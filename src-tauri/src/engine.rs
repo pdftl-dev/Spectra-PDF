@@ -214,11 +214,12 @@ pub fn get_python_path<R: Runtime>(app: &AppHandle<R>) -> String {
         .path()
         .resource_dir()
         .expect("failed to resolve resource dir");
-    resource_dir
-        .join("python")
-        .join("python.exe")
-        .to_string_lossy()
-        .to_string()
+    let path = if cfg!(target_os = "windows") {
+        resource_dir.join("python").join("python.exe")
+    } else {
+        resource_dir.join("python").join("bin").join("python")
+    };
+    path.to_string_lossy().to_string()
 }
 
 /// Resolves the path to the vendored native Tesseract.
@@ -233,7 +234,8 @@ pub fn get_tesseract_path(app: &AppHandle) -> String {
         .path()
         .resource_dir()
         .expect("failed to resolve resource dir");
-    let exe = resource_dir.join("tesseract").join("tesseract.exe");
+    let exe_name = if cfg!(target_os = "windows") { "tesseract.exe" } else { "tesseract" };
+    let exe = resource_dir.join("tesseract").join(exe_name);
     // `dunce::simplified` STRIPS the `\?\` verbatim prefix that
     // `resource_dir()` carries on Windows, and that is load-bearing rather
     // than cosmetic: Tesseract derives its tessdata directory from the
@@ -334,10 +336,11 @@ pub fn get_icc_path(app: &AppHandle) -> String {
 /// then refuses the export with a clear message rather than crashing.
 pub fn get_soffice_path(app: &AppHandle) -> String {
     if let Ok(resource_dir) = app.path().resource_dir() {
+        let exe_name = if cfg!(target_os = "windows") { "soffice.exe" } else { "soffice" };
         let bundled = resource_dir
             .join("libreoffice")
             .join("program")
-            .join("soffice.exe");
+            .join(exe_name);
         if bundled.is_file() {
             return bundled.to_string_lossy().to_string();
         }
@@ -390,13 +393,21 @@ pub async fn start(app: &AppHandle) -> Result<(), String> {
     }
 
     let python_path = get_python_path(app);
-    let script_path = get_engine_script_path(app);
+
+    // Build environment variables map including PYTHONPATH pointing to resource_dir
+    let mut env_map = python_env().into_iter().collect::<HashMap<String, String>>();
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        env_map.insert(
+            "PYTHONPATH".to_string(),
+            dunce::simplified(&resource_dir).to_string_lossy().to_string(),
+        );
+    }
 
     let shell = app.shell();
     let (mut rx, child) = shell
         .command(&python_path)
-        .args([&script_path])
-        .envs(python_env().into_iter().collect::<HashMap<String, String>>())
+        .args(["-m", "engine.__startup__"])
+        .envs(env_map)
         .spawn()
         .map_err(|e| format!("Failed to start engine: {}", e))?;
 

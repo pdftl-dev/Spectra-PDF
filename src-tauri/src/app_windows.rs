@@ -956,8 +956,12 @@ pub fn build_app_window(
     e2e: bool,
 ) -> tauri::Result<tauri::WebviewWindow> {
     let force_opaque = e2e && std::env::var("SPECTRAPDF_E2E_FORCE_OPAQUE").is_ok();
+    #[cfg(windows)]
+    let os_build = windows_version::OsVersion::current().build;
+    #[cfg(not(windows))]
+    let os_build = 0u32;
     let wants_backdrop = crate::wants_backdrop(
-        windows_version::OsVersion::current().build,
+        os_build,
         crate::is_remote_session(),
         crate::transparency_effects_enabled(),
     ) && !force_opaque;
@@ -969,6 +973,7 @@ pub fn build_app_window(
         .visible(false)
         .transparent(wants_backdrop)
         .build()?;
+    #[cfg(windows)]
     let backdrop = if wants_backdrop && window_vibrancy::apply_mica(&window, None).is_ok() {
         "mica"
     } else {
@@ -977,6 +982,8 @@ pub fn build_app_window(
         // cleanly.
         "none"
     };
+    #[cfg(not(windows))]
+    let backdrop = "none";
     app.state::<BackdropState>().record(label, backdrop);
     crate::session::on_window_created(app, &window);
     Ok(window)

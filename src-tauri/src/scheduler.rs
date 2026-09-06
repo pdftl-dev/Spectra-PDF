@@ -297,6 +297,16 @@ fn register_task_com(
     .map_err(|_| "The task registration thread panicked.".to_string())?
 }
 
+#[cfg(not(windows))]
+fn register_task_com(
+    _task_path: String,
+    _xml: String,
+    _account: String,
+    _password: Option<String>,
+) -> Result<(), String> {
+    Err("Scheduled tasks are not available on this platform".to_string())
+}
+
 fn run(cmd: &mut Command) -> Result<String, String> {
     let out = cmd
         .output()

@@ -1,0 +1,56 @@
+name: Build Linux Package
+
+on:
+  push:
+    branches: [ main, master, linux-cross-platform ]
+  pull_request:
+    branches: [ main, master, linux-cross-platform ]
+
+jobs:
+  build-debian:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          bash scripts/install-linux-deps.sh
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked || cargo install tauri-cli
+
+      - name: Build Linux package
+        run: bash scripts/build-linux.sh
+        env:
+          BUNDLES: "deb"
+
+      - name: Upload .deb Package Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spectrapdf-debian-package
+          path: src-tauri/target/release/bundle/deb/*.deb
