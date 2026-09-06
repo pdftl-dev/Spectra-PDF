@@ -97,6 +97,7 @@ pub async fn stage_send_copy(path: String, display_name: String) -> Result<Strin
 
 /// The default desktop mail client's registered name, if any. HKCU overrides
 /// HKLM (per-user default beats machine default), both read-only.
+#[cfg(windows)]
 fn default_mail_client() -> Option<String> {
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
@@ -108,6 +109,12 @@ fn default_mail_client() -> Option<String> {
             }
         }
     }
+    None
+}
+
+/// Non-Windows: no registered-mail-client concept.
+#[cfg(not(windows))]
+fn default_mail_client() -> Option<String> {
     None
 }
 
@@ -166,6 +173,7 @@ fn utf16z(s: &str) -> Vec<u16> {
 /// opens its compose window and the user takes it from there. Runs on a
 /// dedicated thread (MAPI providers dislike foreign COM apartments) and
 /// BLOCKS until the compose window closes on most clients.
+#[cfg(windows)]
 fn run_mapi(hwnd: usize, staged_path: &str) -> Result<u32, String> {
     use windows::core::{s, w};
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -213,6 +221,12 @@ fn run_mapi(hwnd: usize, staged_path: &str) -> Result<u32, String> {
     Ok(unsafe { send(0, hwnd, &message, MAPI_DIALOG | MAPI_LOGON_UI, 0) })
 }
 
+/// Non-Windows: MAPI does not exist here.
+#[cfg(not(windows))]
+fn run_mapi(_hwnd: usize, _staged_path: &str) -> Result<u32, String> {
+    Err("Email attachment integration is not available on this platform".to_string())
+}
+
 /// Hand a staged copy to the default mail client's compose window.
 ///
 /// The result contract: fast failures (no registered client, a client that
@@ -235,7 +249,13 @@ pub async fn send_by_email(window: tauri::WebviewWindow, staged_path: String) ->
     if !Path::new(&staged_path).is_file() {
         return Err(format!("The staged attachment is missing: {staged_path}"));
     }
+    #[cfg(windows)]
     let hwnd = window.hwnd().map(|h| h.0 as usize).unwrap_or(0);
+    #[cfg(not(windows))]
+    let hwnd = {
+        let _ = &window;
+        0usize
+    };
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
     std::thread::spawn(move || {

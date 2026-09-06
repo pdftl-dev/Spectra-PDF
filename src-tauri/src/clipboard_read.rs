@@ -18,6 +18,7 @@
 //! The bytes never cross the IPC boundary: a pasted screenshot is megabytes,
 //! the engine needs a file anyway, and the caller needs only the path.
 
+#![cfg(windows)]
 use std::path::PathBuf;
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

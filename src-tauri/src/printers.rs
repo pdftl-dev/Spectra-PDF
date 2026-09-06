@@ -6,6 +6,8 @@
 //! (`printers` subcommand and its `--capabilities` arm) — GUI/CLI parity by
 //! construction, not by keeping two lists in step.
 
+#[cfg(windows)]
+mod imp {
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{DEVMODEW, DM_PAPERSIZE};
@@ -259,3 +261,46 @@ fn default_printer() -> Option<String> {
     // `len` counts the terminating NUL on success.
     Some(String::from_utf16_lossy(&buf[..len.saturating_sub(1) as usize]))
 }
+
+} // mod imp
+
+#[cfg(windows)]
+pub use imp::*;
+
+#[cfg(not(windows))]
+mod stub {
+    #[derive(serde::Serialize)]
+    pub struct PaperOption {
+        pub id: u16,
+        pub name: String,
+        pub width_pt: f64,
+        pub height_pt: f64,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct PrinterList {
+        pub printers: Vec<String>,
+        pub default: Option<String>,
+    }
+
+    #[derive(serde::Serialize)]
+    pub struct PrinterCapabilities {
+        pub papers: Vec<PaperOption>,
+        pub default_paper: Option<u16>,
+        pub duplex: bool,
+        pub color: bool,
+        pub collate: bool,
+        pub max_copies: u32,
+    }
+
+    pub fn enumerate() -> Result<PrinterList, String> {
+        Err("Printer support is not available on this platform".to_string())
+    }
+
+    pub fn capabilities(_name: &str) -> Result<PrinterCapabilities, String> {
+        Err("Printer support is not available on this platform".to_string())
+    }
+}
+
+#[cfg(not(windows))]
+pub use stub::*;

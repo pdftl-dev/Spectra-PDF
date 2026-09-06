@@ -712,6 +712,16 @@ fn register_task_com(
     .map_err(|_| "The task registration thread panicked.".to_string())?
 }
 
+#[cfg(not(windows))]
+fn register_task_com(
+    _task_path: String,
+    _xml: String,
+    _account: String,
+    _password: Option<String>,
+) -> Result<(), String> {
+    Err("Scheduled tasks are not available on this platform".to_string())
+}
+
 /// Run `work` against a connected Task Scheduler service on a thread of its
 /// own, for the same reasons as [`register_task_com`].
 #[cfg(windows)]

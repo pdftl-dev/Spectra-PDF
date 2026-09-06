@@ -1385,10 +1385,12 @@ pub async fn printer_capabilities(
 /// once a profile customizes its colors, so it can be absent on stock
 /// machines.
 #[tauri::command]
+#[cfg(windows)]
 pub async fn get_system_accent_color() -> Result<Option<String>, String> {
     Ok(accent_from_uisettings().or_else(accent_from_registry))
 }
 
+#[cfg(windows)]
 fn accent_from_uisettings() -> Option<String> {
     use windows::UI::ViewManagement::{UIColorType, UISettings};
     let ui = UISettings::new().ok()?;
@@ -1396,6 +1398,7 @@ fn accent_from_uisettings() -> Option<String> {
     Some(format!("#{:02X}{:02X}{:02X}", c.R, c.G, c.B))
 }
 
+#[cfg(windows)]
 fn accent_from_registry() -> Option<String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
@@ -1410,6 +1413,13 @@ fn accent_from_registry() -> Option<String> {
     let g = (abgr >> 8) & 0xFF;
     let b = (abgr >> 16) & 0xFF;
     Some(format!("#{:02X}{:02X}{:02X}", r, g, b))
+}
+
+/// Non-Windows: no accent-colour source wired up yet.
+#[tauri::command]
+#[cfg(not(windows))]
+pub async fn get_system_accent_color() -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 // ── Window backdrop ──────────────────────────────────────────────────────
@@ -2067,6 +2077,7 @@ pub async fn take_unreadable_records(
 // ── Enterprise policy ─────────────────────────────────────────────────────
 
 #[tauri::command]
+#[cfg(windows)]
 pub async fn check_auto_update_disabled() -> Result<bool, String> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
@@ -2081,11 +2092,18 @@ pub async fn check_auto_update_disabled() -> Result<bool, String> {
     }
 }
 
+#[tauri::command]
+#[cfg(not(windows))]
+pub async fn check_auto_update_disabled() -> Result<bool, String> {
+    Ok(false)
+}
+
 /// Whether this machine forbids running field scripts, whatever the user's
 /// preference says. Same key and same shape as `DisableAutoUpdate`: an
 /// administrator sets it, and it outranks the preference in one direction only
 /// — it can turn scripting off, never on.
 #[tauri::command]
+#[cfg(windows)]
 pub async fn check_field_scripts_disabled() -> Result<bool, String> {
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
@@ -2098,6 +2116,12 @@ pub async fn check_field_scripts_disabled() -> Result<bool, String> {
         }
         Err(_) => Ok(false),
     }
+}
+
+#[tauri::command]
+#[cfg(not(windows))]
+pub async fn check_field_scripts_disabled() -> Result<bool, String> {
+    Ok(false)
 }
 
 // ── Startup (Start with Windows) ─────────────────────────────────────────
@@ -2247,6 +2271,7 @@ pub async fn startup_entry_notice(
 /// Read the current state of the "Start with Windows" registry entry.
 /// Returns (enabled, minimized) — minimized is true if the --minimized flag is present.
 #[tauri::command]
+#[cfg(windows)]
 pub async fn get_startup_enabled() -> Result<(bool, bool), String> {
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
@@ -2265,9 +2290,16 @@ pub async fn get_startup_enabled() -> Result<(bool, bool), String> {
     }
 }
 
+#[tauri::command]
+#[cfg(not(windows))]
+pub async fn get_startup_enabled() -> Result<(bool, bool), String> {
+    Ok((false, false))
+}
+
 /// Set or remove the "Start with Windows" registry entry.
 /// When start_minimized is true, appends --minimized to the command.
 #[tauri::command]
+#[cfg(windows)]
 pub async fn set_startup_enabled(
     enabled: bool,
     start_minimized: bool,
@@ -2296,6 +2328,15 @@ pub async fn set_startup_enabled(
     }
 
     Ok(())
+}
+
+#[tauri::command]
+#[cfg(not(windows))]
+pub async fn set_startup_enabled(
+    _enabled: bool,
+    _start_minimized: bool,
+) -> Result<(), String> {
+    Err("Start-with-system is not available on this platform".to_string())
 }
 
 #[cfg(test)]

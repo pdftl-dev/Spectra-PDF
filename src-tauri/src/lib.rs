@@ -1,10 +1,12 @@
 pub mod cli;
+#[cfg(windows)]
 mod clipboard_read;
 mod commands;
 pub mod create_pdf_sources;
 mod print_to_pdf;
 mod scheduler;
 mod send_to;
+#[cfg(windows)]
 mod snapshot;
 mod page_commit;
 mod file_publication;
@@ -13,6 +15,7 @@ mod process_job;
 mod scratch;
 mod staging;
 mod watchers;
+#[cfg(windows)]
 mod web_capture;
 pub mod engine;
 pub mod health_engine;
@@ -20,7 +23,9 @@ pub mod net;
 pub mod gs;
 mod printers;
 pub mod scan_host;
+#[cfg(windows)]
 pub mod scanner;
+#[cfg(windows)]
 pub mod scantest;
 pub mod app_windows;
 pub mod portable;
@@ -49,6 +54,7 @@ fn backdrop_supported(build: u32) -> bool {
 
 /// Is "Transparency effects" on? (Settings ▸ Personalization ▸ Colours.)
 /// Absent value means the Windows default, which is ON.
+#[cfg(windows)]
 pub(crate) fn transparency_effects_enabled() -> bool {
     winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
@@ -57,9 +63,24 @@ pub(crate) fn transparency_effects_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Non-Windows: no such setting; assume on. The only consumer,
+/// `wants_backdrop`, is already gated off below the Win11 floor, so this
+/// never triggers a backdrop draw on Linux.
+#[cfg(not(windows))]
+pub(crate) fn transparency_effects_enabled() -> bool {
+    true
+}
+
+#[cfg(windows)]
 pub(crate) fn is_remote_session() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
     unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+}
+
+/// Non-Windows: no RDP-equivalent check wired up; assume local.
+#[cfg(not(windows))]
+pub(crate) fn is_remote_session() -> bool {
+    false
 }
 
 /// Whether DWM will compose a backdrop, as opposed to accepting the request.
@@ -119,13 +140,17 @@ pub fn run() {
         .manage(session::SessionState::new())
         .manage(session::QuitAcks::new())
         .manage(page_commit::PageCommitState::default())
-        .manage(scanner::ScannerSessions::new())
         .manage(commands::StartupEntryNotice::new())
         .manage(commands::UnreadableRecords::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build());
+
+    #[cfg(windows)]
+    {
+        builder = builder.manage(scanner::ScannerSessions::new());
+    }
 
     // In-app W3C WebDriver server (TRIAL). Double-gated on purpose: the
     // `webdriver` Cargo feature keeps it out of a release binary at compile
@@ -207,12 +232,19 @@ pub fn run() {
             commands::user_dictionary_dir,
             commands::list_printers,
             commands::printer_capabilities,
+            #[cfg(windows)]
             scanner::list_scanners,
+            #[cfg(windows)]
             scanner::scanner_capabilities,
+            #[cfg(windows)]
             scanner::scanner_close,
+            #[cfg(windows)]
             scanner::scanner_select_dialog,
+            #[cfg(windows)]
             scanner::scan_acquire,
+            #[cfg(windows)]
             scanner::scan_cancel,
+            #[cfg(windows)]
             scanner::scan_discard,
             commands::canonicalize_paths,
             commands::classify_recent_paths,
@@ -284,9 +316,13 @@ pub fn run() {
             tabdrag::tabdrag_commit,
             tabdrag::tabdrag_release,
             tabdrag::tabdrag_reserve_new_window,
+            #[cfg(windows)]
             snapshot::copy_image_to_clipboard,
+            #[cfg(windows)]
             snapshot::save_snapshot_png,
+            #[cfg(windows)]
             clipboard_read::read_clipboard_source,
+            #[cfg(windows)]
             web_capture::capture_web_page,
             net::net_request,
             net::net_payload_path,
@@ -423,6 +459,7 @@ pub fn run() {
                     // capture reads its own window's close as a cancel and
                     // destroys the window itself.
                     if !app_windows::is_app_window(window.label()) {
+                        #[cfg(windows)]
                         web_capture::window_close_requested(window.label());
                         return;
                     }
