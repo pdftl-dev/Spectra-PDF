@@ -8,7 +8,9 @@
 [![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
 [![License](https://img.shields.io/github/license/jasonulbright/Spectra-PDF)](LICENSE)
 
-A modern, open-source PDF workbench for Windows. Tauri v2 + React, with an embedded Python engine. No ads, no telemetry, no upsells. Ships as an installer or as a portable zip you extract and run. WebView2 prerequisite (ships with Windows 10/11). A handful of features — listed below, each marked — additionally need Ghostscript, which you install separately.
+A modern, open-source PDF workbench for Windows. **Ported to linux: see the `linux-cross-platform` branch of this fork.**
+
+Tauri v2 + React, with an embedded Python engine. No ads, no telemetry, no upsells. Ships as an installer or as a portable zip you extract and run. WebView2 prerequisite (ships with Windows 10/11). A handful of features — listed below, each marked — additionally need Ghostscript, which you install separately.
 
 Nothing here reaches the network on its own. The only network actions are ones you start and confirm: the update check (notify-only, and switchable off), opening a document from a web address, capturing a web page, submitting a form through its own Submit button behind a consent dialog, and signing through a signing service you configure. Everything else — OCR, spell check, signature trust, export, print production — runs entirely on your machine.
 
