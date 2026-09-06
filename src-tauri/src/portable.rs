@@ -150,6 +150,28 @@ fn read_accepted_flag(path: &Path) -> Option<bool> {
     value.get(ACCEPTED_KEY)?.as_bool()
 }
 
+/// The ICC assent record used by the running application.
+///
+/// Windows keeps the existing container-specific behaviour: installed copies
+/// use the installer's record beside the executable, while portable copies
+/// keep their record under `data/`.
+///
+/// Non-Windows installed packages cannot use the executable directory as a
+/// writable root (`/usr/bin`, for example), so the assent record lives in the
+/// per-user application configuration directory instead.
+#[cfg(windows)]
+fn icc_assent_path(dir: &Path) -> PathBuf {
+    dir.join(PORTABLE_DATA_DIR).join(ICC_ASSENT_FILE)
+}
+
+#[cfg(not(windows))]
+fn icc_assent_path<R: tauri::Runtime, M: Manager<R>>(app: &M) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|dir| dir.join(ICC_ASSENT_FILE))
+        .map_err(|e| format!("Cannot resolve the configuration folder: {e}"))
+}
+
 /// The recorded assent for a payload directory, whichever container it is.
 ///
 /// The installer's record wins when it exists, because in that container it is
@@ -165,10 +187,17 @@ pub fn icc_assent_at(dir: &Path) -> IccAssent {
             None => IccAssent::Unrecorded,
         };
     }
-    match read_accepted_flag(&dir.join(PORTABLE_DATA_DIR).join(ICC_ASSENT_FILE)) {
-        Some(true) => IccAssent::Accepted,
-        Some(false) => IccAssent::Declined,
-        None => IccAssent::Unrecorded,
+    #[cfg(windows)]
+    {
+        match read_accepted_flag(&icc_assent_path(dir)) {
+            Some(true) => IccAssent::Accepted,
+            Some(false) => IccAssent::Declined,
+            None => IccAssent::Unrecorded,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        IccAssent::Unrecorded
     }
 }
 
@@ -195,6 +224,21 @@ pub fn record_icc_assent_at(dir: &Path, accepted: bool) -> Result<(), String> {
     let body = format!("{{\n  \"{ACCEPTED_KEY}\": {accepted}\n}}\n");
     let path = root.join(ICC_ASSENT_FILE);
     std::fs::write(&path, body).map_err(|e| format!("Cannot write {}: {}", path.display(), e))
+}
+
+#[cfg(not(windows))]
+fn record_icc_assent_with_app<R: tauri::Runtime, M: Manager<R>>(
+    app: &M,
+    accepted: bool,
+) -> Result<(), String> {
+    let path = icc_assent_path(app)?;
+    if let Some(root) = path.parent() {
+        std::fs::create_dir_all(root)
+            .map_err(|e| format!("Cannot create {}: {}", root.display(), e))?;
+    }
+    let body = format!("{{\n  \"{ACCEPTED_KEY}\": {accepted}\n}}\n");
+    std::fs::write(&path, body)
+        .map_err(|e| format!("Cannot write {}: {}", path.display(), e))
 }
 
 /// What the engine subprocess is told, as an environment value.
@@ -483,9 +527,26 @@ pub async fn icc_assent_state(app: tauri::AppHandle) -> Result<AssentState, Stri
     let dir = exe_dir();
     let icc = PathBuf::from(crate::engine::get_icc_path(&app));
     let license = icc.join("Adobe-Color-Profile-License.txt");
+    let assent = {
+        #[cfg(windows)]
+        {
+            icc_assent_at(&dir)
+        }
+        #[cfg(not(windows))]
+        {
+            match icc_assent_path(&app) {
+                Ok(path) => match read_accepted_flag(&path) {
+                    Some(true) => IccAssent::Accepted,
+                    Some(false) => IccAssent::Declined,
+                    None => IccAssent::Unrecorded,
+                },
+                Err(_) => IccAssent::Unrecorded,
+            }
+        }
+    };
     Ok(AssentState {
         portable: container_at(&dir) == Container::Portable,
-        assent: icc_assent_at(&dir),
+        assent,
         license_path: if license.is_file() {
             license.to_string_lossy().into_owned()
         } else {
@@ -508,7 +569,14 @@ pub async fn icc_license_text(app: tauri::AppHandle) -> Result<String, String> {
 /// engine holds no state between calls.
 #[tauri::command]
 pub async fn record_icc_assent(app: tauri::AppHandle, accepted: bool) -> Result<AssentState, String> {
-    record_icc_assent_at(&exe_dir(), accepted)?;
+    #[cfg(windows)]
+    {
+        record_icc_assent_at(&exe_dir(), accepted)?;
+    }
+    #[cfg(not(windows))]
+    {
+        record_icc_assent_with_app(&app, accepted)?;
+    }
     crate::engine::restart_for_assent(&app).await;
     icc_assent_state(app).await
 }
