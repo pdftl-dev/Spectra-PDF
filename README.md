@@ -1,5 +1,11 @@
 # Spectra PDF
 
+This is an experimental fork to make Spectra PDF run on linux. It currently builds, runs and mostly works. Some features (tesseract integration, printing, scanning, ...) do not work yet.
+
+For instructions, see [INSTALL-linux.md](INSTALL-linux.md).
+
+---
+
 [![CI](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml)
 [![Release workflow](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release.yml?label=release%20workflow)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release.yml)
 [![Release recovery](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release-redo.yml?label=release%20recovery)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release-redo.yml)
