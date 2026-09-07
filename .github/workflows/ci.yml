@@ -1,10 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+  workflow_dispatch:
 
 # Least privilege for GITHUB_TOKEN (CodeQL actions/missing-workflow-permissions).
 # Every job below only READS the repository — checkout, install, run gates.
