@@ -138,12 +138,12 @@ pub fn run() {
         .manage(commands::StartupEntryNotice::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_shell::init());
 
     #[cfg(windows)]
     {
-        builder = builder.manage(scanner::ScannerSessions::new());
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build())
+	    .manage(scanner::ScannerSessions::new());
     }
 
     // In-app W3C WebDriver server (TRIAL). Double-gated on purpose: the
