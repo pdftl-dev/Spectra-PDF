@@ -7,8 +7,12 @@ on:
     branches: [ main, master, linux-cross-platform ]
 
 jobs:
-  build-debian:
-    runs-on: ubuntu-latest
+  build-ubuntu:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout repository
@@ -23,7 +27,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.13'
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,6 +36,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+          prefix-key: v0-rust-build-${{ matrix.os }}
 
       - name: Install system dependencies
         run: |
@@ -42,15 +47,26 @@ jobs:
         run: npm ci
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked || cargo install tauri-cli
+        run: cargo tauri --version || cargo install tauri-cli --locked --force
 
       - name: Build Linux package
         run: bash scripts/build-linux.sh
         env:
           BUNDLES: "deb"
 
+      - name: Extract Versions for Artifact
+        run: |
+          # Get the app version from package.json
+          APP_VERSION=$(node -p "require('./package.json').version")
+
+          # Get the exact Ubuntu version of the current runner (e.g., 22.04 or 24.04)
+          UBUNTU_VERSION=$(lsb_release -rs)
+
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "UBUNTU_VERSION=$UBUNTU_VERSION" >> $GITHUB_ENV
+
       - name: Upload .deb Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: spectrapdf-debian-package
+          name: spectrapdf-v${{ env.APP_VERSION }}-ubuntu-${{ env.UBUNTU_VERSION }}
           path: src-tauri/target/release/bundle/deb/*.deb
