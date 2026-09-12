@@ -9,19 +9,8 @@ on:
 jobs:
   build-debian:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        debian-version: ["12", "13", "testing"]
-
-    container:
-      image: debian:${{ matrix.debian-version }}
 
     steps:
-      - name: Install basic container prerequisites
-        run: |
-          apt-get update
-          apt-get install -y git curl sudo build-essential ca-certificates
-
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -43,7 +32,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
-          key: debian-${{ matrix.debian-version }}
 
       - name: Install system dependencies
         run: |
@@ -61,15 +49,19 @@ jobs:
         env:
           BUNDLES: "deb"
 
-      # Extract version using Node and write to GITHUB_ENV
-      - name: Get App Version
+      - name: Extract Versions for Artifact
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          # Get the app version from package.json
+          APP_VERSION=$(node -p "require('./package.json').version")
 
-      # Use the APP_VERSION environment variable in the artifact name
+          # Get the exact Ubuntu version of the current runner (e.g., 22.04 or 24.04)
+          UBUNTU_VERSION=$(lsb_release -rs)
+
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_ENV
+          echo "UBUNTU_VERSION=$UBUNTU_VERSION" >> $GITHUB_ENV
+
       - name: Upload .deb Package Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: spectrapdf-v${{ env.APP_VERSION }}-debian-${{ matrix.debian-version }}
+          name: spectrapdf-v${{ env.APP_VERSION }}-ubuntu-${{ env.UBUNTU_VERSION }}
           path: src-tauri/target/release/bundle/deb/*.deb

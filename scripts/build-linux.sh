@@ -46,8 +46,9 @@ fi
 
 
 cd "$PROJECT_ROOT"
-if [ ! -d "node_modules" ] || [ ! -d "node_modules/pdfjs-dist" ]; then
-    echo "==> Installing frontend dependencies..."
+# Check if node_modules is missing OR older than package-lock.json
+if [ ! -d "node_modules" ] || [ "package-lock.json" -nt "node_modules" ]; then
+    echo "==> Syncing frontend dependencies (package-lock updated)..."
     npm ci
 fi
 
