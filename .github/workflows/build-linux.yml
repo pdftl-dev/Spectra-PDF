@@ -36,6 +36,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: "src-tauri -> target"
+          prefix-key: v0-rust-build-${{ matrix.os }}
 
       - name: Install system dependencies
         run: |
@@ -46,7 +47,7 @@ jobs:
         run: npm ci
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked || cargo install tauri-cli
+        run: cargo tauri --version || cargo install tauri-cli --locked --force
 
       - name: Build Linux package
         run: bash scripts/build-linux.sh
