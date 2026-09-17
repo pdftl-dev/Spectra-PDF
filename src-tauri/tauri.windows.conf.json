@@ -1,0 +1,8 @@
+// src-tauri/tauri.windows.conf.json
+{
+  "bundle": {
+    "resources": {
+      "../resources/python": "python"
+    }
+  }
+}

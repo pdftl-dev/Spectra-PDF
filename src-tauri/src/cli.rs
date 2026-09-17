@@ -2673,7 +2673,14 @@ fn exe_dir() -> PathBuf {
 }
 
 fn resolve_python() -> PathBuf {
-    exe_dir().join("python").join("python.exe")
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/usr/lib/spectrapdf/venv/bin/python")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        exe_dir().join("python").join("python.exe")
+    }
 }
 
 fn resolve_engine_script() -> PathBuf {

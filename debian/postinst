@@ -1,0 +1,61 @@
+#!/bin/sh
+
+# debian/postinst
+
+set -e
+
+PROV_DIR="/usr/lib/spectrapdf/python-provisioning"
+VENV_DIR="/usr/lib/spectrapdf/venv"
+LOCK_FILE="$PROV_DIR/python-requirements.txt"
+
+case "$1" in
+    configure)
+        PYTHON_BIN=""
+        for candidate in python3.14 python3.13 python3.12 python3; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+                if "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' >/dev/null 2>&1; then
+                    PYTHON_BIN="$(command -v "$candidate")"
+                    break
+                fi
+            fi
+        done
+
+        if [ -z "$PYTHON_BIN" ]; then
+            echo "spectrapdf: ERROR: no suitable python3 (>= 3.12) found." >&2
+            exit 1
+        fi
+
+        if [ -x "$VENV_DIR/bin/python" ]; then
+            EXISTING_VER=$("$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "")
+            case "$EXISTING_VER" in
+                3.1[2-9]|3.[2-9][0-9]) : ;;
+                *) rm -rf "$VENV_DIR" ;;
+            esac
+        fi
+
+        if [ ! -x "$VENV_DIR/bin/python" ]; then
+            echo "spectrapdf: creating application virtual environment at $VENV_DIR using $PYTHON_BIN..."
+            "$PYTHON_BIN" -m venv --without-pip "$VENV_DIR"
+        fi
+
+        if ! "$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1; then
+            "$VENV_DIR/bin/python" -I -m ensurepip --default-pip >/dev/null
+        fi
+
+        if [ -f "$LOCK_FILE" ]; then
+            echo "spectrapdf: installing Python dependencies via network..."
+
+            if ! PIP_OUTPUT=$("$VENV_DIR/bin/python" -m pip install -r "$LOCK_FILE" \
+                --no-warn-script-location 2>&1); then
+
+                echo "spectrapdf: ERROR: Python dependency installation failed!" >&2
+                echo "--- Pip Installation Log ---" >&2
+                echo "$PIP_OUTPUT" >&2
+                echo "----------------------------" >&2
+                exit 1
+            fi
+        fi
+        ;;
+esac
+
+exit 0
