@@ -18,6 +18,7 @@ pub mod health_engine;
 pub mod net;
 pub mod gs;
 mod printers;
+#[cfg(windows)]
 pub mod scan_host;
 #[cfg(windows)]
 pub mod scanner;
@@ -518,6 +519,7 @@ pub fn run() {
                 });
                 // The scanner host holds device locks, so it is ended here
                 // rather than left to the job object that backstops a crash.
+                #[cfg(windows)]
                 scan_host::shutdown();
             }
         });
