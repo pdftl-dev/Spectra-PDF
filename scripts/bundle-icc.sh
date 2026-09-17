@@ -210,11 +210,11 @@ for i in "${!descriptions[@]}"; do
     [[ "$actual" == "$expected" ]] ||
         die "${members[$i]}: sha256 $actual does not match pinned $expected"
 
-    cp -- "$src" "$STAGING/$leaf"
+    cp -p -- "$src" "$STAGING/$leaf"
 done
 
 # The licence is part of the shipped ICC resource tree.
-cp -- "$LICENSE_TEXT" "$STAGING/$LICENSE_NAME"
+cp -p -- "$LICENSE_TEXT" "$STAGING/$LICENSE_NAME"
 
 # ---------------------------------------------------------------------------
 # Re-verify the files actually written to staging.
@@ -232,16 +232,14 @@ for i in "${!descriptions[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Atomically-ish replace the destination tree.
+# Sync staging into destination while preserving timestamps for identical files.
 #
-# We deliberately remove the old resources/icc only after the complete
-# staging tree has been verified.
+# Using rsync --checksum avoids touching mtime on unchanged profiles, which
+# prevents Cargo from unnecessarily triggering Rust rebuilds.
 # ---------------------------------------------------------------------------
 
-rm -rf -- "$DEST_DIR"
-mv -- "$STAGING" "$DEST_DIR"
-
-trap - EXIT
+mkdir -p -- "$DEST_DIR"
+rsync -a --checksum --delete "$STAGING/" "$DEST_DIR/"
 
 size_bytes="$(
     find "$DEST_DIR" -type f -printf '%s\n' |

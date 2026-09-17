@@ -63,7 +63,7 @@ if [ "$SKIP_PREP" = true ]; then
 fi
 
 cd "$PROJECT_ROOT/src-tauri"
-cargo tauri build "${EXTRA_FLAGS[@]}" --bundles "$BUNDLES" -- -vv
+cargo tauri build "${EXTRA_FLAGS[@]}" --bundles "$BUNDLES"
 # to debug last step add
 # -- -vv
 

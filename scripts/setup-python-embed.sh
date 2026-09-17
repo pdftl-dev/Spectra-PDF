@@ -52,13 +52,20 @@ fi
 
 echo "Found $PYTHON_CMD ($($PYTHON_CMD -c 'import sys; print(".".join(map(str, sys.version_info[:3])))'))"
 
-rm -rf "$STAGE_DIR"
-mkdir -p "$STAGE_DIR"
+TEMP_STAGE="$(mktemp -d)"
+trap 'rm -rf "$TEMP_STAGE"' EXIT
 
 if [ ! -f "$LOCK_FILE" ]; then
     echo "ERROR: Python dependency lockfile not found: $LOCK_FILE" >&2
     exit 1
 fi
+
+# Prepare staging content in temporary directory
+sed -E 's/ --hash=sha256:[a-f0-9]+//g' "$LOCK_FILE" > "$TEMP_STAGE/python-requirements.txt"
+
+# Sync to destination without updating mtime for unchanged files
+mkdir -p "$STAGE_DIR"
+rsync -a --checksum --delete "$TEMP_STAGE/" "$STAGE_DIR/"
 # Strip hashes so network installs succeed across any Python version >= 3.12
 sed -E 's/ --hash=sha256:[a-f0-9]+//g' "$LOCK_FILE" > "$STAGE_DIR/python-requirements.txt"
 
