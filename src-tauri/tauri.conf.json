@@ -25,7 +25,6 @@
       "icons/icon.png"
     ],
     "resources": {
-      "../resources/python": "python",
       "../resources/libreoffice": "libreoffice",
       "../resources/fonts": "fonts",
       "../resources/tesseract": "tesseract",

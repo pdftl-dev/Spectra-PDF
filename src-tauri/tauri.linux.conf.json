@@ -1,0 +1,20 @@
+{
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "linux": {
+      "deb": {
+         "depends": [
+           "python3.12-venv | python3.13-venv | python3.14-venv | python3.15-venv"
+         ],
+        "files": {
+          "/usr/lib/spectrapdf/python-provisioning/": "../resources/python-provisioning/"
+        },
+        "postInstallScript": "../debian/postinst",
+        "preRemoveScript": "../debian/prerm"
+      }
+    }
+  },
+  "plugins": {
+    "updater": null
+  }
+}
