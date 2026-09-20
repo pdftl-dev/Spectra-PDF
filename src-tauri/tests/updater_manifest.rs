@@ -12,6 +12,10 @@
 //! With `SPECTRAPDF_UPDATER_MANIFEST` set (the release verifier's mode), the
 //! named manifest is verified against the expectations in the sibling
 //! variables; unset, that test returns and only the fixture tests run.
+//!
+//! The updater plugin itself is Windows-only (see Cargo.toml), so this whole
+//! file compiles to nothing elsewhere.
+#![cfg(windows)]
 
 use std::collections::BTreeSet;
 use std::fs;

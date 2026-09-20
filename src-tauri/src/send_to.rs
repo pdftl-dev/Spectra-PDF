@@ -120,7 +120,9 @@ fn default_mail_client() -> Option<String> {
 
 const SUCCESS_SUCCESS: u32 = 0;
 const MAPI_E_USER_ABORT: u32 = 1;
+#[cfg(windows)]
 const MAPI_LOGON_UI: u32 = 0x1;
+#[cfg(windows)]
 const MAPI_DIALOG: u32 = 0x8;
 
 /// The failures worth naming (full table is MAPI.h; the rest report the code).
@@ -137,6 +139,7 @@ fn mapi_error_name(code: u32) -> String {
     }
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct MapiFileDescW {
     ul_reserved: u32,
@@ -147,6 +150,7 @@ struct MapiFileDescW {
     lp_file_type: *mut core::ffi::c_void,
 }
 
+#[cfg(windows)]
 #[repr(C)]
 struct MapiMessageW {
     ul_reserved: u32,
@@ -163,8 +167,10 @@ struct MapiMessageW {
     lp_files: *mut MapiFileDescW,
 }
 
+#[cfg(windows)]
 type MapiSendMailWFn = unsafe extern "system" fn(usize, usize, *const MapiMessageW, u32, u32) -> u32;
 
+#[cfg(windows)]
 fn utf16z(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

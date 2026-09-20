@@ -576,7 +576,10 @@ fn valid_task_name(name: &str) -> bool {
 }
 
 fn schtasks() -> Command {
+    #[cfg(windows)]
     let mut cmd = Command::new("schtasks.exe");
+    #[cfg(not(windows))]
+    let cmd = Command::new("schtasks.exe");
     // Never pop a console window on a GUI-initiated call.
     #[cfg(windows)]
     {
@@ -1580,6 +1583,7 @@ mod tests {
     /// which may hold a user's schedules — is never touched or deleted.
     #[test]
     #[ignore]
+    #[cfg(windows)]
     fn com_registration_creates_the_missing_folder() {
         // Pid + nanos: a pid alone is reusable across runs, and a stale
         // probe folder would make this test pass without the feature.
@@ -1609,6 +1613,7 @@ mod tests {
     }
 
     /// Test-only cleanup: schtasks can delete tasks but not FOLDERS.
+    #[cfg(windows)]
     fn delete_task_folder(folder: &str) {
         use windows::core::BSTR;
         use windows::Win32::System::Com::{
@@ -2216,6 +2221,7 @@ mod tests {
     /// Uses a probe folder of its own, deleted at the end.
     #[test]
     #[ignore]
+    #[cfg(windows)]
     fn com_definitions_read_back_the_action_a_registration_names() {
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2255,6 +2261,7 @@ mod tests {
     /// action, and the first file is gone.
     #[test]
     #[ignore]
+    #[cfg(windows)]
     fn com_a_replaced_schedule_names_its_own_complete_action() {
         let nanos = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

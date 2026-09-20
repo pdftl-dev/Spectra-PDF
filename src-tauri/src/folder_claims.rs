@@ -16,11 +16,13 @@ pub struct FolderLease {
 
 /// The worker holds the same OS lease while it can still write. A parent's
 /// crash may close its own lease before the job has terminated its children.
+#[cfg(windows)]
 pub struct WorkerLease {
     process: usize,
     handle: usize,
 }
 
+#[cfg(windows)]
 impl FolderLease {
     pub fn retain_in_worker(&self, pid: u32) -> Result<WorkerLease, String> {
         use std::os::windows::io::AsRawHandle;
@@ -54,6 +56,7 @@ impl FolderLease {
     }
 }
 
+#[cfg(windows)]
 impl Drop for WorkerLease {
     fn drop(&mut self) {
         use windows::Win32::Foundation::{
@@ -83,6 +86,29 @@ impl Drop for WorkerLease {
     }
 }
 
+// flock(2) locks belong to the open file description, which dup() shares:
+// cloning the fd here keeps the lock held as long as either this lease or
+// the clone is open, with no cross-process handle transplant needed. Unlike
+// Windows, this does NOT survive this process being killed out from under an
+// already-spawned, unrelated worker process (see KNOWN_BUGS-linux.md) --
+// Linux has no equivalent of injecting a handle into another running
+// process's table short of ptrace/pidfd_getfd tricks that need elevated
+// privilege the app should not require.
+#[cfg(not(windows))]
+impl FolderLease {
+    pub fn retain_in_worker(&self, _pid: u32) -> Result<WorkerLease, String> {
+        self._handle
+            .try_clone()
+            .map(|_handle| WorkerLease { _handle })
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+pub struct WorkerLease {
+    _handle: File,
+}
+
 #[derive(Debug)]
 pub enum ClaimError {
     Busy(String),
@@ -100,6 +126,7 @@ struct Record {
     roots: Vec<String>,
 }
 
+#[cfg(windows)]
 pub fn registry_path() -> Result<PathBuf, ClaimError> {
     // Task Scheduler can run under another account. ProgramData supplies one
     // machine-wide location; its default inherited Users permissions allow
@@ -110,6 +137,15 @@ pub fn registry_path() -> Result<PathBuf, ClaimError> {
     Ok(PathBuf::from(base).join("Spectra PDF").join("folder-claims"))
 }
 
+// No direct ProgramData equivalent: cron/systemd can likewise run a scheduled
+// job as another account, so this needs a location every account can reach,
+// not a per-user config dir. `/tmp` (or $TMPDIR) has that property already.
+#[cfg(not(windows))]
+pub fn registry_path() -> Result<PathBuf, ClaimError> {
+    Ok(std::env::temp_dir().join("spectrapdf-folder-claims"))
+}
+
+#[cfg(windows)]
 fn exclusive(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     // Only READ access is needed to acquire an exclusive OS sharing lease.
@@ -117,6 +153,14 @@ fn exclusive(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).share_mode(0).open(path)
 }
 
+#[cfg(not(windows))]
+fn exclusive(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
 fn live_record(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     // Readers may inspect the record; nobody may replace, delete or write it
@@ -133,8 +177,43 @@ fn live_record(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+// flock is advisory: unlike Windows, another process can still write or
+// unlink this file directly. It does not need to defend against that here --
+// nothing else in the app opens these paths outside this module -- only
+// against another claim_in() call, which always goes through exclusive()
+// too. A crash leaves the file on disk (no delete-on-close equivalent); the
+// next claim_in() scan's stale-record check (exclusive() now succeeds)
+// deletes it, same end state as Windows, one scan later.
+#[cfg(not(windows))]
+fn live_record(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    flock_exclusive(&file)?;
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn flock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
 fn sharing_error(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(not(windows))]
+fn sharing_error(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
 fn registry_lock(path: &Path) -> Result<File, ClaimError> {
@@ -190,13 +269,32 @@ fn prefix(a: &str, b: &str) -> bool {
             .is_some_and(|rest| rest.starts_with(['\\', '/']))
 }
 
+// Windows path comparison: backslash-normalized and case-folded, since NTFS
+// paths are case-insensitive.
+#[cfg(windows)]
+fn fold(p: &Path) -> String {
+    p.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+// APFS's default (non-"case-sensitive") format is case-insensitive like
+// NTFS, just case-preserving, so this needs the same fold as Windows minus
+// the backslash normalization -- NOT lumped in with Linux below.
+#[cfg(target_os = "macos")]
+fn fold(p: &Path) -> String {
+    p.to_string_lossy().trim_end_matches('/').to_lowercase()
+}
+
+// Linux filesystems are case-sensitive; forcing lowercase here would treat
+// distinct paths (/tmp/Out vs /tmp/out) as the same folder.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn fold(p: &Path) -> String {
+    p.to_string_lossy().trim_end_matches('/').to_string()
+}
+
 pub fn roots_conflict(a: &Path, b: &Path) -> bool {
-    let fold = |p: &Path| {
-        p.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_lowercase()
-    };
     let (left, right) = (fold(a), fold(b));
     if prefix(&left, &right) || prefix(&right, &left) {
         return true;
@@ -355,13 +453,27 @@ mod tests {
             .find(|path| path.extension().is_some_and(|ext| ext == "json"))
             .unwrap();
         assert!(std::fs::read_to_string(&record).unwrap().contains("out"));
-        assert!(std::fs::write(&record, b"{}").is_err());
-        assert!(std::fs::remove_file(&record).is_err());
+        // Windows enforces this at the OS handle level (share_mode plus
+        // delete-on-close). Unix's flock is advisory: it blocks another
+        // exclusive() attempt, not an unrelated write() or unlink() on the
+        // same path, so the exact guarantee below is Windows-only.
+        #[cfg(windows)]
+        {
+            assert!(std::fs::write(&record, b"{}").is_err());
+            assert!(std::fs::remove_file(&record).is_err());
+        }
         drop(lease);
+        #[cfg(windows)]
         assert!(
             !record.exists(),
             "the OS must remove a finished run's record"
         );
+        // No delete-on-close on Unix, so the stale file can still be on
+        // disk here; what must hold is that the lock itself was released,
+        // which the next claim_in() also reaps the leftover record for.
+        assert!(claim_in(&registry, std::slice::from_ref(&root)).is_ok());
+        #[cfg(not(windows))]
+        assert!(!record.exists(), "a later claim_in() must reap the stale record");
 
         // ProgramData grants other users read access to an existing mutex
         // file. Acquiring it must not ask for write access to that file.
@@ -396,12 +508,12 @@ mod tests {
     #[test]
     fn another_process_blocks_a_claim_and_crash_releases_it() {
         use std::io::BufRead;
-        use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         let scratch = tempfile::tempdir().unwrap();
         let root = scratch.path().join("out").to_string_lossy().into_owned();
         let registry = scratch.path().join("claims");
-        let mut child = Command::new(std::env::current_exe().unwrap())
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
             .args([
                 "--exact",
                 "folder_claims::tests::child_holds_folder",
@@ -410,11 +522,14 @@ mod tests {
             ])
             .env("SPECTRA_TEST_CLAIM_REGISTRY", &registry)
             .env("SPECTRA_TEST_CLAIM_ROOT", &root)
-            .creation_flags(0x0800_0000)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stdout(Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn().unwrap();
         let mut reader = std::io::BufReader::new(child.stdout.take().unwrap());
         let mut ready = false;
         for line in reader.by_ref().lines() {

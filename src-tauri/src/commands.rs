@@ -1289,6 +1289,7 @@ pub async fn open_releases_page(app: AppHandle) -> Result<(), String> {
 /// output always carries a space in its filename.
 ///
 /// Windows filenames cannot contain `"`, so the path itself needs no escaping.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn select_argument(canonical: &str) -> String {
     format!("/select,\"{canonical}\"")
 }
@@ -2126,7 +2127,9 @@ pub async fn check_field_scripts_disabled() -> Result<bool, String> {
 
 // ── Startup (Start with Windows) ─────────────────────────────────────────
 
+#[cfg(windows)]
 const STARTUP_REG_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+#[cfg(windows)]
 const STARTUP_REG_VALUE: &str = "SpectraPDF";
 
 /// What a launch must do to the Run value it found there.
@@ -2134,7 +2137,11 @@ const STARTUP_REG_VALUE: &str = "SpectraPDF";
 /// `Absent` covers both "startup is not enabled" and "the value is gone":
 /// neither is this code's business to create, because only the user's own
 /// preference turns the entry on.
+// Only called from Windows registry code, but left uncfg'd (with a targeted
+// `allow` below instead of `#[cfg(windows)]`) so its pure decision logic
+// stays unit-tested on every host platform.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) enum RunKeyAction {
     Absent,
     Current,
@@ -2147,6 +2154,7 @@ pub(crate) enum RunKeyAction {
 /// ` --minimized`, so the quoted head is the path. An unquoted value (written
 /// by an older build or by hand) is taken up to the first ` --`, which is the
 /// only separator this app's own flags use.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn run_value_exe(value: &str) -> &str {
     let trimmed = value.trim();
     if let Some(rest) = trimmed.strip_prefix('"') {
@@ -2176,6 +2184,7 @@ fn run_value_exe(value: &str) -> &str {
 /// happens to start first must not seize the other's startup entry.
 /// `recorded_exists` is the caller's answer to that question so the decision
 /// stays testable without a filesystem.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn run_key_action(
     existing: Option<&str>,
     exe: &Path,

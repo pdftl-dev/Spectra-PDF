@@ -3980,6 +3980,7 @@ version = "1.2.6"
 dependencies = [
  "clap",
  "dunce",
+ "libc",
  "reqwest",
  "same-file",
  "serde",

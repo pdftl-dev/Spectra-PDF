@@ -40,3 +40,17 @@ Make restart_for_assent() start the replacement engine immediately after termina
 Reproduction
 
 Install a freshly built DEB with no existing ICC assent record, launch spectrapdf, accept the ICC licence, and immediately attempt to open a PDF without restarting the application.
+
+Folder-claim leases do not survive this process crashing while a worker still writes
+
+Status: Known, by design for now
+Affected: Batch / BatchOcr CLI commands' folder-claim protection (src-tauri/src/folder_claims.rs)
+Observed: Linux
+
+On Windows, `retain_in_worker` duplicates the lease's file handle into the running engine subprocess via `DuplicateHandle`, so the OS-level lease survives even if the Spectra PDF process that created it is killed outright.
+
+On Linux, leases use `flock(2)` instead, which is scoped to open file descriptions rather than injectable into an already-running unrelated process's file descriptor table (there is no Linux syscall for that short of ptrace/pidfd tricks requiring elevated privilege). `retain_in_worker` instead `dup()`s the fd within the same process, which keeps the lease held if the `FolderLease` itself is dropped early but the `WorkerLease` is still alive -- but if the whole Spectra PDF process is killed (not just the lease dropped), both fds close together and the lease releases immediately, before the engine subprocess has necessarily finished writing.
+
+Practical effect: a crash of the main process while a batch job's engine subprocess is still writing can let a second run claim the same output folder before the first one's writes are done, on Linux only.
+
+Possible fix: architectural change so folder-claiming happens before the engine subprocess is spawned, with the lock fd passed down as an inherited (non-CLOEXEC) descriptor at spawn time, so the child genuinely owns an independent reference to the same open file description.

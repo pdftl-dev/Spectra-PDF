@@ -10,6 +10,8 @@ fn main() {
     // a console, raise a dialog, or reach the parser, and its stdio carries a
     // protocol that any other output would corrupt.
     let argv: Vec<String> = std::env::args().collect();
+
+    #[cfg(windows)]
     if spectrapdf_lib::scan_host::host_arg_present(&argv) {
         std::process::exit(spectrapdf_lib::scan_host::serve());
     }

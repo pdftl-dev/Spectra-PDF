@@ -51,6 +51,7 @@ pub const ICC_ASSENT_ENV: &str = "SPECTRAPDF_ICC_ASSENT";
 pub const WEBVIEW_USER_DATA_ENV: &str = "WEBVIEW2_USER_DATA_FOLDER";
 
 /// The EdgeUpdate client id of the WebView2 Evergreen Runtime.
+#[cfg(windows)]
 const WEBVIEW2_CLIENT: &str =
     r"Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
 

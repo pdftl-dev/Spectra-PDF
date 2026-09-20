@@ -2674,7 +2674,14 @@ fn exe_dir() -> PathBuf {
 }
 
 fn resolve_python() -> PathBuf {
-    exe_dir().join("python").join("python.exe")
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/usr/lib/spectrapdf/venv/bin/python")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        exe_dir().join("python").join("python.exe")
+    }
 }
 
 fn resolve_engine_script() -> PathBuf {
@@ -3774,9 +3781,10 @@ pub fn run(command: CliCommand, gs_path: Option<String>) -> i32 {
 
     // Scanner enumeration/capabilities are pure WIA — no Python engine to
     // spawn, and the session store closes its devices when it drops here.
-    if let CliCommand::Scanners(args) = &command {
+    if let CliCommand::Scanners(_args) = &command {
         #[cfg(windows)]
         {
+            let args = _args;
             let result = match &args.capabilities {
                 Some(device_id) => crate::scanner::ScannerSessions::new()
                     .capabilities(device_id)
@@ -6473,6 +6481,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn the_checklist_row_selection_refuses_a_row_that_does_not_exist() {
         assert_eq!(parse_scan_test_rows(None), Ok(Vec::new()));
         assert_eq!(

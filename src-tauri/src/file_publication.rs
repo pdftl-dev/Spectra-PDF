@@ -309,27 +309,25 @@ fn publish_at(
         Ok(stage) => stage,
         Err(refused) => return after_refused_stage(refused, parent, existing.as_ref(), in_place),
     };
+    #[cfg(windows)]
     if let Some(original) = &existing {
-        #[cfg(windows)]
-        {
-            use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
-            // Never silently remove filesystem encryption from an existing
-            // destination merely because its working copy is unencrypted.
-            if original.metadata()?.file_attributes() & 0x4000 != 0 {
-                // Encrypt the EMPTY stage before copying any document bytes.
-                let encrypted_path = fs::canonicalize(stage.file().path())?;
-                let wide: Vec<u16> = encrypted_path
-                    .as_os_str()
-                    .encode_wide()
-                    .chain(Some(0))
-                    .collect();
-                unsafe {
-                    windows::Win32::Storage::FileSystem::EncryptFileW(windows::core::PCWSTR(
-                        wide.as_ptr(),
-                    ))
-                }
-                .map_err(io::Error::other)?;
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        // Never silently remove filesystem encryption from an existing
+        // destination merely because its working copy is unencrypted.
+        if original.metadata()?.file_attributes() & 0x4000 != 0 {
+            // Encrypt the EMPTY stage before copying any document bytes.
+            let encrypted_path = fs::canonicalize(stage.file().path())?;
+            let wide: Vec<u16> = encrypted_path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect();
+            unsafe {
+                windows::Win32::Storage::FileSystem::EncryptFileW(windows::core::PCWSTR(
+                    wide.as_ptr(),
+                ))
             }
+            .map_err(io::Error::other)?;
         }
     }
     fill(&stage)?;

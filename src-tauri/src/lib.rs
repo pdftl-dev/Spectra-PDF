@@ -22,6 +22,7 @@ pub mod health_engine;
 pub mod net;
 pub mod gs;
 mod printers;
+#[cfg(windows)]
 pub mod scan_host;
 #[cfg(windows)]
 pub mod scanner;
@@ -144,12 +145,12 @@ pub fn run() {
         .manage(commands::UnreadableRecords::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
-        .plugin(tauri_plugin_updater::Builder::new().build());
+        .plugin(tauri_plugin_shell::init());
 
     #[cfg(windows)]
     {
-        builder = builder.manage(scanner::ScannerSessions::new());
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build())
+	    .manage(scanner::ScannerSessions::new());
     }
 
     // In-app W3C WebDriver server (TRIAL). Double-gated on purpose: the
@@ -526,6 +527,7 @@ pub fn run() {
                 });
                 // The scanner host holds device locks, so it is ended here
                 // rather than left to the job object that backstops a crash.
+                #[cfg(windows)]
                 scan_host::shutdown();
             }
         });

@@ -235,7 +235,17 @@ pub fn get_engine_script_path<R: Runtime>(app: &AppHandle<R>) -> String {
 }
 
 /// Resolves the path to the embedded Python executable.
+#[cfg_attr(target_os = "linux", allow(unused_variables))]
 pub fn get_python_path<R: Runtime>(app: &AppHandle<R>) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        // Linux no longer bundles an interpreter: the .deb's postinst builds
+        // a venv against the system python3 at a fixed path. See
+        // debian/postinst and scripts/setup-python-embed.sh.
+        return "/usr/lib/spectrapdf/venv/bin/python".to_string();
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -246,6 +256,7 @@ pub fn get_python_path<R: Runtime>(app: &AppHandle<R>) -> String {
         resource_dir.join("python").join("bin").join("python")
     };
     path.to_string_lossy().to_string()
+    }
 }
 
 /// Resolves the path to the vendored native Tesseract.

@@ -1,8 +1,11 @@
 //! A worker and its descendants cannot outlive the process owning its writes.
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 
+#[cfg(windows)]
 pub struct ProcessJob(usize);
 
+#[cfg(windows)]
 impl ProcessJob {
     pub fn attach(pid: u32) -> Result<Self, String> {
         use std::ffi::c_void;
@@ -41,6 +44,7 @@ impl ProcessJob {
     }
 }
 
+#[cfg(windows)]
 impl Drop for ProcessJob {
     fn drop(&mut self) {
         unsafe {
@@ -49,11 +53,21 @@ impl Drop for ProcessJob {
     }
 }
 
+/// No job-object equivalent is wired up on this platform yet: the engine
+/// process is not killed if this process dies uncleanly. See KNOWN_BUGS-linux.md.
+#[cfg(not(windows))]
+pub struct ProcessJob;
+
+#[cfg(not(windows))]
+impl ProcessJob {
+    pub fn attach(_pid: u32) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::io::{BufRead, Write};
-    use std::process::{Command, Stdio};
+    use std::io::Write;
 
     #[test]
     #[ignore]
@@ -68,8 +82,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn dropping_the_owner_terminates_its_worker() {
+        use super::*;
+        use std::io::BufRead;
         use std::os::windows::process::CommandExt;
+        use std::process::{Command, Stdio};
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
