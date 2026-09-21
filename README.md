@@ -5,7 +5,7 @@
 [![Release recovery](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release-redo.yml?label=release%20recovery)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release-redo.yml)
 [![Latest release](https://img.shields.io/github/v/release/jasonulbright/Spectra-PDF?label=release)](https://github.com/jasonulbright/Spectra-PDF/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/jasonulbright/Spectra-PDF/total?label=downloads)](https://github.com/jasonulbright/Spectra-PDF/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Linux_/_Windows-0078D4)](#requirements)
 [![License](https://img.shields.io/github/license/jasonulbright/Spectra-PDF)](LICENSE)
 
 A modern, open-source PDF workbench for Windows. **Ported to linux: see the `linux-cross-platform` branch of this fork.**
