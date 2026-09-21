@@ -1,11 +1,17 @@
-import { PDFDocument, PDFArray, PDFDict, PDFHexString, PDFName, PDFPage, PDFString, degrees } from 'pdf-lib';
+import { PDFDocument, PDFArray, PDFDict, PDFHexString, PDFName, PDFNull, PDFObject, PDFPage, PDFRef, PDFStream, PDFString, degrees } from 'pdf-lib';
 
+import { tChrome } from '../i18n';
 import { MANIFEST_NAME, PDFX_VERSION } from './pdfx-format';
 import type { ExportAnnotation, ExportDocument, ExportPage, PdfxManifest } from './pdfx-format';
 import { carryAcroForm, prepareSourceForms, sourceHasXfa } from './acroform-carry';
 import type { FormContribution } from './acroform-carry';
 import { carryEmbeddedFiles } from './embedded-files-carry';
-import { carryDocumentCatalog } from './catalog-carry';
+import { carryDocumentCatalog, jumpsToRemovedPage } from './catalog-carry';
+import { carryOptionalContent } from './optional-content-carry';
+import { carryDocumentMetadata } from './metadata-carry';
+import { copyOutputIntents } from './output-intents-carry';
+import { carryFormatDeclarations, saveWithFormatDeclarations } from './format-declarations';
+import type { MetadataOverrides } from './metadata-process';
 import type { CarriedSourcePages } from './catalog-carry';
 import { carryStructTree } from './struct-carry';
 import { cloudBumps } from './annotation-manipulation';
@@ -220,7 +226,7 @@ function apMatrixFor(rotation: number): number[] {
   }
 }
 
-// The cloud border's scalloped path (rung 2) as PDF operators — the bump
+// The cloud border's scalloped path as PDF operators — the bump
 // geometry itself is shared with the SVG renderer (cloudBumps) so the two
 // looks cannot drift.
 function cloudPath(verts: [number, number][], r: number): string {
@@ -243,20 +249,21 @@ function stripImportedOriginals(
   copied: import('pdf-lib').PDFPage,
   annotations: ExportAnnotation[],
   removedImportedOriginals: NonNullable<ExportAnnotation['importedOriginal']>[],
-): void {
+): Map<ExportAnnotation, PDFObject> {
+  const layerGates = new Map<ExportAnnotation, PDFObject>();
   // Two sources of fingerprints to strip-on-match: annotations being
   // re-appended (live, possibly edited) and ones the user REMOVED (tombstones
   // — matched and stripped same as any other, just never re-appended after).
   // Without the latter, deleting an imported annotation would be a no-op:
   // its fingerprint vanishes with it, nothing left to match the real PDF
   // object against, and the "original" reappears on reindex after commit.
-  const fingerprints = [
-    ...annotations.map((a) => a.importedOriginal),
-    ...removedImportedOriginals,
-  ].filter((f): f is NonNullable<ExportAnnotation['importedOriginal']> => !!f);
-  if (fingerprints.length === 0) return;
+  const originals = annotations.flatMap(annotation => annotation.importedOriginal
+    ? [{ fingerprint: annotation.importedOriginal, annotation: annotation as ExportAnnotation | undefined }] : []);
+  originals.push(...removedImportedOriginals.map(fingerprint => ({ fingerprint, annotation: undefined })));
+  const fingerprints = originals.map(original => original.fingerprint);
+  if (fingerprints.length === 0) return layerGates;
   const annots = copied.node.lookupMaybe(PDFName.of('Annots'), PDFArray);
-  if (!annots) return;
+  if (!annots) return layerGates;
   const consumed = new Set<number>(); // indices into `fingerprints` already matched
   // Iterate back-to-front: PDFArray.remove(index) shifts later indices, which
   // would desync a forward loop's remaining indices mid-iteration.
@@ -270,7 +277,7 @@ function stripImportedOriginals(
     const subtype = dict.lookupMaybe(PDFName.of('Subtype'), PDFName)?.decodeText();
     const STRIPPABLE = new Set([
       'Square', 'FreeText', 'Ink', 'Stamp', 'Highlight', 'Underline', 'StrikeOut', 'Squiggly', 'Text',
-      // Rung 2 — the imported drawing shapes re-append like everything else.
+      // The imported drawing shapes re-append like everything else.
       'Circle', 'Line', 'Polygon', 'PolyLine',
     ]);
     if (!subtype || !STRIPPABLE.has(subtype)) continue;
@@ -291,8 +298,15 @@ function stripImportedOriginals(
     );
     if (matchIndex === -1) continue; // no positive match — never guess-remove
     consumed.add(matchIndex);
+    const annotation = originals[matchIndex].annotation;
+    const layer = dict.get(PDFName.of('OC'));
+    // Geometry and appearance are reauthored; layer membership is not.
+    // Its reference is already in the output context and configured by the
+    // optional-content carry, so the replacement uses that exact identity.
+    if (annotation && layer !== undefined) layerGates.set(annotation, layer);
     annots.remove(i);
   }
+  return layerGates;
 }
 
 /** The stroke width every dimension annotation is drawn at. */
@@ -317,7 +331,7 @@ function addAnnotations(
   stampImages: Map<string, import('pdf-lib').PDFImage>,
   signatureFonts: Map<string, import('pdf-lib').PDFFont>,
 ): void {
-  stripImportedOriginals(copied, annotations, removedImportedOriginals);
+  const layerGates = stripImportedOriginals(copied, annotations, removedImportedOriginals);
   const context = output.context;
   // CropBox (defaults to MediaBox when absent, so byte-identical for the
   // common case) — must match what annotation-import.ts reads via pdf.js's
@@ -410,8 +424,8 @@ function addAnnotations(
       annot.set(PDFName.of('DA'), PDFString.of(`${r} ${g} ${b} rg /Helv ${FREETEXT_FONT_SIZE} Tf`));
       annot.set(PDFName.of('Contents'), PDFHexString.fromText(text));
     } else if (a.kind === 'ink') {
-      // Rung 2's shared style edit reaches ink too: width + opacity (default
-      // 2 / opaque — byte-identical to the pre-rung-2 output when unset).
+      // The shared style edit reaches ink too: width + opacity (unset: width
+      // 2, opaque).
       // One /InkList entry AND one AP sub-path per stroke — a signature
       // of several pen lifts round-trips as exactly its strokes.
       const strokeW = a.strokeWidth ?? 2;
@@ -549,7 +563,7 @@ function addAnnotations(
       }
       if (a.note) annot.set(PDFName.of('Contents'), PDFHexString.fromText(a.note));
     } else if (a.kind === 'shape') {
-      // Rung 2: a drawing shape commits as its REAL subtype with a faithful
+      // A drawing shape commits as its REAL subtype with a faithful
       // appearance. /BS is ALWAYS written — its presence is what tells the
       // importer a /Square is a rectangle and not a highlight box.
       const strokeW = a.strokeWidth ?? 2;
@@ -681,7 +695,7 @@ function addAnnotations(
       if (a.opacity !== undefined && a.opacity < 1) annot.set(PDFName.of('CA'), context.obj(a.opacity));
       if (a.note) annot.set(PDFName.of('Contents'), PDFHexString.fromText(a.note));
     } else if (a.kind === 'callout') {
-      // Rung 2: /FreeText + /IT /FreeTextCallout + /CL. The whole appearance
+      // A callout is /FreeText + /IT /FreeTextCallout + /CL. The whole appearance
       // (text box + leader) is authored in DISPLAY space and counter-rotated
       // by the AP matrix like freetext; /CL itself is page-space semantic
       // data for other editors.
@@ -1203,6 +1217,8 @@ function addAnnotations(
       });
       if (a.note) annot.set(PDFName.of('Contents'), PDFHexString.fromText(a.note));
     }
+    const layer = layerGates.get(a);
+    if (layer !== undefined) annot.set(PDFName.of('OC'), layer);
     const ref = context.register(annot);
     let annots = copied.node.lookupMaybe(PDFName.of('Annots'), PDFArray);
     if (!annots) {
@@ -1303,6 +1319,166 @@ async function embedStampImages(
   return map;
 }
 
+// copyPages follows an explicit /Dest or GoTo chain into its target page and
+// writes that page into the output even when the build dropped it, as a page
+// object outside the page tree. On the loaded source copy, before copying, a
+// link's /Dest, an annotation's /A, and each page or annotation /AA trigger
+// that jumps to a removed page is deleted. A named destination pulls no page
+// object and stays as written.
+function dropJumpsToRemovedPages(doc: PDFDocument, keptIndices: number[]): void {
+  const pages = doc.getPages();
+  const all = new Set(pages.map(page => page.ref.tag));
+  const kept = new Set(keptIndices.flatMap(index => pages[index] ? [pages[index].ref.tag] : []));
+  const removed = (destination: PDFObject): boolean => {
+    const value = doc.context.lookup(destination);
+    const target = value instanceof PDFArray && value.size() > 0 ? value.get(0) : undefined;
+    return target instanceof PDFRef && all.has(target.tag) && !kept.has(target.tag);
+  };
+  const removedAnnots = new Set<string>();
+  pages.forEach(page => {
+    if (kept.has(page.ref.tag)) return;
+    const annots = doc.context.lookup(page.node.get(PDFName.of('Annots')));
+    if (annots instanceof PDFArray) for (const raw of annots.asArray()) if (raw instanceof PDFRef) removedAnnots.add(raw.tag);
+  });
+  const onRemovedPage = (raw: PDFObject | undefined): boolean => {
+    if (!(raw instanceof PDFRef)) return false;
+    if (removedAnnots.has(raw.tag)) return true;
+    const target = doc.context.lookup(raw), page = target instanceof PDFDict ? target.get(PDFName.of('P')) : undefined;
+    return page instanceof PDFRef && all.has(page.tag) && !kept.has(page.tag);
+  };
+  const dropTriggers = (owner: PDFDict) => {
+    const triggers = doc.context.lookup(owner.get(PDFName.of('AA')));
+    if (!(triggers instanceof PDFDict)) return;
+    for (const [key, action] of triggers.entries()) {
+      if (jumpsToRemovedPage(doc.context, action, removed)) triggers.delete(key);
+    }
+  };
+  for (const index of new Set(keptIndices)) {
+    if (!pages[index]) continue;
+    dropTriggers(pages[index].node);
+    const annots = doc.context.lookup(pages[index].node.get(PDFName.of('Annots')));
+    if (!(annots instanceof PDFArray)) continue;
+    for (const raw of annots.asArray()) {
+      const annot = doc.context.lookup(raw);
+      if (!(annot instanceof PDFDict)) continue;
+      const dest = annot.get(PDFName.of('Dest'));
+      if (annot.lookup(PDFName.of('Subtype')) === PDFName.of('Link') && dest !== undefined && removed(dest)) annot.delete(PDFName.of('Dest'));
+      if (jumpsToRemovedPage(doc.context, annot.get(PDFName.of('A')), removed)) annot.delete(PDFName.of('A'));
+      dropTriggers(annot);
+      if (onRemovedPage(annot.get(PDFName.of('Popup')))) annot.delete(PDFName.of('Popup'));
+      if (onRemovedPage(annot.get(PDFName.of('IRT')))) { annot.delete(PDFName.of('IRT')); annot.delete(PDFName.of('RT')); }
+      if (annot.lookup(PDFName.of('Subtype')) === PDFName.of('Popup') && onRemovedPage(annot.get(PDFName.of('Parent')))) annot.delete(PDFName.of('Parent'));
+    }
+  }
+  // ISO 32000-2 12.4.3/Tables 159-160: beads form a circular /N-/V ring and
+  // the thread's /F bead carries /T. Beads on removed pages leave the ring;
+  // a thread left without beads is reachable from nothing and is not carried.
+  const threads = new Map<string, PDFRef>();
+  const catalogThreads = doc.context.lookup(doc.catalog.get(PDFName.of('Threads')));
+  if (catalogThreads instanceof PDFArray) for (const raw of catalogThreads.asArray()) if (raw instanceof PDFRef) threads.set(raw.tag, raw);
+  for (const index of new Set(keptIndices)) {
+    const beads = pages[index] ? doc.context.lookup(pages[index].node.get(PDFName.of('B'))) : undefined;
+    if (!(beads instanceof PDFArray)) continue;
+    for (const raw of beads.asArray()) {
+      const bead = doc.context.lookup(raw), thread = bead instanceof PDFDict ? bead.get(PDFName.of('T')) : undefined;
+      if (thread instanceof PDFRef) threads.set(thread.tag, thread);
+    }
+  }
+  for (const threadRef of threads.values()) {
+    const thread = doc.context.lookup(threadRef);
+    if (!(thread instanceof PDFDict)) continue;
+    const ring: PDFRef[] = [], seen = new Set<string>();
+    let cursor = thread.get(PDFName.of('F')), closed = false;
+    while (cursor instanceof PDFRef && !seen.has(cursor.tag) && seen.size < 100000) {
+      seen.add(cursor.tag);
+      const bead = doc.context.lookup(cursor);
+      if (!(bead instanceof PDFDict)) break;
+      ring.push(cursor);
+      cursor = bead.get(PDFName.of('N'));
+      closed = cursor instanceof PDFRef && cursor.tag === ring[0].tag;
+    }
+    if (!closed) continue;
+    const onKept = ring.filter(ref => {
+      const page = doc.context.lookup(ref, PDFDict).get(PDFName.of('P'));
+      return page instanceof PDFRef && kept.has(page.tag);
+    });
+    if (onKept.length === ring.length || onKept.length === 0) continue;
+    onKept.forEach((ref, i) => {
+      const bead = doc.context.lookup(ref, PDFDict);
+      bead.set(PDFName.of('N'), onKept[(i + 1) % onKept.length]);
+      bead.set(PDFName.of('V'), onKept[(i - 1 + onKept.length) % onKept.length]);
+    });
+    thread.set(PDFName.of('F'), onKept[0]);
+    doc.context.lookup(onKept[0], PDFDict).set(PDFName.of('T'), threadRef);
+  }
+}
+
+interface PagePlacement { doc: PDFDocument; srcIndex: number; outPage: PDFPage }
+
+// copyPages registers a second clone of a page leaf whenever the copied graph
+// references that page (an annotation /P, a link or action destination, a
+// bead), so the reference names a leaf outside the page tree that no viewer
+// can reach. A reference to a placed page re-binds to its FIRST placement in
+// output order, found by walking each source page and its copy in parallel
+// (copyPages preserves shape). Page references never live in content,
+// resources, thumbnails or streams, so the walk skips them; it is iterative
+// and visits each output object once, so page size cannot exhaust it. A
+// detached leaf nothing references afterwards is deleted.
+const NO_PAGE_REFERENCES = new Set(['Parent', 'Resources', 'Contents', 'Thumb'].map(key => PDFName.of(key)));
+function bindDetachedPageCopies(output: PDFDocument, placements: PagePlacement[]): void {
+  const TYPE = PDFName.of('Type'), PAGE = PDFName.of('Page');
+  const tree = new Set(output.getPages().map(page => page.ref.tag));
+  const detached = new Map<string, PDFRef>();
+  for (const [ref, obj] of output.context.enumerateIndirectObjects()) {
+    if (obj instanceof PDFDict && obj.lookup(TYPE) === PAGE && !tree.has(ref.tag)) detached.set(ref.tag, ref);
+  }
+  if (detached.size === 0) return;
+  const first = new Map<PDFDocument, Map<string, PDFRef>>();
+  for (const { doc, srcIndex, outPage } of placements) {
+    let byTag = first.get(doc);
+    if (!byTag) { byTag = new Map(); first.set(doc, byTag); }
+    const tag = doc.getPage(srcIndex).ref.tag;
+    if (!byTag.has(tag)) byTag.set(tag, outPage.ref);
+  }
+  interface Step { doc: PDFDocument; src: PDFObject | undefined; out: PDFObject | undefined; rebind?: (ref: PDFRef) => void }
+  const stack: Step[] = placements.map(({ doc, srcIndex, outPage }) => ({ doc, src: doc.getPage(srcIndex).node, out: outPage.node }));
+  const seen = new Set<PDFObject>();
+  for (let step = stack.pop(); step; step = stack.pop()) {
+    const { doc, src, out, rebind } = step;
+    if (src instanceof PDFRef) {
+      if (!(out instanceof PDFRef)) continue;
+      const target = doc.context.lookup(src);
+      if (target instanceof PDFDict && target.lookup(TYPE) === PAGE) {
+        const placed = detached.has(out.tag) ? first.get(doc)?.get(src.tag) : undefined;
+        if (placed && rebind) rebind(placed);
+        continue;
+      }
+      stack.push({ doc, src: target, out: output.context.lookup(out) });
+      continue;
+    }
+    if (src === undefined || out === undefined || seen.has(out)) continue;
+    seen.add(out);
+    if (src instanceof PDFDict && out instanceof PDFDict) {
+      for (const [key, value] of src.entries()) {
+        if (!NO_PAGE_REFERENCES.has(key)) stack.push({ doc, src: value, out: out.get(key), rebind: ref => out.set(key, ref) });
+      }
+    } else if (src instanceof PDFArray && out instanceof PDFArray) {
+      for (let i = 0; i < Math.min(src.size(), out.size()); i++) {
+        stack.push({ doc, src: src.get(i), out: out.get(i), rebind: ref => out.set(i, ref) });
+      }
+    }
+  }
+  const referenced = new Set<string>();
+  const scan = (obj: PDFObject): void => {
+    if (obj instanceof PDFRef) { if (detached.has(obj.tag)) referenced.add(obj.tag); }
+    else if (obj instanceof PDFDict) for (const [, value] of obj.entries()) scan(value);
+    else if (obj instanceof PDFArray) for (const value of obj.asArray()) scan(value);
+    else if (obj instanceof PDFStream) scan(obj.dict);
+  };
+  for (const [ref, obj] of output.context.enumerateIndirectObjects()) if (!detached.has(ref.tag)) scan(obj);
+  for (const [tag, ref] of detached) if (!referenced.has(tag)) output.context.delete(ref);
+}
+
 // Load each distinct source once, prepare its form-field trees for the kept
 // subset of pages, and copy every kept page in ONE copyPages call per source
 // — pdf-lib's object copier caches per call, so a field tree shared by
@@ -1315,7 +1491,23 @@ async function assemblePages(
   output: PDFDocument,
   pages: ExportPage[],
   ownSourceKey?: string,
+  ownBytes?: Uint8Array,
+  metadataOverrides: MetadataOverrides = {},
 ): Promise<void> {
+  // Catalog defaults belong to the document; explicit page conditions belong
+  // to that physical page. Cache per source/value so repeated page occurrences
+  // share an already validated, byte-identical intent graph.
+  const intentCopies = new Map<PDFDocument, Map<PDFObject | undefined, PDFArray | undefined>>();
+  const carryIntents = (source: PDFDocument, sourceRoot: PDFDict, targetRoot: PDFDict) => {
+    const raw = sourceRoot.get(PDFName.of('OutputIntents'));
+    const value = raw === undefined ? undefined : source.context.lookup(raw);
+    let copies = intentCopies.get(source);
+    if (!copies) { copies = new Map(); intentCopies.set(source, copies); }
+    if (!copies.has(value)) copies.set(value, copyOutputIntents(output, source, raw));
+    const copied = copies.get(value);
+    if (copied) targetRoot.set(PDFName.of('OutputIntents'), output.context.getObjectRef(copied) ?? copied);
+    else targetRoot.delete(PDFName.of('OutputIntents'));
+  };
   const groups = new Map<string, { bytes: Uint8Array; indices: number[] }>();
   for (const page of pages) {
     let g = groups.get(page.sourceKey);
@@ -1331,7 +1523,7 @@ async function assemblePages(
   >();
   const contributions: FormContribution[] = [];
   for (const [key, g] of groups) {
-    const doc = await PDFDocument.load(g.bytes, { ignoreEncryption: true });
+    const doc = await PDFDocument.load(g.bytes, { ignoreEncryption: true, updateMetadata: false });
     if (sourceHasXfa(doc)) {
       // Page surgery on an XFA form detaches the form from its pages
       // (the XFA template lays out its own) — refuse with the reason rather
@@ -1344,6 +1536,7 @@ async function assemblePages(
       );
     }
     prepareSourceForms(doc, g.indices);
+    dropJumpsToRemovedPages(doc, g.indices);
     const copied = await output.copyPages(doc, g.indices);
     const copiedByIndex = new Map<number, PDFPage>();
     g.indices.forEach((idx, i) => copiedByIndex.set(idx, copied[i]));
@@ -1354,21 +1547,35 @@ async function assemblePages(
   const stampImages = await embedStampImages(output, pages);
   const signatureFonts = await embedSignatureFonts(output, pages);
   const used = new Set<PDFPage>();
+  const pendingExtras: { copied: PDFPage; page: ExportPage }[] = [];
   // Which source page landed at which output page — the reference-identity
   // channel every catalog/struct remap depends on (catalog-carry.ts).
   const pairsByKey = new Map<string, { srcIndex: number; outPage: PDFPage }[]>();
+  const placements: PagePlacement[] = [];
   for (const page of pages) {
     const src = sources.get(page.sourceKey)!;
     let copied = src.copiedByIndex.get(page.pageIndex);
     if (!copied || used.has(copied)) {
-      // Defensive only: no workspace op can put the same source page into the
-      // output twice today. If one ever does, the duplicate gets its own copy
-      // rather than one page object being mutated through two ExportPages.
+      // The same source page placed twice (a file imported into itself, a
+      // merge of two partitions of one file) gets its own copy rather than
+      // one page object being mutated through two ExportPages.
       [copied] = await output.copyPages(src.doc, [page.pageIndex]);
     }
     used.add(copied);
-    applyPageExtras(copied, page, output, stampImages, signatureFonts);
+    carryIntents(src.doc, src.doc.getPage(page.pageIndex).node, copied.node);
+    // Layer identity is paired against the untouched copy. Adding/removing
+    // an annotation or wrapping Contents first changes that graph's shape.
+    pendingExtras.push({ copied, page });
     output.addPage(copied);
+    // copyPages clones the page leaf separately from its recursive object
+    // cache. An annotation's /P can therefore name a second, detached copy
+    // of that leaf. Bind existing backpointers to the page actually inserted;
+    // otherwise even a comment/rotation makes incremental preservation refuse.
+    // Leave optional, absent /P entries absent (no invented annotation delta).
+    for (const ref of copied.node.Annots()?.asArray() ?? []) {
+      const annotation = output.context.lookup(ref, PDFDict);
+      if (annotation.has(PDFName.of('P'))) annotation.set(PDFName.of('P'), copied.ref);
+    }
     src.contribution.copiedPages.push(copied);
     let pairs = pairsByKey.get(page.sourceKey);
     if (!pairs) {
@@ -1376,7 +1583,9 @@ async function assemblePages(
       pairsByKey.set(page.sourceKey, pairs);
     }
     pairs.push({ srcIndex: page.pageIndex, outPage: copied });
+    placements.push({ doc: src.doc, srcIndex: page.pageIndex, outPage: copied });
   }
+  bindDetachedPageCopies(output, placements);
   carryAcroForm(output, contributions);
   // The structure tree: EVERY source contributes its surviving tags —
   // a donor page's MCIDs arrive in its copied stream, so its subtree must
@@ -1386,30 +1595,115 @@ async function assemblePages(
     doc: s.doc,
     pairs: pairsByKey.get(key) ?? [],
   }));
-  carryStructTree(output, carriedSources);
-  // Document-level catalog state (/Lang, /ViewerPreferences, /Outlines,
-  // /PageLabels, /OCProperties) carries from the OWN source only — a page
-  // inserted from a donor must not import the donor document's bookmarks or
-  // layer config (the embedded-files rule).
+  const formatSources = carriedSources.map(source => source.doc);
+  // Layer state belongs to every source whose content we copy. Resolve the
+  // owner separately: its registry/configurations survive even with no pages.
+  let owner: CarriedSourcePages | undefined;
   if (ownSourceKey) {
     const own = sources.get(ownSourceKey);
     const ownPairs = pairsByKey.get(ownSourceKey);
-    if (own && ownPairs && ownPairs.length > 0) {
-      carryDocumentCatalog(output, { doc: own.doc, pairs: ownPairs });
-      carryInfoDates(output, own.doc);
+    // Document ownership is independent of retained page membership. Zero
+    // own pages still carries its language, preferences, dates and behavior;
+    // page-relative entries use an empty map, never the donor's namespace.
+    const ownDoc = own?.doc ?? (ownBytes ? await PDFDocument.load(ownBytes, { ignoreEncryption: true, updateMetadata: false }) : undefined);
+    if (ownDoc) {
+      owner = { doc: ownDoc, pairs: ownPairs ?? [] };
     }
   }
+  const optionalContent = carryOptionalContent(output, carriedSources, owner);
+  if (optionalContent.properties) output.catalog.set(PDFName.of('OCProperties'),
+    output.context.getObjectRef(optionalContent.properties) ?? output.context.register(optionalContent.properties));
+  for (const { copied, page } of pendingExtras) applyPageExtras(copied, page, output, stampImages, signatureFonts);
+  const structureMaps = carryStructTree(output, carriedSources);
+  // Bookmarks, language, preferences and document actions remain owner-only.
+  // Actions use the same actual layer identities as the composed registry.
+  if (owner) {
+    formatSources.push(owner.doc);
+    carryDocumentCatalog(output, owner, structureMaps.get(owner.doc), optionalContent.identities.get(owner.doc));
+    carryDocumentInfo(output, owner.doc);
+    await carryDocumentMetadata(output, owner.doc, metadataOverrides);
+    carryIntents(owner.doc, owner.doc.catalog, output.catalog);
+  }
+  carryFormatDeclarations(output, formatSources);
 }
 
-/** /CreationDate and /ModDate travel from the source document, never the run's
- * clock: a clock-stamped Info dict puts different bytes in the file on every
- * commit of the same document, which breaks byte-identity between an in-place
- * save and its control. A source with no date leaves the output with none. */
-function carryInfoDates(output: PDFDocument, source: PDFDocument): void {
-  const created = source.getCreationDate();
-  if (created) output.setCreationDate(created);
-  const modified = source.getModificationDate();
-  if (modified) output.setModificationDate(modified);
+// Info entries this builder generates for itself. A carried value would be
+// overwritten by the explicit set after assembly, so the carry skips the key
+// outright rather than depending on that ordering.
+const GENERATED_INFO_KEYS = new Set(['/Producer']);
+
+// ISO 32000-2 Table 349: /Trapped is the one name-valued Info entry, and its
+// value is one of three names (not the booleans that spell the same words).
+// An unlisted name is not a value this carry can preserve as meaningful.
+const TRAPPED_NAMES = new Set(['/True', '/False', '/Unknown']);
+
+/** pdf-lib's own getInfoDict is private; this is the same lazy shape — the
+ * trailer's existing /Info, or one registered on first use. */
+function outputInfoDict(output: PDFDocument): PDFDict {
+  const existing = output.context.lookup(output.context.trailerInfo.Info);
+  if (existing instanceof PDFDict) return existing;
+  const created = output.context.obj({});
+  output.context.trailerInfo.Info = output.context.register(created);
+  return created;
+}
+
+/** The OWN document's whole Info dictionary travels to the rebuild — not just
+ * its dates. A from-scratch rebuild otherwise published a document whose
+ * title, author and private entries were silently gone.
+ *
+ * Values carry as RAW OBJECTS, never through a decode/re-encode: pdf-lib's
+ * date accessors parse to a JS Date and re-serialize as UTC `D:…Z`, which
+ * drops the timezone offset and pads a partial date out to a full timestamp.
+ * Cloning the leaf keeps the original string kind (literal vs hex), its exact
+ * bytes and whatever precision the source actually wrote. Dates in particular
+ * never come from the run's clock: a clock-stamped Info dict puts different
+ * bytes in the file on every commit of the same document, which breaks
+ * byte-identity between an in-place save and its control.
+ *
+ * ISO 32000-2 14.3.3 makes /Info optional and requires every entry outside
+ * /CreationDate and /ModDate to be a text string; Table 349 adds /Trapped as
+ * the sole name. So a conforming Info dict holds only leaf scalars, and an
+ * entry resolving to anything else (a dict, an array, a stream) is refused
+ * before the output is touched — never dropped silently, and never followed
+ * into an object graph this carry has no business copying.
+ *
+ * Absence stays absence, including /Trapped, whose absent-means-Unknown
+ * default is not materialized. Per 7.3.9 an entry whose value is null, and a
+ * reference to a nonexistent object, are both equivalent to omitting the
+ * entry, so those are absent entries rather than malformed ones.
+ */
+function carryDocumentInfo(output: PDFDocument, source: PDFDocument): void {
+  const raw = source.context.trailerInfo.Info;
+  if (raw === undefined) return;
+  const fail = () => new Error(tChrome('app.operation.unverified'));
+  const info = source.context.lookup(raw);
+  if (info === undefined || info === PDFNull) return;
+  if (!(info instanceof PDFDict)) throw fail();
+  // The one permitted leaf for a key: `undefined` for an entry that is really
+  // absent, the leaf to clone, or a refusal. Resolving is as far as this goes
+  // — a dict, array or stream value never gets followed, so no page graph is
+  // cloned and no cycle is walked.
+  const leaf = (key: PDFName, value: PDFObject): PDFObject | undefined => {
+    const resolved = source.context.lookup(value);
+    if (resolved === undefined || resolved === PDFNull) return undefined;
+    if (key.asString() === '/Trapped') {
+      if (resolved instanceof PDFName && TRAPPED_NAMES.has(resolved.asString())) return resolved;
+      throw fail();
+    }
+    if (resolved instanceof PDFString || resolved instanceof PDFHexString) return resolved;
+    throw fail();
+  };
+  // Resolve and validate every entry BEFORE publishing any of them: a refusal
+  // must not leave the output holding half a document's identity.
+  const carried: [PDFName, PDFObject][] = [];
+  for (const [key, value] of info.entries()) {
+    if (GENERATED_INFO_KEYS.has(key.asString())) continue;
+    const resolved = leaf(key, value);
+    if (resolved) carried.push([key, resolved.clone()]);
+  }
+  if (carried.length === 0) return;
+  const target = outputInfoDict(output);
+  for (const [key, value] of carried) target.set(key, value);
 }
 
 export async function buildPdf(
@@ -1422,16 +1716,19 @@ export async function buildPdf(
   if (pages.length === 0) throw new Error('buildPdf: cannot build a PDF with no pages');
   // updateMetadata:false: pdf-lib's constructor otherwise stamps /ModDate and
   // /CreationDate from `new Date()`, so two builds of the same input differ
-  // whenever they straddle a second boundary. Dates travel from the source
-  // (carryInfoDates); /Producer is set explicitly below.
+  // whenever they straddle a second boundary. The whole Info dictionary
+  // travels from the source instead (carryDocumentInfo); /Producer is the one
+  // entry this builder generates, set explicitly below.
   const output = await PDFDocument.create({ updateMetadata: false });
-  await assemblePages(output, pages, ownSourceKey);
+  await assemblePages(output, pages, ownSourceKey, ownBytes, { producer: `PDFX ${PDFX_VERSION}` });
   // Document-level catalog trees (/Names /EmbeddedFiles, /Collection) are not
   // page subtrees — without this carry a committed page edit deleted every
   // attachment (embedded-files-carry.ts).
   if (ownBytes) await carryEmbeddedFiles(output, ownBytes);
+  // Names the writer, so it describes this build and not the source's tool.
+  // GENERATED_INFO_KEYS keeps the carry off the key; this is its only writer.
   output.setProducer(`PDFX ${PDFX_VERSION}`);
-  return output.save();
+  return saveWithFormatDeclarations(output);
 }
 
 export async function buildPdfx(
@@ -1444,7 +1741,9 @@ export async function buildPdfx(
   const manifest: PdfxManifest = { pdfx: PDFX_VERSION, title, documents: [] };
 
   const nonEmpty = documents.filter((doc) => doc.pages.length > 0);
-  await assemblePages(output, nonEmpty.flatMap((doc) => doc.pages), ownSourceKey);
+  await assemblePages(output, nonEmpty.flatMap((doc) => doc.pages), ownSourceKey, ownBytes, {
+    producer: `PDFX ${PDFX_VERSION}`, title, keywords: 'PDFX',
+  });
   // Carry BEFORE the manifest attach: pdf-lib's save-time embed appends to an
   // existing tree, so the manifest and carried members coexist (pinned by
   // embedded-files-carry.test.ts's pdfx leg).
@@ -1460,9 +1759,14 @@ export async function buildPdfx(
     description: 'PDFX manifest describing the documents in this collection',
   });
 
+  // A collection describes itself, so these three OVERRIDE whatever the own
+  // document's Info carried: the title is the collection's name, not a member
+  // document's, and the keyword is what identifies the file as a collection.
+  // Every other carried entry (author, subject, creator, dates, private
+  // fields) survives untouched.
   output.setTitle(title);
   output.setProducer(`PDFX ${PDFX_VERSION}`);
   output.setKeywords(['PDFX']);
 
-  return output.save();
+  return saveWithFormatDeclarations(output);
 }

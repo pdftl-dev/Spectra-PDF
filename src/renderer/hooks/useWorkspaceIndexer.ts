@@ -1,8 +1,9 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useAppState, useAppDispatch } from '../state/AppStateProvider';
 import { indexOpenFile } from '../lib/workspace';
-import { evictExcept } from '../lib/pdfDocCache';
-import type { PdfBuffer } from '../state/types';
+import { evictDocumentProxy, evictExcept, subscribeProxyEvictions } from '../lib/pdfDocCache';
+import { createIndexRuns } from '../lib/index-runs';
+import { indexFailed, needsIndex, recordIndexFailure, recordIndexSuccess, subscribeIndexRetries } from '../lib/workspace-settle';
 
 // Keeps AppState.workspace in sync with AppState.files. Whenever a file's
 // buffer changes (open, whole-file op, undo/redo), its workspace documents are
@@ -12,11 +13,29 @@ import type { PdfBuffer } from '../state/types';
 export function useWorkspaceIndexer(): void {
   const state = useAppState();
   const dispatch = useAppDispatch();
-  // path -> buffer an index run was started for, so a buffer is indexed once
-  // even while the run is still in flight
-  const inFlight = useRef(new Map<string, PdfBuffer>());
+  // One live run per path, so a buffer is indexed once even while its run is
+  // still in flight, and only the live run lands.
+  const runs = useRef(createIndexRuns());
+  // A destroyed proxy abandons the run reading it; this re-runs the pass that
+  // starts it again.
+  const [restarts, setRestarts] = useState(0);
+
+  useEffect(() => subscribeIndexRetries((path, buffer) => {
+    runs.current.abandon(path, buffer);
+    evictDocumentProxy(path, buffer);
+    setRestarts(n => n + 1);
+  }), []);
+
+  useEffect(
+    () =>
+      subscribeProxyEvictions((path, buffer) => {
+        if (runs.current.abandon(path, buffer)) setRestarts((n) => n + 1);
+      }),
+    [],
+  );
 
   useEffect(() => {
+    const indexed = { files: state.files, workspace: state.workspace };
     evictExcept(new Set(state.files.keys()));
     for (const [path, f] of state.files) {
       const buffer = f.buffer;
@@ -24,20 +43,25 @@ export function useWorkspaceIndexer(): void {
       // Byte-only import sources provide bytes for rendering/commit only
       // — never a strip. evictExcept above still keeps their proxy alive.
       if (f.importOnly) continue;
-      const current = state.workspace.documents.find((d) => d.path === path);
-      if (current && current.buffer === buffer) continue;
-      if (inFlight.current.get(path) === buffer) continue;
-      inFlight.current.set(path, buffer);
+      if (!needsIndex(indexed, path)) continue;
+      if (indexFailed(buffer)) continue;
+      const token = runs.current.begin(path, buffer);
+      if (token === null) continue;
       indexOpenFile(f)
-        .then((documents) => dispatch({ type: 'SET_WORKSPACE_DOCUMENTS', path, documents }))
-        .catch(() => {
-          // Unindexable buffer (shouldn't happen for a file that opened) —
-          // leave the workspace entry absent/stale rather than surfacing an
-          // error for state no UI reads yet.
+        .then((documents) => {
+          if (!runs.current.live(path, token)) return;
+          recordIndexSuccess(buffer);
+          dispatch({ type: 'SET_WORKSPACE_DOCUMENTS', path, documents });
         })
-        .finally(() => {
-          if (inFlight.current.get(path) === buffer) inFlight.current.delete(path);
-        });
+        .catch((error: unknown) => {
+          // Bytes pdf.js cannot load, or whose pages it cannot read, even
+          // where the engine opened them: the workspace entry stays absent or
+          // superseded. The canvas says so in place of the pages, and a commit
+          // waiting for this landing is released with a refusal that carries
+          // this error instead of waiting on.
+          if (runs.current.live(path, token)) recordIndexFailure(buffer, error);
+        })
+        .finally(() => runs.current.end(path, token));
     }
-  }, [state.files, state.workspace, dispatch]);
+  }, [state.files, state.workspace, dispatch, restarts]);
 }

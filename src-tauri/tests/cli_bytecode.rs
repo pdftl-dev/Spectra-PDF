@@ -3,8 +3,8 @@
 //! The windowed engine spawn and the CLI's spawn are two code paths onto one
 //! interpreter; a regression in either writes `__pycache__` beside every
 //! imported engine module, so an install grows files no uninstall removes.
-//! The unit tests in `cli.rs` cover argument parsing; this is the only test
-//! that launches the real binary and reads the tree it leaves behind.
+//! The unit tests in `cli.rs` cover argument parsing; this test launches the
+//! real binary and reads the tree it leaves behind.
 //!
 //! The binary resolves `python/` and `engine/` beside itself, so the run is
 //! made against a copy: the exe and a fresh copy of the engine tree in a
@@ -80,7 +80,7 @@ fn check_writes_no_bytecode_into_the_engine_payload() {
             engine.join("__startup__.py").is_file()
         );
         eprintln!(
-            "skipped: no provisioned python/engine beside {} (see punchlist § Dev environment notes)",
+            "skipped: no provisioned python/engine beside {} (scripts/setup-python-embed.ps1 provisions it)",
             exe.display()
         );
         return;

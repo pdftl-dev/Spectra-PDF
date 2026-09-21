@@ -47,6 +47,7 @@ def search_and_redact(
     allow_signed: bool = False,
     properties=None,
     font_dir: str = "",
+    gs_path: str = "",
 ) -> dict:
     """Redact every occurrence of `query` / `terms` / `patterns` in one file.
 
@@ -56,12 +57,19 @@ def search_and_redact(
     `marks_only` writes `/Redact` annotations and removes nothing -- the
     interchange format, for a sweep whose output a person reviews and applies.
     `properties` carries the redaction appearance keys onto every region.
+    `gs_path` is the configured Ghostscript, or "" when none is configured.
+    Only a hit over part of a JBIG2 scan needs one, to decode it. A configured
+    path is the only one that decode uses, and "" lets the capability
+    authority search; with no usable Ghostscript that image refuses by name.
 
     A document whose own signatures forbid the edit REFUSES; one they merely
     make invalid refuses unless `allow_signed` says the caller accepted that.
     """
     edit_class = "annotate" if marks_only else "structural"
     decision = signed_edit_decision(signature_policy(file), edit_class)
+    if decision.get("reason") == "signature-policy-unreadable":
+        from engine.docmdp import refuse_unreadable_policy
+        refuse_unreadable_policy()
     if decision["kind"] == "refuse":
         raise RuntimeError(
             "this document is certified to allow no changes, so redacting it "
@@ -121,7 +129,7 @@ def search_and_redact(
     if marks_only:
         written = save_redaction_marks(file, output, regions)
     else:
-        written = redact(file, output, regions, font_dir)
+        written = redact(file, output, regions, font_dir, gs_path)
     written.pop("output", None)
     result.update(written)
     return result

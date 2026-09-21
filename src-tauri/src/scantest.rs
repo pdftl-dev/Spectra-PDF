@@ -1,6 +1,6 @@
 //! The guided scanner checklist runner behind `spectrapdf scan-test`.
 //!
-//! Doc 71 §7.3 is a checklist most of whose rows cannot be posed on a
+//! Most rows of the scanner checklist cannot be posed on a
 //! flatbed-only device. This module is what a tester with the missing
 //! hardware runs: the rows that can be judged from the staged pages are
 //! judged here, the rows that need a physical act (load the feeder, pull the
@@ -355,6 +355,7 @@ pub fn page_evidence(path: &Path) -> PageEvidence {
             format!("truncated ({actual} of {declared} bytes)")
         }
         crate::scanner::PageIntegrity::Unverifiable => "unverifiable".to_string(),
+        crate::scanner::PageIntegrity::Unreadable { error } => format!("unreadable: {error}"),
     };
     let mut evidence = PageEvidence {
         file,
@@ -1669,7 +1670,9 @@ fn attach(pages: &[String], out: &Path, row: &str, console: &dyn Console) -> Vec
         let from = Path::new(page);
         let Some(name) = from.file_name() else { continue };
         let to = dir.join(name);
-        match std::fs::copy(from, &to) {
+        // A report from an earlier run in this folder names the scan it
+        // replaces, so the scan is replaced whole or not at all.
+        match crate::staging::export_copy(from, &to) {
             Ok(_) => saved.push(to.to_string_lossy().to_string()),
             Err(e) => console.say(&format!("  Could not copy {}: {e}", from.display())),
         }
@@ -2294,8 +2297,9 @@ pub fn write_report(report: &Report, out: &Path) -> Result<(PathBuf, PathBuf), S
     let json_path = out.join("scan-test-report.json");
     let text_path = out.join("scan-test-report.txt");
     let json = serde_json::to_string_pretty(report).map_err(|e| e.to_string())?;
-    std::fs::write(&json_path, json).map_err(|e| format!("Could not write the report: {e}"))?;
-    std::fs::write(&text_path, report.to_text())
+    crate::staging::export_record(&json_path, json.as_bytes())
+        .map_err(|e| format!("Could not write the report: {e}"))?;
+    crate::staging::export_record(&text_path, report.to_text().as_bytes())
         .map_err(|e| format!("Could not write the report: {e}"))?;
     Ok((json_path, text_path))
 }
@@ -2386,7 +2390,7 @@ mod tests {
             assert!(row.minutes > 0, "row {} has no time estimate", row.id);
             assert!(super::row(row.id).is_some());
         }
-        // The rows the owner's flatbed could not close are all here: this is
+        // The rows a flatbed-only device cannot close are all here: this is
         // the reason the runner exists.
         for id in ["3", "4", "5", "6", "7", "8", "9", "10", "14"] {
             assert!(seen.contains(id), "row {id} is missing from the runner");
@@ -3040,5 +3044,107 @@ mod tests {
         }
         assert!(listing.contains("document feeder"), "{listing}");
         assert!(listing.contains("minutes"), "{listing}");
+    }
+
+    /// The report and the scans beside it go through the staged writer, which
+    /// is also what reclaims the stage a run killed mid-write left.
+    #[cfg(windows)]
+    #[test]
+    fn the_report_and_its_scans_land_whole() {
+        let out = tempfile::tempdir().expect("a temp dir");
+        let mut writer = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("a child");
+        writer.wait().expect("the child exits");
+        let scans = out.path().join("scan-test-scans").join("row-1");
+        std::fs::create_dir_all(&scans).expect("the scans folder");
+        let orphans = [
+            crate::staging::stage_path(&out.path().join("scan-test-report.json"), writer.id()),
+            crate::staging::stage_path(&out.path().join("scan-test-report.txt"), writer.id()),
+            crate::staging::stage_path(&scans.join("page-0000.bmp"), writer.id()),
+        ];
+        for orphan in &orphans {
+            std::fs::write(orphan, b"torn").expect("an orphan");
+        }
+        std::fs::write(scans.join("page-0000.bmp"), b"BM an earlier run's page").expect("old");
+        let page = out.path().join("page-0000.bmp");
+        std::fs::write(&page, b"BM this run's page").expect("a page");
+
+        let saved = attach(
+            &[page.to_string_lossy().to_string()],
+            out.path(),
+            "1",
+            &ScriptedConsole::eof(),
+        );
+        let report = empty_report();
+        let (json, text) = write_report(&report, out.path()).expect("the report");
+
+        let copied = scans.join("page-0000.bmp");
+        assert_eq!(saved, vec![copied.to_string_lossy().to_string()]);
+        assert_eq!(std::fs::read(&copied).expect("the scan"), b"BM this run's page");
+        assert!(orphans.iter().all(|orphan| !orphan.exists()));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(json).expect("json")).expect("parses");
+        assert_eq!(parsed["device_name"], "Test Scanner");
+        assert_eq!(std::fs::read_to_string(text).expect("text"), report.to_text());
+    }
+
+    fn empty_report() -> Report {
+        Report {
+            schema: REPORT_SCHEMA,
+            tool: "spectrapdf scan-test".to_string(),
+            app_version: "1.0.0".to_string(),
+            windows_build: "10.0.26200".to_string(),
+            started_unix_secs: 0,
+            device_id: "dev".to_string(),
+            device_name: "Test Scanner".to_string(),
+            capabilities: serde_json::Value::Null,
+            rows: Vec::new(),
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            not_run: 0,
+            privacy: PRIVACY_NOTE.to_string(),
+        }
+    }
+
+    /// A rerun into a folder that lets the tester change the earlier report
+    /// and scans but not create a file replaces them in place.
+    #[cfg(windows)]
+    #[test]
+    fn a_rerun_replaces_the_report_where_the_folder_refuses_new_files() {
+        let out = tempfile::tempdir().expect("a temp dir");
+        let scans = out.path().join("scan-test-scans").join("row-1");
+        std::fs::create_dir_all(&scans).expect("the scans folder");
+        let json = out.path().join("scan-test-report.json");
+        let text = out.path().join("scan-test-report.txt");
+        let scan = scans.join("page-0000.bmp");
+        for earlier in [&json, &text, &scan] {
+            std::fs::write(earlier, b"an earlier run, longer than this one").expect("old");
+        }
+        let elsewhere = tempfile::tempdir().expect("a temp dir");
+        let page = elsewhere.path().join("page-0000.bmp");
+        std::fs::write(&page, b"BM this run's page").expect("a page");
+        let report = empty_report();
+
+        let saved = {
+            let _out = crate::staging::Denied::create(out.path(), &[&json, &text]);
+            let _scans = crate::staging::Denied::create(&scans, &[&scan]);
+            write_report(&report, out.path()).expect("the report");
+            attach(
+                &[page.to_string_lossy().to_string()],
+                out.path(),
+                "1",
+                &ScriptedConsole::eof(),
+            )
+        };
+
+        assert_eq!(saved, vec![scan.to_string_lossy().to_string()]);
+        assert_eq!(std::fs::read(&scan).expect("the scan"), b"BM this run's page");
+        assert_eq!(std::fs::read_to_string(&text).expect("text"), report.to_text());
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&json).expect("json")).expect("parses");
+        assert_eq!(parsed["device_name"], "Test Scanner");
     }
 }

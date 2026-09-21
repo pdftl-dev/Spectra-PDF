@@ -174,8 +174,8 @@ export class GsUnavailableError extends Error {
  * use the catalog key (`panel.common.gsRequired`); this is what reaches a
  * caller that can only show `String(error)`. */
 export const GS_REQUIRED_MESSAGE =
-  'This feature needs Ghostscript, which Spectra does not include. ' +
-  'Install it and point Spectra at it in Settings ▸ Engine.';
+  'This feature needs Ghostscript, which Spectra PDF does not include. ' +
+  'Install it and point Spectra PDF at it in Preferences ▸ Engine.';
 
 /**
  * The gs path for a call that cannot proceed without one.
@@ -191,15 +191,26 @@ export async function requireGsPath(): Promise<string> {
 }
 
 /**
- * The gs path if there is one, else `''` — for a PARTIAL door whose gs leg
- * is one branch of several (Create PDF's PostScript sources, Export's slide
- * format, Compare's visual mode). The branch itself is gated by the surface;
- * this hands the engine a path when one exists without making the whole
- * operation refuse.
+ * The gs path for a PARTIAL door whose gs leg is one branch of several
+ * (Create PDF's PostScript sources, Export's slide format, Compare's visual
+ * mode, a JBIG2 scan under a redaction). The branch itself is gated by the
+ * surface; this never makes the whole operation refuse.
+ *
+ * The probed path when Ghostscript is usable. Otherwise the CONFIGURED path:
+ * the engine searches only on `''`, so handing `''` for a Preferences path
+ * that does not run would let the engine use a Ghostscript the user did not
+ * name, where the configured path makes the one input that needs Ghostscript
+ * refuse by that path's name. `''` only when nothing is configured.
+ *
+ * A pending answer means no probe reached the resolver, whose search also
+ * reads the registry; the engine's own search on `''` reads only the
+ * environment and PATH. So a second probe runs before `''` is handed over.
  */
 export async function gsPathIfAvailable(): Promise<string> {
-  const capability = await ensureGsCapability();
-  return capability.available ? capability.path : '';
+  let capability = await ensureGsCapability();
+  if (capability.pending) capability = await ensureGsCapability();
+  if (capability.available) return capability.path;
+  return configuredPath() ?? '';
 }
 
 // ── Decisions the surfaces share ─────────────────────────────────────────
@@ -235,7 +246,7 @@ export function gsStateKey(capability: GsCapability = current): string | null {
 // ── The launch offer ────────────────────────────────────────────────────
 //
 // A copy with no Ghostscript anywhere gates ten features, and nothing said
-// so until the user opened Settings ▸ Engine unprompted. The offer is made
+// so until the user opened Preferences ▸ Engine unprompted. The offer is made
 // ONCE per launch and only where resolution failed EVERYWHERE — a path the
 // user chose themselves is an answer they already know about, and re-asking
 // about it would be arguing with a decision rather than reporting a gap.
@@ -283,7 +294,7 @@ export function registerGsSetupOpener(opener: SetupOpener | null): void {
   setupOpener = opener;
 }
 
-/** Open Settings ▸ Engine. A no-op before App mounts, which is not
+/** Open Preferences ▸ Engine. A no-op before App mounts, which is not
  * reachable from a rendered control. */
 export function openGsSetup(): void {
   setupOpener?.();

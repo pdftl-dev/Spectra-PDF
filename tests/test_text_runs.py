@@ -9,7 +9,7 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTChar
 
 from engine.extract_text import extract_text
-from engine.text_runs import list_text_runs, replace_text_run
+from engine.text_runs import UNNAMED_FONT, list_text_runs, replace_text_run
 
 
 def _helv(pdf) -> pikepdf.Object:
@@ -264,7 +264,7 @@ class TestReplaceTextRun:
     def test_direct_font_dicts_never_serve_a_stale_capability(self, tmp_dir):
         """DIRECT (non-indirect) /Font entries: the capability cache keyed
         transient wrapper id()s and served the WRONG font's tables —
-        review-measured at 22.6% wrong lookups, and a replace would write
+        22.6% wrong lookups, and a replace would write
         the wrong font's bytes into the file. Alternating direct fonts
         across many runs pins the stable-key fix."""
         src = os.path.join(tmp_dir, "t.pdf")
@@ -301,8 +301,7 @@ class TestReplaceTextRun:
     def test_subset_widths_range_gates_encoding(self, tmp_dir):
         """A subset-embedded simple font (narrow /Widths range) must REFUSE
         characters outside the declared range — encode() succeeding for a
-        never-subsetted glyph writes .notdef boxes silently (regression;
-        the phase doc's own glyph-availability promise)."""
+        never-subsetted glyph writes .notdef boxes silently."""
         from engine.pdf_fonts import font_capability
 
         pdf = pikepdf.new()
@@ -714,7 +713,7 @@ _EDIT_FONT = os.path.join(
     reason="edit fonts not provisioned (scripts/sync-edit-fonts.ps1)",
 )
 class TestOffPageRetypeGuard:
-    """Round 30 (lens): a retype re-anchors at the original
+    """A retype re-anchors at the original
     position, so longer text marched off the page silently — success
     result, invisible text. Worst for rotated authored runs (no
     paragraph-editor fallback). The guard refuses when the NEW rect
@@ -740,7 +739,7 @@ class TestOffPageRetypeGuard:
         return out
 
     def test_retype_longer_past_the_right_edge_refuses(self, tmp_dir):
-        # Lens repro shape: box near the right edge; authored rect ends
+        # Box near the right edge; authored rect ends
         # ~571 (on-sheet); tripling the text would run to ~700 > 612.
         src = self._authored(tmp_dir, [510, 400, 606, 430])
         out = os.path.join(tmp_dir, "o.pdf")
@@ -753,7 +752,7 @@ class TestOffPageRetypeGuard:
 
     def test_rotated_retype_longer_past_the_top_edge_refuses(self, tmp_dir):
         # 90-deg authored run reads bottom-to-top; longer text marches past
-        # the page TOP (y1 ~890 > 792 in the lens repro).
+        # the page TOP (y1 ~890 > 792).
         src = self._authored(tmp_dir, [300, 700, 330, 790], rotate=90)
         out = os.path.join(tmp_dir, "o.pdf")
         idx = next(
@@ -863,3 +862,300 @@ class TestRestyleTextRun:
             restyle_text_run(src, out, 1, 0, size=0)
         with pytest.raises(ValueError, match="color must be"):
             restyle_text_run(src, out, 1, 0, color=[2, 0, 0])
+
+
+class TestTheFontTheTextStateHolds:
+    """A run is read and measured with the font DICTIONARY the text state
+    holds (ISO 32000-2 §9.3.1). An edit writes through a `Tf` that names a
+    resource of the run's own stream, so a run whose font no such name selects
+    is listed, read and measured, and not offered for editing."""
+
+    def test_an_extgstate_font_after_a_tf_of_another_font_measures_and_is_not_edited(self, tmp_dir):
+        from test_redact_text_state import _gs_font_doc
+
+        src = os.path.join(tmp_dir, "gs.pdf")
+        doc = _gs_font_doc(b"/F2 1 Tf ")
+        doc.save(src)
+        doc.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["text"] == "PUBLIC SECRET WORDS"
+        # 19 characters at 0.6 em and 12 pt: the ExtGState font and size.
+        assert run["rect"][2] - run["rect"][0] == pytest.approx(19 * 7.2, abs=0.01)
+        assert run["font_size"] == 12
+        assert run["editable"] is False
+        assert run["reason"] == UNNAMED_FONT
+        with pytest.raises(ValueError) as caught:
+            replace_text_run(src, os.path.join(tmp_dir, "out.pdf"), 1, 0, "PUBLIC")
+        assert str(caught.value) == UNNAMED_FONT
+
+    def test_a_form_that_inherits_a_font_its_resources_rename_is_not_edited(self, tmp_dir):
+        from test_redact_text_state import _form_doc
+
+        src = os.path.join(tmp_dir, "form.pdf")
+        doc = _form_doc()
+        doc.save(src)
+        doc.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["nested"] is True
+        assert run["rect"][2] - run["rect"][0] == pytest.approx(19 * 7.2, abs=0.01)
+        assert run["editable"] is False
+        assert run["reason"] == UNNAMED_FONT
+
+    @pytest.mark.parametrize("form_width, editable", [(600, True), (50, False)])
+    def test_direct_font_dictionaries_compare_by_value(self, tmp_dir, form_width, editable):
+        # Both fonts are direct objects: the form's /F1 selects the font the
+        # page's /F1 set only when the two dictionaries are equal.
+        def direct_font(width):
+            return Dictionary(
+                Type=Name.Font, Subtype=Name.Type1, BaseFont=Name("/Face"),
+                FirstChar=32, LastChar=126, Widths=Array([width] * 95),
+                Encoding=Name.WinAnsiEncoding,
+            )
+
+        src = os.path.join(tmp_dir, "direct.pdf")
+        pdf = pikepdf.new()
+        form = pdf.make_stream(b"BT 72 700 Td (Hello) Tj ET")
+        form["/Type"] = Name.XObject
+        form["/Subtype"] = Name.Form
+        form["/BBox"] = Array([0, 0, 612, 792])
+        form["/Resources"] = Dictionary(Font=Dictionary(F1=direct_font(form_width)))
+        page = _page(pdf, b"BT /F1 12 Tf ET /Fm0 Do", {"/F1": direct_font(600)})
+        page.obj.Resources["/XObject"] = Dictionary(Fm0=pdf.make_indirect(form))
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["editable"] is editable
+        assert run["reason"] == (None if editable else UNNAMED_FONT)
+
+    def test_a_run_an_edit_cannot_select_still_reads_for_accessibility(self, tmp_dir):
+        # The text maps to Unicode; only the edit is refused, so the
+        # character-encoding check finds nothing to report.
+        from test_redact_text_state import _gs_font_doc
+
+        from engine.accessibility import check_accessibility
+
+        src = os.path.join(tmp_dir, "gs.pdf")
+        doc = _gs_font_doc(b"/F2 1 Tf ")
+        doc.save(src)
+        doc.close()
+        (check,) = [c for c in check_accessibility(src)["checks"] if c["id"] == "character_encoding"]
+        assert check["status"] == "pass"
+        assert check["findings"] == []
+
+    def test_a_form_that_inherits_a_font_its_resources_do_not_name_stays_editable(self, tmp_dir):
+        # The form's own resources lack /F1, so /F1 resolves through the
+        # invoking page to the very font the page selected.
+        src = os.path.join(tmp_dir, "inherits.pdf")
+        pdf = pikepdf.new()
+        form = pdf.make_stream(b"BT 72 700 Td (Hello) Tj ET")
+        form["/Type"] = Name.XObject
+        form["/Subtype"] = Name.Form
+        form["/BBox"] = Array([0, 0, 612, 792])
+        form["/Resources"] = Dictionary()
+        page = _page(pdf, b"BT /F1 12 Tf ET /Fm0 Do", {"/F1": _helv(pdf)})
+        page.obj.Resources["/XObject"] = Dictionary(Fm0=pdf.make_indirect(form))
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["editable"] is True
+        out = os.path.join(tmp_dir, "out.pdf")
+        replace_text_run(src, out, 1, 0, "Hi")
+        assert list_text_runs(out, 1)["runs"][0]["text"] == "Hi"
+
+    @pytest.mark.skipif(
+        not all(
+            os.path.isfile(os.path.join(os.path.dirname(_EDIT_FONT), face))
+            for face in ("LiberationSerif-Regular.ttf", "LiberationSans-Regular.ttf")
+        ),
+        reason="edit fonts not provisioned (scripts/sync-edit-fonts.ps1)",
+    )
+    def test_a_converted_run_takes_the_face_family_of_the_font_it_was_drawn_in(self, tmp_dir):
+        from engine.text_runs import convert_text_run
+
+        # The inner form names /F1 and its resources lack it: the outer form
+        # supplies it, which a lookup through the page alone never reaches.
+        src = os.path.join(tmp_dir, "nested.pdf")
+        pdf = pikepdf.new()
+        times = pdf.make_indirect(
+            Dictionary(
+                Type=Name("/Font"),
+                Subtype=Name("/Type1"),
+                BaseFont=Name("/Times-Roman"),
+                Encoding=Name("/WinAnsiEncoding"),
+            )
+        )
+        inner = pdf.make_stream(b"BT /F1 12 Tf 72 700 Td (Hello) Tj ET")
+        inner["/Type"] = Name.XObject
+        inner["/Subtype"] = Name.Form
+        inner["/BBox"] = Array([0, 0, 612, 792])
+        inner["/Resources"] = Dictionary()
+        outer = pdf.make_stream(b"/Fm1 Do")
+        outer["/Type"] = Name.XObject
+        outer["/Subtype"] = Name.Form
+        outer["/BBox"] = Array([0, 0, 612, 792])
+        outer["/Resources"] = Dictionary(
+            Font=Dictionary(F1=times), XObject=Dictionary(Fm1=pdf.make_indirect(inner))
+        )
+        page = _page(pdf, b"/Fm0 Do", {})
+        page.obj.Resources["/XObject"] = Dictionary(Fm0=pdf.make_indirect(outer))
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["editable"] is True
+        out = os.path.join(tmp_dir, "out.pdf")
+        convert_text_run(src, out, 1, 0, "Hi", os.path.dirname(_EDIT_FONT))
+        with pikepdf.open(out) as opened:
+            embedded = [
+                str(obj.get("/BaseFont"))
+                for obj in opened.objects
+                if isinstance(obj, Dictionary) and obj.get("/Subtype") == Name.Type0
+            ]
+        assert len(embedded) == 1
+        assert "LiberationSerif" in embedded[0]
+
+
+def _wide_font(pdf) -> pikepdf.Object:
+    """Every code 0.6 em wide, and no descriptor: pdfminer boxes each glyph
+    from the baseline to one em above it, exactly the listed em box."""
+    return pdf.make_indirect(
+        Dictionary(
+            Type=Name("/Font"), Subtype=Name("/Type1"), BaseFont=Name("/Wide"),
+            FirstChar=32, LastChar=126, Widths=Array([600] * 95),
+            Encoding=Name("/WinAnsiEncoding"),
+        )
+    )
+
+
+def _glyph_boxes(path: str) -> list:
+    """pdfminer's box of every glyph on page 1: an independent reading of
+    where ISO 32000-2 §9.4.4 puts each one."""
+    boxes: list = []
+
+    def visit(obj) -> None:
+        if isinstance(obj, LTChar):
+            boxes.append((obj.get_text(), obj.x0, obj.y0, obj.x1, obj.y1))
+            return
+        for child in getattr(obj, "_objs", None) or []:
+            visit(child)
+
+    for layout in extract_pages(path):
+        visit(layout)
+    return boxes
+
+
+def _vertical_font(pdf, to_unicode: bool = True) -> pikepdf.Object:
+    """Identity-V, every glyph 1 em down the column (/DW2). Without a
+    /ToUnicode the font is refused for editing and still writes downward."""
+    from test_pdf_fonts import _tounicode_stream
+
+    descendant = pdf.make_indirect(
+        Dictionary(
+            Type=Name("/Font"), Subtype=Name("/CIDFontType2"), BaseFont=Name("/VertFace"),
+            CIDSystemInfo=Dictionary(Registry=b"Adobe", Ordering=b"Identity", Supplement=0),
+            DW2=Array([880, -1000]), W=Array([3, 5, 1000]),
+        )
+    )
+    font = Dictionary(
+        Type=Name("/Font"), Subtype=Name("/Type0"), BaseFont=Name("/VertFace"),
+        Encoding=Name("/Identity-V"), DescendantFonts=Array([descendant]),
+    )
+    if to_unicode:
+        font["/ToUnicode"] = _tounicode_stream(pdf, {3: "あ", 4: "い", 5: "う"})
+    return pdf.make_indirect(font)
+
+
+class TestTheClickBoxCoversEveryGlyph:
+    """The listed rect is the box the user clicks, so every glyph the show
+    draws lies inside it. At 12 pt and 0.6 em per glyph each glyph is 7.2
+    wide, and a TJ number moves the pen back as readily as forward: in
+    `[(AB) 1200 (C)]` A draws x 60..67.2, B 67.2..74.4, and C draws over A,
+    so the net advance of 7.2 ends the pen short of B."""
+
+    # (show, the box: the pen's path from x 60 joined with every glyph's box)
+    SHAPES = [
+        pytest.param(b"[(AB) 1200 (C)] TJ", (60, 300, 74.4, 312), id="back-over-drawn-glyphs"),
+        pytest.param(b"[(A) 1800 (B)] TJ", (45.6, 300, 67.2, 312), id="back-past-the-start"),
+        pytest.param(b"[1200 (A)] TJ", (45.6, 300, 60, 312), id="back-at-the-start"),
+        pytest.param(b"[(AB) 1200] TJ", (60, 300, 74.4, 312), id="back-at-the-end"),
+        pytest.param(b"[(A) -1200 (B)] TJ", (60, 300, 88.8, 312), id="forward-inside"),
+        pytest.param(b"[-1200 (A)] TJ", (60, 300, 81.6, 312), id="forward-at-the-start"),
+        pytest.param(b"[(A) -1200] TJ", (60, 300, 81.6, 312), id="forward-at-the-end"),
+        pytest.param(b"50 Tz [(AB) 1200 (C)] TJ", (60, 300, 67.2, 312), id="back-under-Tz"),
+        pytest.param(b"20 Ts (A) Tj", (60, 320, 67.2, 332), id="raised"),
+        pytest.param(b"-20 Ts (A) Tj", (60, 280, 67.2, 292), id="lowered"),
+        pytest.param(b"-3 Tc (ABC) Tj", (60, 300, 75.6, 312), id="tight-tracking"),
+    ]
+
+    @pytest.mark.parametrize("show, box", SHAPES)
+    def test_every_glyph_lies_inside_the_run_rect(self, tmp_dir, show, box):
+        src = os.path.join(tmp_dir, "shape.pdf")
+        pdf = pikepdf.new()
+        _page(pdf, b"BT /F1 12 Tf 60 300 Td " + show + b" ET", {"/F1": _wide_font(pdf)})
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        x0, y0, x1, y1 = run["rect"]
+        glyphs = _glyph_boxes(src)
+        assert glyphs
+        for ch, gx0, gy0, gx1, gy1 in glyphs:
+            assert x0 - 0.01 <= gx0 and gx1 <= x1 + 0.01, (ch, run["rect"])
+            assert y0 - 0.01 <= gy0 and gy1 <= y1 + 0.01, (ch, run["rect"])
+        assert run["rect"] == pytest.approx(list(box), abs=0.01)
+
+    def test_the_box_still_spans_the_pen_path(self, tmp_dir):
+        # A trailing forward jump draws nothing, and the caret after the run
+        # still belongs at the pen's end: the box keeps the whole path.
+        src = os.path.join(tmp_dir, "path.pdf")
+        pdf = pikepdf.new()
+        _page(pdf, b"BT /F1 12 Tf 60 300 Td [(A) -1200] TJ ET", {"/F1": _wide_font(pdf)})
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["rect"] == pytest.approx([60.0, 300.0, 81.6, 312.0], abs=0.01)
+
+    @pytest.mark.parametrize(
+        "show, column",
+        [
+            # Size 10, 1 em per glyph. A positive number moves the next glyph
+            # DOWN in vertical writing (Table 107): あ 700..690, い 685..675.
+            pytest.param(b"[<0003> 500 <0004>] TJ", (675.0, 700.0), id="number-moves-down"),
+            # A negative number moves it up, here past the start: い 710..700.
+            pytest.param(b"[<0003> -2000 <0004>] TJ", (690.0, 710.0), id="number-moves-up"),
+            # A positive Tc moves the pen UP in vertical writing (§9.3.2):
+            # い starts 7 below あ and draws 10 down to 683.
+            pytest.param(b"3 Tc <00030004> Tj", (683.0, 700.0), id="spacing-moves-up"),
+            # Ts moves the baseline up in either writing mode (§9.3.7).
+            pytest.param(b"5 Ts <0003> Tj", (695.0, 705.0), id="raised"),
+        ],
+    )
+    def test_a_vertical_run_covers_its_column(self, tmp_dir, show, column):
+        src = os.path.join(tmp_dir, "column.pdf")
+        pdf = pikepdf.new()
+        _page(pdf, b"BT /F1 10 Tf 100 700 Td " + show + b" ET", {"/F1": _vertical_font(pdf)})
+        pdf.save(src)
+        pdf.close()
+        (run,) = list_text_runs(src, 1)["runs"]
+        assert run["vertical"] is True
+        assert run["rect"] == pytest.approx([95.0, column[0], 105.0, column[1]], abs=0.01)
+
+    def test_a_refused_vertical_run_is_boxed_as_the_column_it_draws(self, tmp_dir):
+        src = os.path.join(tmp_dir, "refused.pdf")
+        pdf = pikepdf.new()
+        _page(
+            pdf,
+            b"BT /F1 10 Tf 100 700 Td <00030004> Tj <0005> Tj ET",
+            {"/F1": _vertical_font(pdf, to_unicode=False)},
+        )
+        pdf.save(src)
+        pdf.close()
+        runs = list_text_runs(src, 1)["runs"]
+        assert [r["editable"] for r in runs] == [False, False]
+        assert [r["vertical"] for r in runs] == [True, True]
+        # The second show flows DOWN the column after the first.
+        assert runs[0]["rect"] == pytest.approx([95.0, 680.0, 105.0, 700.0], abs=0.01)
+        assert runs[1]["rect"] == pytest.approx([95.0, 670.0, 105.0, 680.0], abs=0.01)
+        centres = [((b[1] + b[3]) / 2, (b[2] + b[4]) / 2) for b in _glyph_boxes(src)]
+        assert len(centres) == 3
+        for cx, cy in centres:
+            assert any(r["rect"][0] <= cx <= r["rect"][2] and r["rect"][1] <= cy <= r["rect"][3]
+                       for r in runs), (cx, cy)

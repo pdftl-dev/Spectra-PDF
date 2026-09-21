@@ -7,7 +7,7 @@ import React, {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { useAppState, useAppDispatch } from '../../state/AppStateProvider';
+import { useAppState, useAppDispatch, useReadAppState, useReadLinkDrafts, useSubscribeAppState } from '../../state/AppStateProvider';
 import { usePdfProxyState } from '../../hooks/usePdfProxies';
 import { isUnrenderable } from '../../lib/render-health';
 import { showableFile, tabFiles } from '../../state/selectors';
@@ -33,8 +33,25 @@ import {
   resolvePageEntry,
   sanitizePageEntry,
 } from '../../lib/page-labels';
-import { getDocumentProxy } from '../../lib/pdfDocCache';
-import { buildRedactionRegions } from '../../lib/redaction';
+import { getDocumentProxy, requestDocumentProxy } from '../../lib/pdfDocCache';
+import {
+  EMPTY_MARK_LEDGER,
+  buildRedactionRegions,
+  marksAcross,
+  marksAfterRun,
+  marksInRun,
+  pageForFilePageNumber,
+  withSeededMarks,
+  type MarkLedger,
+} from '../../lib/redaction';
+import {
+  drawingTarget,
+  indexVerdicts,
+  pagesUnreadable,
+  pathDescribesCurrentBytes,
+  retryFailedIndexes,
+  subscribeIndexVerdicts,
+} from '../../lib/workspace-settle';
 import { displayRectToPdf, pdfRectToDisplay } from '../../lib/pdfx-build';
 import { sameRegion } from '../../lib/search-redact';
 import {
@@ -43,7 +60,8 @@ import {
   propertiesPayload,
 } from '../../lib/redaction-properties';
 import { buildLinkPayloads, type PageQuads } from '../../lib/text-selection-markup';
-import type { PageGeometry, RedactionMark, RedactionRegion } from '../../lib/redaction';
+import type { PageGeometry, RedactionMark } from '../../lib/redaction';
+import { groupRedactionMarks } from '../../lib/redaction-write';
 import {
   buildFieldSpecs,
   candidatesFromDetection,
@@ -54,19 +72,25 @@ import {
   type FieldCandidate,
 } from '../../lib/form-candidates';
 import {
-  acceptedRegions,
+  awaitReviewPages,
+  captureExportRequest,
   addColumn,
   exportRegions,
   moveColumn,
   moveRegionBounds,
+  ownedAcceptedRegions,
   prunedRegions,
   quarter,
   regionsFromDetection,
   removeColumn,
+  sessionMatches,
+  tableReviewPages,
   toggleRegion,
   type TableDetectionResult,
+  type TableExportRequest,
   type TableRegion,
   type TableReviewHandlers,
+  type TableReviewSession,
 } from '../../lib/table-review';
 import {
   findingsByPage,
@@ -76,7 +100,7 @@ import {
   type PlaceableFinding,
 } from '../../lib/a11y-findings';
 import type { ExportDocumentResult } from '../../lib/export-targets';
-import type { PageRef } from '../../state/types';
+import type { AppState, OpenDocument, PageRef } from '../../state/types';
 import { buildSignatureAppearance } from '../../lib/signature-placement';
 import type { SignaturePlacement } from '../../lib/signature-placement';
 import { captureSnapshot, type SnapshotPlacement } from '../../lib/snapshot-capture';
@@ -103,6 +127,7 @@ import {
 import type { SignerSource } from '../SignerSourceFields';
 import {
   certifyParams,
+  parseSignaturePolicy,
   lockNeedsFields,
   lockParams,
   CERTIFICATION_LEVEL_LABEL,
@@ -173,7 +198,7 @@ import type { Mat } from '../../lib/image-transform';
 import { workspacePageNumber } from '../../lib/workspace-commit';
 import { runCommitGate } from '../../lib/commit-gate';
 
-import { buildMergedPageRefs, pathBlockedFromClose } from '../../lib/merge-docs';
+import { buildMergedPageRefs, mergedPageSources, pathBlockedFromClose } from '../../lib/merge-docs';
 import { useWorkspaceForms } from '../../hooks/useWorkspaceForms';
 import { useFieldScripts } from '../../hooks/useFieldScripts';
 import { useFieldScriptsAllowed } from '../../hooks/useFieldScriptsAllowed';
@@ -182,6 +207,7 @@ import {
   formatScriptOf,
   placementDocsCurrent,
   pruneFormValues,
+  remainingFormValues,
   shownValue,
   valueShapeMatches,
 } from '../../lib/form-overlay';
@@ -256,12 +282,14 @@ interface WorkspaceCanvasViewProps {
   // Run the engine's redact on one file — App routes this through
   // performOperation, so the commit gate flushes pending page edits, a
   // snapshot lands on the undo chain, and the buffer reloads after. Resolves
-  // FALSE when the document's own signature policy declined the edit, which
-  // is not a failure and must not clear the marks it did not apply.
-  onRedactFile: (path: string, regions: RedactionRegion[]) => Promise<boolean>;
+  // whether new bytes were written: FALSE when the document's own signature
+  // policy declined the edit, which is not a failure and must not clear the
+  // marks it did not apply.
+  onRedactFile: (path: string, marks: readonly RedactionMark[], seen: AppState) => Promise<boolean>;
   // Persist the pending marks as the file's /Redact annotation set
-  // (same performOperation shape — undoable; the reload re-seeds).
-  onSaveRedactionMarks: (path: string, regions: RedactionRegion[]) => Promise<void>;
+  // (same performOperation shape — undoable; the reload re-seeds). Resolves
+  // whether new bytes were written, as onRedactFile does.
+  onSaveRedactionMarks: (path: string, marks: readonly RedactionMark[], seen: AppState) => Promise<boolean>;
   // A widget's data action, fired by the gesture the document authored it on
   // (a pushbutton's `/A` on a click, the `/AA` triggers on theirs).
   onWidgetAction: (
@@ -413,10 +441,9 @@ interface WorkspaceCanvasViewProps {
   // Add-page ghost: pick file(s) and import their pages into a document
   // at an index (byte-only import machinery, undoable via the page tier).
   onAddPages: (docId: string, toIndex: number) => void;
-  // Bake pending on-canvas form values into one file — App implements
-  // the FormsPanel shape (snapshot(gate) → engine fill_form_fields → reload →
-  // UPDATE_FILE), so it lands on the snapshot-undo chain.
-  onFillFormValues: (path: string, values: Record<string, FormFieldValue>) => Promise<void>;
+  // Bake pending values through App's private-stage/native publication. A
+  // declined edit must retain the pending values, just like a failed write.
+  onFillFormValues: import('../../hooks/useOperations').FillFormValues;
   // Author a new form field into one file — same whole-file-op shape, and the
   // same EDIT_DECLINED contract: creating a field is a structural change, so a
   // signed document takes the decision before anything is written.
@@ -473,7 +500,7 @@ const NO_ANNOTATIONS: readonly PageAnnotation[] = [];
 const NO_LINK_REGIONS: readonly LinkRegion[] = [];
 const NO_ANNOTATION_IDS: readonly string[] = [];
 
-// Rung 3: the right-click recalibrate popover — "this measures X unit" with
+// The right-click recalibrate popover — "this measures X unit" with
 // two outcomes: set the toolbar scale for FUTURE measurements, or override
 // THIS measurement's recorded factors (undoable edit).
 function RecalibratePopover({
@@ -623,8 +650,25 @@ export function WorkspaceCanvasView({
 }: WorkspaceCanvasViewProps): React.ReactElement {
   useTranslation();
   const state = useAppState();
+  const readState = useReadAppState();
+  const subscribeState = useSubscribeAppState();
+  const linkDrafts = useReadLinkDrafts();
   const dispatch = useAppDispatch();
   const docs = state.workspace.documents;
+  // A gesture ends on the page its render showed; the store may hold other
+  // bytes or ids by then. A drawing that cannot land where it was drawn is
+  // refused with the notice every refused edit owes.
+  const acceptDrawing = useCallback(
+    (docId: string | undefined, pageId: string, rotationAtDraw: number): { doc: OpenDocument; page: PageRef } | null => {
+      const rendered = docs.find((d) => d.id === docId);
+      const target = rendered
+        ? drawingTarget(readState(), { docId: rendered.id, pageId, buffer: rendered.buffer, rotation: rotationAtDraw })
+        : null;
+      if (!target) dispatch({ type: 'NOTE_EDIT_REFUSED' });
+      return target;
+    },
+    [docs, readState, dispatch],
+  );
   const { proxies, health: renderHealth } = usePdfProxyState(state.files);
   // The documents on this board whose bytes pdf.js refused. The engine opened
   // them, so the tab, the page count, the panels and every extraction the
@@ -633,14 +677,17 @@ export function WorkspaceCanvasView({
   // Read off `files`, NOT the workspace documents: indexing goes through the
   // same pdf.js load, so a document the renderer refused has no workspace
   // entry to name it. The file does — it is the tab the user is looking at.
+  // pdf.js can also load bytes and then fail on a page: the index fails, and
+  // the file shows no pages either.
+  const knownIndexes = useSyncExternalStore(subscribeIndexVerdicts, indexVerdicts);
   const unrenderableNames = useMemo(() => {
     const names: string[] = [];
     for (const f of tabFiles(state)) {
-      if (!isUnrenderable(renderHealth, f.path, f.buffer)) continue;
+      if (!isUnrenderable(renderHealth, f.path, f.buffer) && !pagesUnreadable(state, f, knownIndexes)) continue;
       if (!names.includes(f.name)) names.push(f.name);
     }
     return names;
-  }, [state, renderHealth]);
+  }, [state, renderHealth, knownIndexes]);
   const layout = useMemo(() => computeLayout(docs), [docs]);
   const layoutRef = useRef(layout);
   layoutRef.current = layout;
@@ -886,7 +933,7 @@ export function WorkspaceCanvasView({
   // tool creates the next annotation, across tool switches.
   const [toolColor, setToolColor] = useState<string | null>(null);
   const [stampPreset, setStampPreset] = useState<StampPreset | null>(null);
-  // Shape mode's figure picker (rung 2) — the stamp-preset pattern.
+  // Shape mode's figure picker — the stamp-preset pattern.
   const [shapeType, setShapeType] = useState<ShapeType>('rect');
   // Measure: the scale ratio the readouts apply, whether a
   // finished measurement lands as an ink markup, and the latest value shown
@@ -894,7 +941,7 @@ export function WorkspaceCanvasView({
   const [measureScale, setMeasureScale] = useState<MeasureScale>(DEFAULT_MEASURE_SCALE);
   const [measureLeaveMarkup, setMeasureLeaveMarkup] = useState(true);
   const [measureResult, setMeasureResult] = useState<string | null>(null);
-  // Rung 3 — calibration: the dragged span (PDF points) awaiting its real
+  // Calibration: the dragged span (PDF points) awaiting its real
   // value in the toolbar; and the right-click recalibrate popover's target.
   const [calibration, setCalibration] = useState<number | null>(null);
   const [recalTarget, setRecalTarget] = useState<{
@@ -905,7 +952,7 @@ export function WorkspaceCanvasView({
     y: number;
   } | null>(null);
   // Click-selected annotations (Select tool) — the properties bar's subject
-  // and the manipulation group (rung 1). SAME-PAGE by design: align/
+  // and the manipulation group. SAME-PAGE by design: align/
   // distribute/z-order are page-geometry operations, and a cross-page
   // "formation move" has no meaning — a gesture on another page starts a new
   // selection there. Transient view state like redaction marks: resolved
@@ -919,12 +966,36 @@ export function WorkspaceCanvasView({
   } | null>(null);
   // Pending redaction marks — transient view state, deliberately NOT the
   // page-edit tier (see lib/redaction.ts for why). They survive tool
-  // switches and in-memory page edits, and die when their file's buffer
-  // changes underneath them or the canvas unmounts.
-  const [marks, setMarks] = useState<RedactionMark[]>([]);
-  // Detected field candidates — the redaction-mark lifetime exactly: transient,
-  // never the page tier, and invalidated on buffer identity. Nothing here has
-  // touched the document; accepting a candidate is what does.
+  // switches, in-memory page edits and the page-tier commit, and die with
+  // their page or when the canvas unmounts. The ledger also counts the
+  // unsaved marks that died with their page, for the notice.
+  const [markLedger, setMarkLedger] = useState<MarkLedger>(EMPTY_MARK_LEDGER);
+  const marks = markLedger.marks;
+  const setMarks = useCallback(
+    (update: RedactionMark[] | ((prev: RedactionMark[]) => RedactionMark[])) =>
+      setMarkLedger((ledger) => {
+        const next = typeof update === 'function' ? update(ledger.marks) : update;
+        return next === ledger.marks ? ledger : { ...ledger, marks: next };
+      }),
+    [],
+  );
+  // The count of cleared marks the user has dismissed the notice for.
+  const [marksClearedSeen, setMarksClearedSeen] = useState(0);
+  // Every dispatch, one at a time: a commit rebases a mark by the rotation it
+  // wrote, which only the state just before that dispatch shows. A render can
+  // fold several dispatches into one.
+  useEffect(() => {
+    let before = readState();
+    return subscribeState(() => {
+      const after = readState();
+      const was = before;
+      before = after;
+      setMarkLedger((ledger) => marksAcross(ledger, was, after));
+    });
+  }, [readState, subscribeState]);
+  // Detected field candidates — transient, never the page tier, and
+  // invalidated on buffer identity. Nothing here has touched the document;
+  // accepting a candidate is what does.
   const [fieldCandidates, setFieldCandidates] = useState<FieldCandidate[]>([]);
   const [selectedCandidateId, setSelectedCandidateId] = useState<string | null>(null);
   // Detected tables under review. Same lifetime as the candidates above and
@@ -940,8 +1011,8 @@ export function WorkspaceCanvasView({
   const [confirmRedact, setConfirmRedact] = useState(false);
   const [redacting, setRedacting] = useState(false);
   const [redactError, setRedactError] = useState<string | null>(null);
-  // Pending visible-signature placement — single, transient, same lifecycle
-  // as redaction marks (see lib/signature-placement.ts).
+  // Pending visible-signature placement — single, transient, invalidated on
+  // buffer identity (see lib/signature-placement.ts).
   const [sigPlacement, setSigPlacement] = useState<SignaturePlacement | null>(null);
   // Sign-into-an-existing-field target — mutually exclusive with the
   // rubber-band placement; same transient lifecycle.
@@ -1509,19 +1580,14 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      if (!doc) return;
-      // Anchor only to CURRENT ids: docs indexed from a
-      // superseded buffer are about to be re-identified (fresh generation),
-      // so a placement drawn against them is stillborn — refuse it rather
-      // than arm a box that dies at SET_WORKSPACE_DOCUMENTS moments later.
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
-      setNewFieldPlacement({ id: crypto.randomUUID(), path: doc.path, pageId, rect, rotationAtDraw });
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      setNewFieldPlacement({ id: crypto.randomUUID(), path: target.doc.path, pageId, rect, rotationAtDraw });
       setSigPlacement(null); // one placement card at a time (see onSetSignaturePlacement)
       setAddTextPlacement(null); // …including the Add-Text card
       setNfError(null);
     },
-    [docs, state.files],
+    [acceptDrawing],
   );
   const onClearNewFieldPlacement = useCallback(() => setNewFieldPlacement(null), []);
 
@@ -1759,16 +1825,11 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      if (!doc) return;
-      // Anchor only to CURRENT ids — the onSetNewFieldRect rule:
-      // The sibling flows shared the silent-no-op
-      // pattern without the guard). A placement drawn against docs indexed
-      // from a superseded buffer dies at SET_WORKSPACE_DOCUMENTS — refuse.
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
       setAddTextPlacement({
         id: crypto.randomUUID(),
-        path: doc.path,
+        path: target.doc.path,
         pageId,
         rect,
         rotationAtDraw,
@@ -1780,7 +1841,7 @@ export function WorkspaceCanvasView({
       setAtText('');
       setAtError(null);
     },
-    [docs, state.files, atRotate],
+    [acceptDrawing, atRotate],
   );
   // --- Crop draw ------------------------------------------------------
   // The band is the region to KEEP. Nothing commits here: the insets are
@@ -1797,11 +1858,9 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      const page = doc?.pages.find((p) => p.id === pageId);
-      if (!doc || !page) return;
-      // Anchor only to CURRENT ids — the onSetNewFieldRect rule.
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      const { doc, page } = target;
       const f = state.files.get(page.sourceDocId);
       if (!f?.buffer) return;
       const buffer = f.buffer;
@@ -1829,7 +1888,7 @@ export function WorkspaceCanvasView({
         setCropPlacement({ id: crypto.randomUUID(), path: doc.path, pageId, rect, rotationAtDraw });
       })();
     },
-    [docs, state.files],
+    [docs, state.files, acceptDrawing],
   );
   const onClearCropPlacement = useCallback(() => setCropPlacement(null), []);
   // --- Article bead draw ----------------------------------------------
@@ -1845,10 +1904,9 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      const page = doc?.pages.find((p) => p.id === pageId);
-      if (!doc || !page) return;
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      const { doc, page } = target;
       const f = state.files.get(page.sourceDocId);
       if (!f?.buffer) return;
       const buffer = f.buffer;
@@ -1860,10 +1918,13 @@ export function WorkspaceCanvasView({
         if (!bead) return; // a click, not a box
         const number = workspacePageNumber(docs, doc, page.id);
         if (number === null) return;
-        publishDrawnBead({ page: number, rect: bead, path: doc.path });
+        const owner = state.files.get(doc.path);
+        if (!owner?.buffer || state.pageDirtyPaths.includes(doc.path)) return;
+        publishDrawnBead({ page: number, rect: bead, path: doc.path,
+          workingPath: owner.workingPath, buffer: owner.buffer });
       })();
     },
-    [docs, state.files],
+    [docs, state.files, state.pageDirtyPaths, acceptDrawing],
   );
   // --- Link draw ------------------------------------------------------
   // The bead band's contract exactly: the rect lands in the page's own user
@@ -1877,13 +1938,15 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      const page = doc?.pages.find((p) => p.id === pageId);
-      if (!doc || !page) return;
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      const { doc, page } = target;
       const f = state.files.get(page.sourceDocId);
       if (!f?.buffer) return;
       const buffer = f.buffer;
+      const owner = state.files.get(doc.path);
+      const request = owner ? linkDrafts.startDraw(owner) : null;
+      if (!request) { setLinkError(tChrome('app.history.changed')); return; }
       void (async () => {
         const proxy = await getDocumentProxy(page.sourceDocId, buffer);
         const p = await proxy.getPage(page.sourcePageIndex + 1);
@@ -1895,10 +1958,10 @@ export function WorkspaceCanvasView({
         if (!region) return; // a click, not a rectangle
         const number = workspacePageNumber(docs, doc, page.id);
         if (number === null) return;
-        publishDrawnLink({ page: number, rect: region, path: doc.path });
-      })();
+        publishDrawnLink({ page: number, rect: region, ...request });
+      })().catch(error => linkDrafts.failDraw(request, error));
     },
-    [docs, state.files],
+    [docs, state.files, linkDrafts, acceptDrawing],
   );
   // --- Snapshot -------------------------------------------------------
   // The band's contract again, with one difference that matters: the capture
@@ -1920,10 +1983,9 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      const page = doc?.pages.find((p) => p.id === pageId);
-      if (!doc || !page) return;
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      const { doc, page } = target;
       const f = state.files.get(page.sourceDocId);
       if (!f?.buffer) return;
       const buffer = f.buffer;
@@ -1959,7 +2021,7 @@ export function WorkspaceCanvasView({
         }
       })();
     },
-    [docs, state.files],
+    [state.files, acceptDrawing],
   );
   const onClearSnapshotPlacement = useCallback(() => {
     setSnapshotPlacement(null);
@@ -2285,13 +2347,16 @@ export function WorkspaceCanvasView({
       const failures: string[] = [];
       for (const [path, values] of snapshot) {
         try {
-          await onFillFormValues(path, Object.fromEntries(values));
-          // Applied — drop this file's pending values (the re-read will show
-          // them as the fields' current values).
+          if (await onFillFormValues(path, Object.fromEntries(values)) === EDIT_DECLINED) continue;
+          // Retire only values this successful publication consumed. Input
+          // typed while the engine was running still belongs to the user.
           setPendingFormValues((prev) => {
-            if (!prev.has(path)) return prev;
+            const current = prev.get(path);
+            if (!current) return prev;
+            const remaining = remainingFormValues(current, values);
             const next = new Map(prev);
-            next.delete(path);
+            if (remaining.size) next.set(path, remaining);
+            else next.delete(path);
             return next;
           });
         } catch (err) {
@@ -2316,13 +2381,8 @@ export function WorkspaceCanvasView({
 
   // Workspace-flattened page order (doc order, then page order) — the basis
   // for workspace-order group moves (selection semantics themselves moved
-  // into the reducer with the ui slice). Refs keep the harness registration
-  // stable while reading the latest order/selection.
+  // into the reducer with the ui slice).
   const flatOrder = useMemo(() => docs.flatMap((d) => d.pages.map((p) => p.id)), [docs]);
-  const flatOrderRef = useRef(flatOrder);
-  flatOrderRef.current = flatOrder;
-  const selectionRef = useRef(selectedPageIds);
-  selectionRef.current = selectedPageIds;
 
   // Keyboard shortcuts (Escape chain, Ctrl+F, select-all/delete/rotate/zoom)
   // are owned by the app-level keymap dispatcher now (commands/keymap.ts) —
@@ -2434,19 +2494,20 @@ export function WorkspaceCanvasView({
         },
       },
       tableReview: {
-        publish: async (path, result) =>
-          tableServiceRef.current?.publish(path, result) ?? {
+        publish: async (path, result, revision) =>
+          tableServiceRef.current?.publish(path, result, revision) ?? {
             shown: 0,
             skipped: result.regions.length,
           },
         list: () => [...liveTableRegionsRef.current],
+        session: () => tableSessionRef.current,
         update: (next) => tableServiceRef.current?.update(next),
         clear: () => tableServiceRef.current?.clear(),
         focus: (regionId) => tableServiceRef.current?.focus(regionId),
-        exportTo: async (output, options) => {
+        exportTo: async (output, options, request) => {
           const service = tableServiceRef.current;
           if (!service) throw new Error(tChrome('panel.tableReview.documentGone'));
-          return service.exportTo(output, options);
+          return service.exportTo(output, options, request);
         },
         subscribe: (listener) => {
           tableSubscribersRef.current.add(listener);
@@ -2480,11 +2541,13 @@ export function WorkspaceCanvasView({
   // command paths here, mirroring the redaction/signature/OCR hooks.
   useEffect(() => {
     if (!TEST_HARNESS_ENABLED) return;
+    // Ids come from the store, never from the last render: an id the store no
+    // longer holds is refused when a spec edits through it.
     registerCanvasSelection({
       selectPageIds: (ids) =>
         dispatch({ type: 'UI_SET_SELECTION', pageIds: ids, anchor: ids[ids.length - 1] ?? null }),
-      getSelectedPageIds: () => [...selectionRef.current],
-      getWorkspacePageIds: () => [...flatOrderRef.current],
+      getSelectedPageIds: () => [...readState().ui.selectedPageIds],
+      getWorkspacePageIds: () => readState().workspace.documents.flatMap((d) => d.pages.map((p) => p.id)),
       deleteSelected: () => void invokeCommand('document.deleteSelection'),
       rotateSelected: (delta) =>
         void invokeCommand(
@@ -2492,7 +2555,7 @@ export function WorkspaceCanvasView({
         ),
     });
     return () => registerCanvasSelection(null);
-  }, [dispatch]);
+  }, [dispatch, readState]);
 
   const onAddAnnotation = useCallback(
     (docId: string, pageId: string, annotation: PageAnnotation) =>
@@ -2645,7 +2708,7 @@ export function WorkspaceCanvasView({
     });
   }, [selectedAnnot]);
 
-  // ── Group operations on the selection (rung 1) ───────────────────────
+  // ── Group operations on the selection ───────────────────────
   // Each is one dispatch = one undo step. The align/distribute/size math is
   // pure (lib/annotation-manipulation); measure notes recompute from their
   // captured factors inside sizeMatchEdits.
@@ -2725,7 +2788,7 @@ export function WorkspaceCanvasView({
     },
     [resolvedAnnots, dispatch],
   );
-  // ── Rung 3: calibration + per-measurement recalibration ──────────────
+  // ── Calibration + per-measurement recalibration ──────────────────────
   const onCalibrate = useCallback((lengthPts: number) => setCalibration(lengthPts), []);
   const onMeasureContextMenu = useCallback(
     (docId: string, pageId: string, annotationId: string, x: number, y: number) =>
@@ -2961,22 +3024,45 @@ export function WorkspaceCanvasView({
     setSelectedCandidateId((prev) => (prev === candidateId ? null : prev));
   }, []);
 
+  // The revision the review was read from. A region set describes ONE set of
+  // bytes — the working copy the detector read, as the exact buffer object the
+  // workspace held — and stops describing anything the moment that revision
+  // moves. Page-id pruning alone does not catch that: a page-tier commit
+  // publishes its authored ids, so a page can keep its id while its bytes
+  // change underneath the table drawn on it.
+  const tableSessionRef = useRef<TableReviewSession | null>(null);
   // The same prune, for the same reason: a region bound to a retired page id
-  // would export a table from a page the document no longer has.
+  // would export a table from a page the document no longer has. And the
+  // revision check beside it, for the reason above: a review of bytes the
+  // document no longer has is an empty review, synchronously, before any
+  // effect gets to clear it — a reader between the two must not see stale
+  // tables as live ones.
   const liveTableRegions = useMemo(() => {
     if (tableRegions.length === 0) return NO_TABLES;
+    const session = tableSessionRef.current;
+    if (!session || !sessionMatches(session, state.files.get(session.path))) return NO_TABLES;
     const live = new Set<string>();
     for (const d of docs) for (const p of d.pages) live.add(p.id);
     const kept = prunedRegions(tableRegions, live);
     return kept.length === tableRegions.length ? tableRegions : kept;
-  }, [tableRegions, docs]);
+  }, [tableRegions, docs, state.files]);
   const liveTableRegionsRef = useRef<TableRegion[]>(NO_TABLES);
   liveTableRegionsRef.current = liveTableRegions;
+  // Drop a review whose revision has moved, so a later `update` cannot
+  // resurrect it and the panel's mirror is told.
+  useEffect(() => {
+    const session = tableSessionRef.current;
+    if (!session || sessionMatches(session, state.files.get(session.path))) return;
+    tableSessionRef.current = null;
+    setTableRegions(NO_TABLES);
+    setSelectedTableId(null);
+  }, [state.files]);
   const tableSubscribersRef = useRef(new Set<() => void>());
   const tableServiceRef = useRef<{
     publish: (
       path: string,
       result: TableDetectionResult,
+      revision: { workingPath: string; buffer: object },
     ) => Promise<{ shown: number; skipped: number }>;
     update: (next: readonly TableRegion[]) => void;
     clear: () => void;
@@ -2984,6 +3070,7 @@ export function WorkspaceCanvasView({
     exportTo: (
       output: string,
       options: { sheetPer: string; includeUntabled: boolean },
+      request?: TableExportRequest & { assertCurrent?: () => void },
     ) => Promise<ExportDocumentResult>;
   } | null>(null);
 
@@ -3069,13 +3156,13 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      if (!doc) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
       setMarks((prev) => [
         ...prev,
         {
           id: crypto.randomUUID(),
-          path: doc.path,
+          path: target.doc.path,
           pageId,
           rect,
           rotationAtDraw,
@@ -3087,19 +3174,19 @@ export function WorkspaceCanvasView({
         },
       ]);
     },
-    [docs],
+    [acceptDrawing, setMarks],
   );
 
   const onRemoveRedactionMark = useCallback(
     (markId: string) => setMarks((prev) => prev.filter((m) => m.id !== markId)),
-    [],
+    [setMarks],
   );
 
   // ── Ruler guides ──────────────────────────────────────────────────────
-  // Per-document view state with the redaction-mark lifetime: never written
-  // into the file, invalidated on buffer
-  // identity, and pruned to pages that still exist so a dead generation-tagged
-  // id can never be offered to a gesture (the id-holder rule).
+  // Per-document view state: never written into the file, invalidated on
+  // buffer identity, and pruned to pages that still exist so a dead
+  // generation-tagged id can never be offered to a gesture (the id-holder
+  // rule).
   const [guides, setGuides] = useState<PageGuide[]>(NO_GUIDES);
   const liveGuides = useMemo(() => {
     if (guides.length === 0) return NO_GUIDES;
@@ -3121,14 +3208,15 @@ export function WorkspaceCanvasView({
 
   const onAddGuide = useCallback(
     (pageId: string, axis: GuideAxis, pos: number, rotationAtDraw: 0 | 90 | 180 | 270) => {
-      const doc = docs.find((d) => d.pages.some((p) => p.id === pageId));
-      if (!doc) return;
+      const holder = docs.find((d) => d.pages.some((p) => p.id === pageId));
+      const target = acceptDrawing(holder?.id, pageId, rotationAtDraw);
+      if (!target) return;
       setGuides((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), path: doc.path, pageId, axis, pos, rotationAtDraw },
+        { id: crypto.randomUUID(), path: target.doc.path, pageId, axis, pos, rotationAtDraw },
       ]);
     },
-    [docs],
+    [docs, acceptDrawing],
   );
   const onMoveGuide = useCallback(
     (guideId: string, axis: GuideAxis, pos: number, rotationAtDraw: 0 | 90 | 180 | 270) =>
@@ -3160,20 +3248,16 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ) => {
-      const doc = docs.find((d) => d.id === docId);
-      if (!doc) return;
-      // Anchor only to CURRENT ids — the onSetNewFieldRect rule:
-      // a placement drawn against docs indexed from
-      // a superseded buffer is stillborn — refuse rather than arm it.
-      if (!placementDocsCurrent(state.files, docs, doc.path)) return;
-      setSigPlacement({ id: crypto.randomUUID(), path: doc.path, pageId, rect, rotationAtDraw });
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
+      setSigPlacement({ id: crypto.randomUUID(), path: target.doc.path, pageId, rect, rotationAtDraw });
       setNewFieldPlacement(null);
       setAddTextPlacement(null); // one placement card at a time
       setSigFieldTarget(null);
       setSignDone(null);
       setSignError(null);
     },
-    [docs, state.files],
+    [acceptDrawing],
   );
   const onClearSignaturePlacement = useCallback(() => setSigPlacement(null), []);
 
@@ -3222,11 +3306,11 @@ export function WorkspaceCanvasView({
     void engineCall('signature_policy', { path: workingPath })
       .then((policy) => {
         if (cancelled) return;
-        const { signed } = policy as unknown as { signed: boolean };
-        setSigCanCertify(!signed);
+        const { signed, error } = parseSignaturePolicy(policy);
+        setSigCanCertify(!signed && !error);
         // A document that cannot be certified must not carry a certify
         // request left over from an earlier card.
-        if (signed) setSigCertify(DEFAULT_CERTIFY);
+        if (signed || error) setSigCertify(DEFAULT_CERTIFY);
       })
       .catch(() => {
         if (!cancelled) setSigCanCertify(false);
@@ -3245,19 +3329,14 @@ export function WorkspaceCanvasView({
     };
   }, [sigTargetPath, state.files, engineCall]);
 
-  // Invalidate marks when their file's bytes change underneath them (commit,
-  // whole-file op, undo, reopen) or the file closes. PageRef ids are
-  // positional (`path#pN`), so after a reindex a surviving mark could bind to
-  // a DIFFERENT physical page — for a destructive tool, dropping the marks is
-  // the only safe answer. Buffer identity is exactly what the indexer keys
-  // on, so this fires precisely when the workspace is about to be rebuilt.
-  // Re-seed: a file's stored /Redact set loads back into transient
-  // marks whenever its buffer SETTLES (open, commit, whole-file op, undo —
-  // the very moments the invalidation below clears them). Marks and file
-  // agree by construction: the transient set is always a projection of the
-  // stored one plus this session's unsaved drawing. `callRaw`, documented:
-  // this is a read of the just-settled working file — a gated call would
-  // queue a visible operation (and re-run the gate) on every settle.
+  // Re-seed: a file's stored /Redact set loads back into transient marks
+  // whenever its buffer SETTLES (open, commit, whole-file op, undo). New
+  // bytes that a page-tier commit did not compose take new page ids, so the
+  // seeded marks of the previous bytes die with their pages (marksAcross).
+  // Marks and file agree by construction: the transient set is always a
+  // projection of the stored one plus this session's unsaved drawing. The
+  // internal read uses the file lock, but no commit gate or operation-queue
+  // entry.
   const seedSeqRef = useRef(new Map<string, number>());
   const pendingSeedRef = useRef<Set<string>>(new Set());
 
@@ -3276,20 +3355,25 @@ export function WorkspaceCanvasView({
         page: number;
         rect: [number, number, number, number];
       })[],
-    ): Promise<{ marks: RedactionMark[]; orphaned: number }> => {
-      const f = filesRef.current.get(path);
-      if (!f?.buffer) return { marks: [], orphaned: entries.length };
-      const pages = docsRef.current.filter((d) => d.path === path).flatMap((d) => d.pages);
+    ): Promise<{ marks: RedactionMark[]; orphaned: number; buffer: PdfBuffer | null }> => {
+      const current = readState();
+      const buffer = current.files.get(path)?.buffer ?? null;
+      if (!buffer) return { marks: [], orphaned: entries.length, buffer };
+      // Every page is read from `buffer`. When the file takes other bytes
+      // meanwhile, nothing converted from these ones is kept.
+      const stillCurrent = (): boolean => readState().files.get(path)?.buffer === buffer;
+      const stale = { marks: [], orphaned: entries.length, buffer: null };
       const marks: RedactionMark[] = [];
       let orphaned = 0;
       for (const entry of entries) {
-        const pageRef = pages[entry.page - 1];
+        const pageRef = pageForFilePageNumber(current, path, entry.page);
         if (!pageRef) {
           orphaned += 1;
           continue;
         }
-        const proxy = await getDocumentProxy(pageRef.sourceDocId, f.buffer);
-        const p = await proxy.getPage(pageRef.sourcePageIndex + 1);
+        const request = requestDocumentProxy(pageRef.sourceDocId, buffer, stillCurrent);
+        if (!request) return stale;
+        const p = await (await request).getPage(pageRef.sourcePageIndex + 1);
         const [vx0, vy0, vx1, vy1] = p.view;
         const composed = ((p.rotate + pageRef.rotation) % 360) as 0 | 90 | 180 | 270;
         const rect = pdfRectToDisplay(
@@ -3311,19 +3395,19 @@ export function WorkspaceCanvasView({
           props: propertiesFromPayload(entry as Record<string, unknown>),
         });
       }
-      return { marks, orphaned };
+      return stillCurrent() ? { marks, orphaned, buffer } : stale;
     },
-    [],
+    [readState],
   );
 
   const seedMarksFromFile = useCallback(
     async (path: string) => {
-      const f = filesRef.current.get(path);
+      const f = readState().files.get(path);
       if (!f?.buffer) return;
       const seq = (seedSeqRef.current.get(path) ?? 0) + 1;
       seedSeqRef.current.set(path, seq);
       try {
-        const listed = (await engineCallRaw('list_redact_annotations', {
+        const listed = (await engineCall('list_redact_annotations', {
           file: f.workingPath,
         })) as unknown as {
           // Widened the listing: a stored mark reports its
@@ -3336,11 +3420,16 @@ export function WorkspaceCanvasView({
           })[];
         };
         if (seedSeqRef.current.get(path) !== seq) return; // superseded
-        if (!listed.marks?.length) return;
-        const { marks: seeded, orphaned } = await marksFromFileRects(path, listed.marks);
-        if (seedSeqRef.current.get(path) !== seq) return;
-        markPathsEverRef.current.add(path);
-        setMarks((prev) => [...prev.filter((m) => m.path !== path), ...seeded]);
+        // A listing of bytes the file no longer holds counts other pages; the
+        // change that replaced them queued the seed of the new ones.
+        if (readState().files.get(path)?.buffer !== f.buffer) return;
+        // An empty listing still lands: a seeded mark a page-tier commit
+        // carried over gives way to what the new bytes store, even to nothing.
+        const stored = listed.marks ?? [];
+        const { marks: seeded, orphaned, buffer } = await marksFromFileRects(path, stored);
+        if (seedSeqRef.current.get(path) !== seq || buffer !== f.buffer) return;
+        if (stored.length > 0) markPathsEverRef.current.add(path);
+        setMarks((prev) => withSeededMarks(prev, path, seeded));
         if (orphaned > 0) {
           setRedactError(
             tChromeCount('canvas.redact.seedOrphaned', orphaned, {
@@ -3362,21 +3451,20 @@ export function WorkspaceCanvasView({
         );
       }
     },
-    [engineCallRaw, marksFromFileRects],
+    [engineCall, marksFromFileRects, readState, setMarks],
   );
 
   // --- Link regions on the page ----------------------------------------
   // The redaction-mark seed, one derivation over: the file's own links are
   // read back and projected onto the canvas so an existing one can be picked
-  // and edited. `callRaw`, the documented exception the mark seed already
-  // holds — a read of the just-settled working file, where a gated call would
-  // queue a visible operation (and re-run the commit gate) on every settle.
+  // and edited. Like the mark seed, this INTERNAL read acquires the file lock
+  // without flushing page edits or adding a visible operation.
   //
   // Seeding is QUEUED on the buffer change and drained on the docs change,
   // for the mark seed's reason: the reindex is async, and binding regions to
   // PageRefs a rebuild is about to kill puts every overlay on the wrong page.
   const [linkRegions, setLinkRegions] = useState<LinkRegion[]>([]);
-  const [selectedLink, setSelectedLink] = useState<{ page: number; index: number } | null>(null);
+  const [selectedLink, setSelectedLink] = useState<LinkRegion | null>(null);
   const [linkError, setLinkError] = useState<string | null>(null);
   const linkSeedSeqRef = useRef(new Map<string, number>());
   const pendingLinkSeedRef = useRef<Set<string>>(new Set());
@@ -3387,11 +3475,15 @@ export function WorkspaceCanvasView({
       if (!f?.buffer) return;
       const seq = (linkSeedSeqRef.current.get(path) ?? 0) + 1;
       linkSeedSeqRef.current.set(path, seq);
+      const accepts = () => linkSeedSeqRef.current.get(path) === seq
+        && filesRef.current.get(path)?.buffer === f.buffer
+        && filesRef.current.get(path)?.workingPath === f.workingPath
+        && !readState().pageDirtyPaths.includes(path);
       try {
-        const listed = (await engineCallRaw('list_links', {
+        const listed = (await engineCall('list_links', {
           file: f.workingPath,
         })) as unknown as { links: LinkRecord[] };
-        if (linkSeedSeqRef.current.get(path) !== seq) return; // superseded
+        if (!accepts()) return;
         const entries = listed.links ?? [];
         if (entries.length === 0) {
           setLinkRegions((prev) => (prev.some((r) => r.path === path) ? prev.filter((r) => r.path !== path) : prev));
@@ -3412,6 +3504,8 @@ export function WorkspaceCanvasView({
           const composed = ((p.rotate + pageRef.rotation) % 360) as 0 | 90 | 180 | 270;
           seeded.push({
             path,
+            workingPath: f.workingPath,
+            buffer: f.buffer,
             page: entry.page,
             index: entry.index,
             pageId: pageRef.id,
@@ -3423,7 +3517,7 @@ export function WorkspaceCanvasView({
             ),
           });
         }
-        if (linkSeedSeqRef.current.get(path) !== seq) return;
+        if (!accepts()) return;
         setLinkRegions((prev) => [...prev.filter((r) => r.path !== path), ...seeded]);
         if (orphaned > 0) {
           setLinkError(
@@ -3433,7 +3527,7 @@ export function WorkspaceCanvasView({
           );
         }
       } catch (err) {
-        if (linkSeedSeqRef.current.get(path) !== seq) return; // superseded
+        if (!accepts()) return;
         // A listing that refuses is stated, never swallowed: a user editing
         // links on a document whose existing ones are silently absent would
         // draw a second link over one already there.
@@ -3445,13 +3539,17 @@ export function WorkspaceCanvasView({
         );
       }
     },
-    [engineCallRaw],
+    [engineCall, readState],
   );
 
   const onPickLink = useCallback((region: LinkRegion) => {
-    setSelectedLink({ page: region.page, index: region.index });
-    publishPickedLink({ path: region.path, page: region.page, index: region.index });
-  }, []);
+    const owner = filesRef.current.get(region.path);
+    if (owner?.buffer !== region.buffer || owner?.workingPath !== region.workingPath
+        || readState().pageDirtyPaths.includes(region.path)) return;
+    setSelectedLink(region);
+    publishPickedLink({ path: region.path, workingPath: region.workingPath, buffer: region.buffer,
+      page: region.page, index: region.index });
+  }, [readState]);
 
   // The overlays draw only while the Links tool is open. A link's rectangle is
   // invisible by design in a finished document; painting every one during
@@ -3475,10 +3573,10 @@ export function WorkspaceCanvasView({
       if (!current.has(path)) invalidated.add(path); // closed — a later reopen reuses the same positional ids
     }
     // Queue a mark re-seed for newly-opened files and still-open files
-    // whose buffer changed. QUEUED, not run: the workspace reindex is
-    // async, and seeding against the OLD PageRefs would bind marks to ids
-    // a non-authored rebuild is about to kill. The docs effect below
-    // drains the queue once the fresh pages exist.
+    // whose buffer changed. QUEUED, not run: an open's documents arrive with
+    // its async index, and seeding against documents of other bytes binds
+    // marks to ids that are about to die. The docs effect below drains the
+    // queue once the path's documents describe its bytes.
     for (const path of current.keys()) {
       if (!prev.has(path) || (invalidated.has(path) && current.get(path))) {
         pendingSeedRef.current.add(path);
@@ -3488,14 +3586,15 @@ export function WorkspaceCanvasView({
       }
     }
     if (invalidated.size > 0) {
-      setMarks((prevMarks) => prevMarks.filter((m) => !invalidated.has(m.path)));
+      // Redaction marks are not cleared here: they follow their pages
+      // (marksAcross), and one that dies unsaved is owed a notice.
       // A candidate names a region of bytes that no longer exist. After a
       // create the whole list is stale by construction, so it goes rather than
       // pointing at a document that no longer matches it.
       setFieldCandidates((prev) => prev.filter((c) => !invalidated.has(c.path)));
-      // Guides share the mark's lifetime exactly — same invalidation, same
-      // reason (a rebuilt file's pages are new objects; a guide bound to a
-      // dead page id is a guide pointing at nothing).
+      // Guides go with their file's bytes: a rebuilt file's pages are new
+      // objects, and a guide bound to a dead page id is a guide pointing at
+      // nothing.
       setGuides((prev) => {
         const kept = withoutPaths(prev, invalidated);
         return kept.length === prev.length ? prev : kept;
@@ -3529,28 +3628,27 @@ export function WorkspaceCanvasView({
     }
   }, [state.files]);
 
-  // drain: run queued mark seeds once the workspace's docs reflect the
-  // settled buffer (the reindex is async — seeding earlier would bind marks
-  // to PageRefs a rebuild is about to kill).
+  // drain: run queued mark seeds once the path's documents describe the bytes
+  // it holds (the reindex is async — seeding against the previous documents
+  // binds marks to page indexes of the previous bytes, or to PageRefs a
+  // rebuild is about to kill).
   useEffect(() => {
     if (pendingSeedRef.current.size === 0) return;
-    const present = new Set(docs.map((d) => d.path));
     for (const path of [...pendingSeedRef.current]) {
-      if (!present.has(path)) continue;
+      if (!pathDescribesCurrentBytes(state, path)) continue;
       pendingSeedRef.current.delete(path);
       void seedMarksFromFile(path);
     }
-  }, [docs, seedMarksFromFile]);
+  }, [state, seedMarksFromFile]);
 
   useEffect(() => {
     if (pendingLinkSeedRef.current.size === 0) return;
-    const present = new Set(docs.map((d) => d.path));
     for (const path of [...pendingLinkSeedRef.current]) {
-      if (!present.has(path)) continue;
+      if (!pathDescribesCurrentBytes(state, path)) continue;
       pendingLinkSeedRef.current.delete(path);
       void seedLinksFromFile(path);
     }
-  }, [docs, seedLinksFromFile]);
+  }, [state, seedLinksFromFile]);
 
   // Find overlays: matching pages, and per-word boxes where OCR words exist.
   const findMatchPageIds = find.active ? find.result.pageIds : NO_PAGE_IDS;
@@ -5032,15 +5130,16 @@ export function WorkspaceCanvasView({
       rect: { x: number; y: number; w: number; h: number },
       rotationAtDraw: 0 | 90 | 180 | 270,
     ): Promise<void> => {
-      const doc = docs.find((d) => d.id === docId);
-      if (!doc || addImageRef.current || editBusy) return;
+      if (addImageRef.current || editBusy) return;
+      const target = acceptDrawing(docId, pageId, rotationAtDraw);
+      if (!target) return;
       addImageRef.current = true;
       setEditBusy(true);
       setEditNotice(null);
       try {
         const placement: SignaturePlacement = {
           id: crypto.randomUUID(),
-          path: doc.path,
+          path: target.doc.path,
           pageId,
           rect,
           rotationAtDraw,
@@ -5080,7 +5179,7 @@ export function WorkspaceCanvasView({
         setEditBusy(false);
       }
     },
-    [docs, state.files, onAddImage, editBusy],
+    [docs, state.files, onAddImage, editBusy, acceptDrawing],
   );
 
   // --- Snapping: per-page geometry + the live preferences -------------------
@@ -5322,7 +5421,7 @@ export function WorkspaceCanvasView({
           subpaths: p.subpaths.map((sp) => [...sp]),
           closed: [...p.closed],
         })),
-      // Slice B: the live guide list, in the STORED frame. The e2e drag off a
+      // The live guide list, in the STORED frame. The e2e drag off a
       // ruler is real (the strips are ordinary chrome at known coordinates),
       // so this is a READ-back, not a placement shortcut — a spec that placed
       // guides through the harness would never exercise the gesture.
@@ -5508,8 +5607,8 @@ export function WorkspaceCanvasView({
     if (!TEST_HARNESS_ENABLED) return;
     registerCanvasForms({
       setFieldValue: (path, fieldName, value) => {
-        // Mirror exactly what the overlay controls can produce (review note:
-        // a looser harness could "pass" scenarios no real user can trigger):
+        // Mirror exactly what the overlay controls can produce (a looser
+        // harness could "pass" scenarios no real user can trigger):
         // right shape for the type, and choice values within the options.
         const info = workspaceFormsRef.current.get(path);
         const field = info?.fields.find((f) => f.name === fieldName);
@@ -5609,17 +5708,6 @@ export function WorkspaceCanvasView({
     return () => registerCanvasOcr(null);
   }, []);
 
-  // Convert every live mark into engine regions and redact file by file.
-  // Geometry (crop-intersected box + baked /Rotate) is read from the CURRENT
-  // buffer's pdf.js proxy — the same bytes the marks were drawn against; the
-  // commit gate then materializes pending page edits before the engine reads
-  // the file, so workspace page numbers and composed rotations line up with
-  // what lands on disk. Resolves with per-file failure messages (empty =
-  // success) — the confirm button surfaces them in the error banner, the test
-  // harness rethrows them.
-  // Ref, not just state: two clicks in the same tick both read a stale
-  // `redacting === false` (same failure mode as the commit-race double-click,
-  // the same reentrancy class).
   // Selection -> link regions. Geometry comes from the CURRENT buffer's proxy
   // (the same contract as applyMarks), and the engine call is commit-gated, so
   // the page numbers and user space line up with what lands on disk.
@@ -5656,6 +5744,8 @@ export function WorkspaceCanvasView({
   );
 
   const applyingRef = useRef(false);
+  // Capture marks at the gesture. The write derives their engine regions
+  // after committing page edits, inside the operation's revision guard.
   const applyMarks = useCallback(async (): Promise<string[]> => {
     const toApply = liveMarks;
     if (toApply.length === 0 || applyingRef.current) return [];
@@ -5663,24 +5753,15 @@ export function WorkspaceCanvasView({
     setRedacting(true);
     setRedactError(null);
     try {
-      const { files: payloads } = await buildRedactionRegions(docs, toApply, async (page) => {
-        const f = state.files.get(page.sourceDocId);
-        if (!f?.buffer) throw new Error(`no buffer loaded for ${page.sourceDocId}`);
-        const proxy = await getDocumentProxy(page.sourceDocId, f.buffer);
-        const p = await proxy.getPage(page.sourcePageIndex + 1);
-        const [vx0, vy0, vx1, vy1] = p.view;
-        return {
-          box: { x: vx0, y: vy0, width: vx1 - vx0, height: vy1 - vy0 },
-          bakedRotate: p.rotate,
-        };
-      });
+      const payloads = groupRedactionMarks(state, toApply);
       const failures: string[] = [];
       for (const payload of payloads) {
+        // The run's marks leave with the bytes it writes; that is no loss.
+        const run = crypto.randomUUID();
+        let wrote = false;
+        setMarkLedger((ledger) => marksInRun(ledger, payload.markIds, run));
         try {
-          if (await onRedactFile(payload.path, payload.regions)) {
-            const applied = new Set(payload.markIds);
-            setMarks((prev) => prev.filter((m) => !applied.has(m.id)));
-          }
+          wrote = await onRedactFile(payload.path, payload.marks, state);
         } catch (err) {
           const name = payload.path.split(/[\\/]/).pop() || payload.path;
           failures.push(
@@ -5689,6 +5770,8 @@ export function WorkspaceCanvasView({
               message: err instanceof Error ? err.message : String(err),
             }),
           );
+        } finally {
+          setMarkLedger((ledger) => marksAfterRun(ledger, run, wrote));
         }
       }
       if (failures.length > 0) {
@@ -5703,7 +5786,7 @@ export function WorkspaceCanvasView({
       applyingRef.current = false;
       setRedacting(false);
     }
-  }, [liveMarks, docs, state.files, onRedactFile]);
+  }, [liveMarks, state, onRedactFile]);
 
   // Persist the marks into the file(s) as /Redact annotations — the
   // SAME geometry pipeline as apply, so save and apply cannot disagree
@@ -5726,17 +5809,7 @@ export function WorkspaceCanvasView({
     setSavingMarks(true);
     setRedactError(null);
     try {
-      const { files: payloads } = await buildRedactionRegions(docs, toSave, async (page) => {
-        const f = state.files.get(page.sourceDocId);
-        if (!f?.buffer) throw new Error(`no buffer loaded for ${page.sourceDocId}`);
-        const proxy = await getDocumentProxy(page.sourceDocId, f.buffer);
-        const p = await proxy.getPage(page.sourcePageIndex + 1);
-        const [vx0, vy0, vx1, vy1] = p.view;
-        return {
-          box: { x: vx0, y: vy0, width: vx1 - vx0, height: vy1 - vy0 },
-          bakedRotate: p.rotate,
-        };
-      });
+      const payloads = groupRedactionMarks(state, toSave);
       // Save is a REPLACE, and "no marks" is a set: a file whose marks
       // (drawn or seeded) were all deleted this view lifetime gets its
       // stored set cleared — markPathsEverRef remembers which files those
@@ -5744,8 +5817,12 @@ export function WorkspaceCanvasView({
       const marked = new Set(payloads.map((p) => p.path));
       const failures: string[] = [];
       for (const payload of payloads) {
+        // The file stores the run's marks, and the seed shows them again.
+        const run = crypto.randomUUID();
+        let wrote = false;
+        setMarkLedger((ledger) => marksInRun(ledger, payload.markIds, run));
         try {
-          await onSaveRedactionMarks(payload.path, payload.regions);
+          wrote = await onSaveRedactionMarks(payload.path, payload.marks, state);
         } catch (err) {
           const name = payload.path.split(/[\\/]/).pop() || payload.path;
           failures.push(
@@ -5754,15 +5831,20 @@ export function WorkspaceCanvasView({
               message: err instanceof Error ? err.message : String(err),
             }),
           );
+        } finally {
+          setMarkLedger((ledger) => marksAfterRun(ledger, run, wrote));
         }
       }
       for (const path of [...markPathsEverRef.current]) {
         if (marked.has(path)) continue;
         if (!state.files.has(path)) continue; // closed — nothing to clear
         try {
-          await onSaveRedactionMarks(path, []);
-        } catch {
-          // clearing an already-clear file is best-effort
+          await onSaveRedactionMarks(path, [], state);
+        } catch (err) {
+          const name = path.split(/[\\/]/).pop() || path;
+          failures.push(tChrome('canvas.common.fileFailure', {
+            name, message: err instanceof Error ? err.message : String(err),
+          }));
         }
       }
       if (failures.length > 0) {
@@ -5777,7 +5859,7 @@ export function WorkspaceCanvasView({
       savingRef.current = false;
       setSavingMarks(false);
     }
-  }, [liveMarks, docs, state.files, onSaveRedactionMarks]);
+  }, [liveMarks, state, onSaveRedactionMarks]);
 
   // ── the Search & Redact panel's seam ─────────────────────────────────────
   //
@@ -5857,17 +5939,27 @@ export function WorkspaceCanvasView({
         pending.push({ page: request.page, rect: request.rect, ...current });
         byPath.set(request.path, pending);
       }
+      const converted: { path: string; buffer: PdfBuffer | null; marks: RedactionMark[]; entries: number }[] = [];
+      for (const [path, entries] of byPath) {
+        const { marks: made, orphaned, buffer } = await marksFromFileRects(path, entries);
+        converted.push({ path, buffer, marks: made, entries: made.length + orphaned });
+      }
+      // A file that took other bytes after its conversion keeps none of its
+      // marks: their geometry describes the previous bytes.
       const fresh: RedactionMark[] = [];
       let skipped = 0;
-      for (const [path, entries] of byPath) {
-        const { marks: made, orphaned } = await marksFromFileRects(path, entries);
-        fresh.push(...made);
-        skipped += orphaned;
+      for (const batch of converted) {
+        if (readState().files.get(batch.path)?.buffer === batch.buffer) {
+          fresh.push(...batch.marks);
+          skipped += batch.entries - batch.marks.length;
+        } else {
+          skipped += batch.entries;
+        }
       }
       if (fresh.length > 0) setMarks((prev) => [...prev, ...fresh]);
       return { added: fresh.length, duplicates, skipped };
     },
-    [markedRects, marksFromFileRects],
+    [markedRects, marksFromFileRects, readState, setMarks],
   );
 
   const searchOcrPage = useCallback(
@@ -5882,8 +5974,7 @@ export function WorkspaceCanvasView({
       // it and holds word boxes. They convert to page space through the same
       // machinery "Make searchable" uses, so a scanned page's marks and an
       // OCR layer's words land in the same coordinates.
-      const pages = docsRef.current.filter((d) => d.path === path).flatMap((d) => d.pages);
-      const pageRef = pages[page - 1];
+      const pageRef = pageForFilePageNumber(readState(), path, page);
       if (!pageRef) return [];
       const words = searchIndexRef.current.getOcrWords(sourceKeyOf(pageRef));
       if (!words || words.length === 0) return [];
@@ -5895,7 +5986,7 @@ export function WorkspaceCanvasView({
         rect: displayRectToPdf(word, geometry.box, geometry.bakedRotate),
       }));
     },
-    [geometryForPage],
+    [geometryForPage, readState],
   );
 
   // Listeners so the panel's already-marked state stays live while the user
@@ -6022,20 +6113,43 @@ export function WorkspaceCanvasView({
   // canvas owns the geometry, and the accept side writes no document at all —
   // it hands the reviewed bounds to the spreadsheet export and nothing else.
   const publishTables = useCallback(
-    async (path: string, result: TableDetectionResult): Promise<{ shown: number; skipped: number }> => {
-      const doc = docsRef.current.find((d) => d.path === path);
-      if (!doc) return { shown: 0, skipped: result.regions.length };
+    async (
+      path: string,
+      result: TableDetectionResult,
+      revision: { workingPath: string; buffer: object },
+    ): Promise<{ shown: number; skipped: number }> => {
+      // The detector read `revision`; the review is published only onto that.
+      // The panel's binding is lexical and does not move after its await —
+      // the workspace's does, and it is the workspace that says what the
+      // document's bytes are now.
+      const session: TableReviewSession = { path, ...revision };
+      const current = () => sessionMatches(session, filesRef.current.get(path))
+        && !readState().pageDirtyPaths.includes(path);
+      if (!current()) throw new Error(tChrome('app.history.changed'));
+      // The reindex that publishes the physical page index is async, and for a
+      // document opened moments earlier it can land after detection returns.
+      // The wait is on the INDEX only; the session's bytes are re-proven on
+      // every pass.
+      const pages = await awaitReviewPages(session, () => docsRef.current, current);
+      if (!pages) throw new Error(tChrome('app.history.changed'));
       const geometry = new Map<number, PageGeometry>();
       for (const page of new Set(result.regions.map((r) => r.page))) {
-        const pageRef = doc.pages[page - 1];
+        const pageRef = pages.get(page);
         if (!pageRef) continue;
         geometry.set(page, await geometryForPage(pageRef));
       }
+      // Geometry is an await; the revision can have moved across it.
+      if (!current()) throw new Error(tChrome('app.history.changed'));
+      const currentPages = tableReviewPages(session, docsRef.current);
+      if (!currentPages || [...pages].some(([page, prior]) => {
+        const now = currentPages.get(page);
+        return !now || now.id !== prior.id || now.rotation !== prior.rotation;
+      })) throw new Error(tChrome('app.history.changed'));
       const { regions, skipped } = regionsFromDetection(
         result,
         path,
         (row) => {
-          const pageRef = doc.pages[row.page - 1];
+          const pageRef = pages.get(row.page);
           const geo = geometry.get(row.page);
           if (!pageRef || !geo) return null;
           const delta = quarter(pageRef.rotation ?? 0);
@@ -6050,57 +6164,104 @@ export function WorkspaceCanvasView({
         },
         () => crypto.randomUUID(),
       );
+      tableSessionRef.current = session;
       setTableRegions(regions);
       setSelectedTableId(null);
       return { shown: regions.length, skipped };
     },
-    [geometryForPage],
+    [geometryForPage, readState],
   );
 
   const exportReviewedTables = useCallback(
     async (
       output: string,
       options: { sheetPer: string; includeUntabled: boolean },
+      request?: TableExportRequest & { assertCurrent?: () => void },
     ): Promise<ExportDocumentResult> => {
-      const chosen = acceptedRegions(liveTableRegionsRef.current);
-      if (chosen.length === 0) throw new Error(tChrome('panel.tableReview.nothingAccepted'));
-      const path = chosen[0].path;
-      const doc = docsRef.current.find((d) => d.path === path);
-      if (!doc) throw new Error(tChrome('panel.tableReview.documentGone'));
-      const geometry = new Map<string, { index: number; geo: PageGeometry }>();
+      // The export is OWNED: one revision, one set of tables, both fixed
+      // before the first await and re-proven at every boundary after it. A
+      // caller that captured its request before its own picker hands it in;
+      // a caller with none (the harness) is asking for the live set as it
+      // stands this instant, which is captured here on the same terms.
+      const session = tableSessionRef.current;
+      if (!session) throw new Error(tChrome('panel.tableReview.nothingAccepted'));
+      const asked = request ?? captureExportRequest(session, liveTableRegionsRef.current);
+      if (!asked) throw new Error(tChrome('panel.tableReview.nothingAccepted'));
+      const resolved = ownedAcceptedRegions(asked, {
+        session: tableSessionRef.current,
+        regions: liveTableRegionsRef.current,
+      });
+      if (!resolved.ok) {
+        throw new Error(tChrome(
+          resolved.reason === 'nothing-accepted'
+            ? 'panel.tableReview.nothingAccepted'
+            : 'app.history.changed',
+        ));
+      }
+      const chosen = resolved.regions;
+      const pages = tableReviewPages(session, docsRef.current);
+      if (!pages) throw new Error(tChrome('app.history.changed'));
+      // Live-state proof, run again at every boundary and — through the
+      // engine call's own option — inside the file lock after the commit
+      // gate, immediately before dispatch. The panel's run check rides
+      // along when there is one; this check is the canvas's own regardless.
+      const assertCurrent = (): void => {
+        request?.assertCurrent?.();
+        const currentPages = tableReviewPages(session, docsRef.current);
+        if (tableSessionRef.current !== session
+            || !sessionMatches(session, filesRef.current.get(session.path))
+            || readState().pageDirtyPaths.includes(session.path)
+            || !ownedAcceptedRegions(asked, {
+              session: tableSessionRef.current, regions: liveTableRegionsRef.current,
+            }).ok || !currentPages || chosen.some((region) => {
+              const page = currentPages.get(region.page);
+              const captured = pages.get(region.page);
+              return !page || !captured || page.id !== region.pageId
+                || page.id !== captured.id || page.rotation !== captured.rotation;
+            })) {
+          throw new Error(tChrome('app.history.changed'));
+        }
+      };
+      assertCurrent();
+      const geometry = new Map<string, PageGeometry>();
       for (const region of chosen) {
         if (geometry.has(region.pageId)) continue;
-        const index = doc.pages.findIndex((p) => p.id === region.pageId);
-        if (index < 0) continue;
-        geometry.set(region.pageId, { index, geo: await geometryForPage(doc.pages[index]) });
+        const page = pages.get(region.page);
+        if (!page || page.id !== region.pageId) continue;
+        geometry.set(region.pageId, await geometryForPage(page));
       }
+      // Geometry is an await; the revision can have moved across it.
+      assertCurrent();
       const { regions, skipped } = exportRegions(chosen, (region) => {
         const placed = geometry.get(region.pageId);
         if (!placed) return null;
         return {
           // The engine addresses the file's own page order, and a reviewed
           // table's page is where its bytes are, not where it sits on the board.
-          page: doc.pages[placed.index].sourcePageIndex + 1,
+          page: region.page,
           bounds: displayRectToPdf(
             region.rect,
-            placed.geo.box,
-            placed.geo.bakedRotate + region.rotationAtDraw,
+            placed.box,
+            placed.bakedRotate + region.rotationAtDraw,
           ),
         };
       });
       // A table whose page has gone is not silently left out of a workbook the
       // reviewer believes carries it.
       if (skipped > 0) throw new Error(tChrome('panel.tableReview.pagesGone'));
+      // The WORKING COPY, never the identity path. `path` is where the
+      // document came from; the bytes the reviewer looked at are in the
+      // working copy, and the gate does not translate one into the other.
       return (await engineCall('export_document', {
-        file: path,
+        file: session.workingPath,
         output,
         fmt: 'xlsx',
         sheet_per: options.sheetPer,
         ...(options.includeUntabled ? { include_untabled: true } : {}),
         regions,
-      })) as unknown as ExportDocumentResult;
+      }, { assertCurrent })) as unknown as ExportDocumentResult;
     },
-    [engineCall, geometryForPage],
+    [engineCall, geometryForPage, readState],
   );
 
   // ── Accessibility findings ────────────────────────────────────────────
@@ -6167,8 +6328,19 @@ export function WorkspaceCanvasView({
 
   tableServiceRef.current = {
     publish: publishTables,
-    update: (next) => setTableRegions([...next]),
+    update: (next) => {
+      // An edited copy of the live set and nothing else: a region the live
+      // set does not hold, or one from another document, is not a review
+      // gesture on this document. Refused by name, never merged in.
+      const session = tableSessionRef.current;
+      const live = new Set(liveTableRegionsRef.current.map((r) => r.id));
+      if (!session || next.some((r) => !live.has(r.id) || r.path !== session.path)) {
+        throw new Error(tChrome('app.history.changed'));
+      }
+      setTableRegions([...next]);
+    },
     clear: () => {
+      tableSessionRef.current = null;
       setTableRegions(NO_TABLES);
       setSelectedTableId(null);
     },
@@ -6355,7 +6527,8 @@ export function WorkspaceCanvasView({
     (rect: { x: number; y: number; w: number; h: number }) => { markId: string; docId: string; pageId: string } | null
   >(() => null);
   harnessAddMarkRef.current = (rect) => {
-    const doc = docs.find((d) => d.path === state.activeFileId);
+    const now = readState();
+    const doc = now.workspace.documents.find((d) => d.path === now.activeFileId);
     const page = doc?.pages[0];
     if (!doc || !page) return null;
     const id = crypto.randomUUID();
@@ -6377,7 +6550,7 @@ export function WorkspaceCanvasView({
       count: () => liveMarksRef.current.length,
     });
     return () => registerCanvasRedaction(null);
-  }, []);
+  }, [setMarks]);
 
   // Same bridge for the visible-signature placement (rubber band + native
   // dialogs aren't WebDriver-drivable). The harness places on the first page
@@ -6678,9 +6851,10 @@ export function WorkspaceCanvasView({
         toDocId: to.id,
         toIndex: to.pages.length,
         pages: buildMergedPageRefs(from),
+        sources: mergedPageSources(docs, state.files, from),
       });
     },
-    [dispatch, docs],
+    [dispatch, docs, state.files],
   );
 
   const onRemoveDoc = useCallback(
@@ -6732,13 +6906,13 @@ export function WorkspaceCanvasView({
     if (!TEST_HARNESS_ENABLED) return;
     registerCanvasMerge({
       getDocs: () =>
-        docsRef.current.map((d) => ({ id: d.id, path: d.path, name: d.name, pages: d.pages.length })),
+        readState().workspace.documents.map((d) => ({ id: d.id, path: d.path, name: d.name, pages: d.pages.length })),
       mergeUp: (docId) => mergeUpRef.current(docId),
       removeDoc: (docId) => removeDocRef.current(docId),
       noticeText: () => mergeNoticeRef.current,
     });
     return () => registerCanvasMerge(null);
-  }, []);
+  }, [readState]);
 
   const { intoDocId, intoIndex, betweenIndex, ghostSize, betweenPages } = deriveDropGhosts(
     docs,
@@ -6759,6 +6933,13 @@ export function WorkspaceCanvasView({
         className="shrink-0 border-b border-neutral-700 bg-neutral-800 px-3 py-2 text-sm text-neutral-200"
       >
         {tChrome('canvas.unrenderable', { names: unrenderableNames.join(', ') })}
+        <button
+          type="button"
+          className="ms-3 rounded bg-blue-600 px-2 py-0.5 text-xs text-white hover:bg-blue-500"
+          onClick={() => retryFailedIndexes(readState())}
+        >
+          {tChrome('app.commit.retry')}
+        </button>
       </div>
     ) : null;
 
@@ -7496,7 +7677,14 @@ export function WorkspaceCanvasView({
       {(liveSigPlacement || sigFieldTarget) && (
         <div
           data-testid="sign-canvas-form"
-          className="absolute bottom-4 start-4 z-30 w-80 rounded border border-neutral-700 bg-neutral-900/95 p-3 shadow-xl flex flex-col gap-2.5"
+          // Its own scroll box: the signer source list and a chosen source's
+          // fields together can outgrow the viewport, and a card anchored at
+          // the bottom edge grows UPWARD past the top of the window, where
+          // nothing can scroll it back.
+          // The cap is a percentage of the CANVAS AREA, not of the viewport:
+          // the area sits between the toolbars and the status bar, and a
+          // viewport-relative cap overshoots by however tall those are.
+          className="absolute bottom-4 start-4 z-30 w-80 max-h-[calc(100%-2rem)] overflow-y-auto rounded border border-neutral-700 bg-neutral-900/95 p-3 shadow-xl flex flex-col gap-2.5"
         >
           <div className="text-sm text-neutral-200 font-medium">
             {sigFieldTarget
@@ -7509,18 +7697,23 @@ export function WorkspaceCanvasView({
             )}
           </p>
           <SignerSourceFields value={sigSource} onChange={setSigSource} idPrefix="canvas-sign" />
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-neutral-400 w-20 shrink-0">
-              {tChrome('canvas.sign.password')}
-            </span>
-            <input
-              data-testid="canvas-sign-password"
-              type="password"
-              value={sigPassword}
-              onChange={(e) => setSigPassword(e.target.value)}
-              className="flex-1 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs focus:outline-none focus:border-blue-500"
-            />
-          </div>
+          {/* A store certificate's private key never leaves the platform's
+              keystore, so the request carries no secret for this field to
+              hold — the same rule the panel's form applies. */}
+          {sigSource.mode !== 'store' && (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-400 w-20 shrink-0">
+                {tChrome('canvas.sign.password')}
+              </span>
+              <input
+                data-testid="canvas-sign-password"
+                type="password"
+                value={sigPassword}
+                onChange={(e) => setSigPassword(e.target.value)}
+                className="flex-1 min-w-0 px-2 py-1 bg-neutral-800 border border-neutral-700 rounded text-xs focus:outline-none focus:border-blue-500"
+              />
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <span className="text-xs text-neutral-400 w-20 shrink-0">
               {tChrome('canvas.sign.reason')}
@@ -7603,6 +7796,7 @@ export function WorkspaceCanvasView({
           {signError && <div data-testid="canvas-sign-error" className="text-xs text-red-400">{signError}</div>}
           <div className="flex justify-end gap-2">
             <button
+              data-testid="canvas-sign-cancel"
               onClick={() => {
                 setSigPlacement(null);
                 setSigFieldTarget(null);
@@ -8255,18 +8449,39 @@ export function WorkspaceCanvasView({
         </div>
       )}
 
-      {redactError && (
-        <div
-          data-testid="redact-error"
-          className="absolute bottom-16 end-4 z-30 max-w-md flex items-start gap-2 px-3 py-2 bg-red-600/20 border border-red-500/40 rounded text-xs text-red-200 shadow-lg"
-        >
-          <span className="flex-1">{redactError}</span>
-          <button
-            onClick={() => setRedactError(null)}
-            className="text-red-300 hover:text-red-100"
-          >
-            ×
-          </button>
+      {(redactError || markLedger.cleared > marksClearedSeen) && (
+        <div className="absolute bottom-16 end-4 z-30 max-w-md flex flex-col gap-2">
+          {markLedger.cleared > marksClearedSeen && (
+            <div
+              data-testid="redact-marks-cleared"
+              role="status"
+              className="flex items-start gap-2 px-3 py-2 bg-amber-500/15 border border-amber-500/40 rounded text-xs text-amber-200 shadow-lg"
+            >
+              <span className="flex-1">
+                {tChromeCount('canvas.redact.marksCleared', markLedger.cleared - marksClearedSeen)}
+              </span>
+              <button
+                onClick={() => setMarksClearedSeen(markLedger.cleared)}
+                className="text-amber-300 hover:text-amber-100"
+              >
+                ×
+              </button>
+            </div>
+          )}
+          {redactError && (
+            <div
+              data-testid="redact-error"
+              className="flex items-start gap-2 px-3 py-2 bg-red-600/20 border border-red-500/40 rounded text-xs text-red-200 shadow-lg"
+            >
+              <span className="flex-1">{redactError}</span>
+              <button
+                onClick={() => setRedactError(null)}
+                className="text-red-300 hover:text-red-100"
+              >
+                ×
+              </button>
+            </div>
+          )}
         </div>
       )}
 

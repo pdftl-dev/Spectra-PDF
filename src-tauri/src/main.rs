@@ -6,6 +6,14 @@ use clap::Parser;
 use spectrapdf_lib::cli::{classify_launch, Cli, LaunchMode};
 
 fn main() {
+    // The scanner host is dispatched before anything else: it must not attach
+    // a console, raise a dialog, or reach the parser, and its stdio carries a
+    // protocol that any other output would corrupt.
+    let argv: Vec<String> = std::env::args().collect();
+    if spectrapdf_lib::scan_host::host_arg_present(&argv) {
+        std::process::exit(spectrapdf_lib::scan_host::serve());
+    }
+
     // Handle /? before anything else — show a GUI help dialog.
     // Clap doesn't recognize / switches, so we intercept early.
     if std::env::args().any(|a| a == "/?" || a == "-?") {
@@ -68,6 +76,9 @@ fn attach_parent_console() {
             h_template_file: *const u8,
         ) -> isize;
         fn SetStdHandle(n_std_handle: u32, h_handle: isize) -> i32;
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn GetFileType(h_file: isize) -> u32;
+        fn GetConsoleMode(h_console_handle: isize, lp_mode: *mut u32) -> i32;
     }
 
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
@@ -77,8 +88,36 @@ fn attach_parent_console() {
     const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32; // -11 as u32
     const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4u32; // -12 as u32
     const INVALID_HANDLE_VALUE: isize = -1;
+    const FILE_TYPE_DISK: u32 = 1;
+    const FILE_TYPE_CHAR: u32 = 2;
+    const FILE_TYPE_PIPE: u32 = 3;
 
     unsafe {
+        // A release GUI-subsystem executable can still inherit redirected
+        // stdout/stderr from a CLI caller. Keep those handles: replacing them
+        // with CONOUT$ makes `spectrapdf check ... > report.json` lose output.
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+        let stderr = GetStdHandle(STD_ERROR_HANDLE);
+        let is_redirected = |handle| {
+            if handle == 0 || handle == INVALID_HANDLE_VALUE {
+                return false;
+            }
+            match GetFileType(handle) {
+                FILE_TYPE_DISK | FILE_TYPE_PIPE => true,
+                FILE_TYPE_CHAR => {
+                    // NUL is a character device too. Only an actual console
+                    // should be replaced by CONOUT$ after attaching.
+                    let mut mode = 0;
+                    GetConsoleMode(handle, &mut mode) == 0
+                }
+                _ => false,
+            }
+        };
+        let stdout_redirected = is_redirected(stdout);
+        let stderr_redirected = is_redirected(stderr);
+        if stdout_redirected && stderr_redirected {
+            return;
+        }
         if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
             return; // No parent console (e.g., double-clicked)
         }
@@ -99,8 +138,16 @@ fn attach_parent_console() {
             ptr::null(),
         );
 
-        if handle != INVALID_HANDLE_VALUE {
+        // AttachConsole may replace standard handles. Restore each caller's
+        // redirect independently even if opening the console device fails.
+        if stdout_redirected {
+            SetStdHandle(STD_OUTPUT_HANDLE, stdout);
+        } else if handle != INVALID_HANDLE_VALUE {
             SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        }
+        if stderr_redirected {
+            SetStdHandle(STD_ERROR_HANDLE, stderr);
+        } else if handle != INVALID_HANDLE_VALUE {
             SetStdHandle(STD_ERROR_HANDLE, handle);
         }
     }

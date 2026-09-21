@@ -93,6 +93,153 @@ def _symbolic_program_font(pdf, ttf_bytes, widths=None, first_char=None, tounico
     return pdf.make_indirect(font)
 
 
+def _t1_number(value: int) -> bytes:
+    """One Type 1 charstring number, per the charstring encoding."""
+    value = int(value)
+    if -107 <= value <= 107:
+        return bytes([value + 139])
+    if 108 <= value <= 1131:
+        delta = value - 108
+        return bytes([(delta >> 8) + 247, delta & 0xFF])
+    return b"\xff" + value.to_bytes(4, "big", signed=True)
+
+
+def _t1_charstring(width: int) -> bytes:
+    """`0 <width> hsbw endchar`, eexec-encrypted at lenIV 4 — an empty glyph
+    that still declares its advance, which is what the width derivation
+    reads."""
+    from fontTools.misc import eexec
+
+    HSBW, ENDCHAR = bytes([13]), bytes([14])
+    plain = _t1_number(0) + _t1_number(width) + HSBW + ENDCHAR
+    encrypted, _r = eexec.encrypt(b"\0\0\0\0" + plain, 4330)
+    return encrypted
+
+
+def _type1_program(
+    names_by_code,
+    widths,
+    *,
+    trailer_zeros=512,
+    drop_cipher=0,
+    len_iv=4,
+    clear_extra=(),
+    trailer_sep=b"\n",
+):
+    """A synthesized Type 1 font program → (bytes, Length1, Length2).
+
+    Every byte is generated here — no third-party font is read or
+    redistributed, so the fixture carries no licence. The structure is the
+    one a real program has: a clear-text dictionary ending in
+    `currentfile eexec`, an eexec-encrypted Private/CharStrings section
+    ending in `currentfile closefile`, then the trailer.
+
+    `trailer_zeros=0` is the shape a PDF embeds with `/Length3 0`; a smaller
+    count is a truncated trailer; `drop_cipher` cuts bytes off the encrypted
+    section, which destroys the `closefile` no trailer can restore.
+    `len_iv=-1` declares a Private dict t1Lib rejects only AFTER interpreting
+    the whole program, and `clear_extra` lines are interpreted in the clear
+    text — an undefined name there is a parse failure carrying the document's
+    own bytes. `trailer_sep` is the whitespace between the trailer's zero
+    lines (the `EEXECEND` regex accepts space/tab/CR/LF); a non-whitespace
+    separator makes the run look interrupted.
+    """
+    from fontTools.misc import eexec
+
+    header = [
+        b"%!PS-AdobeFont-1.0: ZooT1 001.001",
+        b"11 dict begin",
+        b"/FontName /ZooT1 def",
+        b"/PaintType 0 def",
+        b"/FontType 1 def",
+        b"/FontMatrix [0.001 0 0 0.001 0 0] readonly def",
+        b"/FontBBox{0 0 600 700}readonly def",
+        b"/Encoding 256 array",
+        b"0 1 255 {1 index exch /.notdef put} for",
+    ]
+    for code, name in sorted(names_by_code.items()):
+        header.append(b"dup %d /%s put" % (code, name.encode("ascii")))
+    header.append(b"readonly def")
+    header += list(clear_extra)
+    header += [b"currentdict end", b"currentfile eexec", b""]
+    clear = b"\n".join(header)
+
+    charstrings = dict(widths)
+    charstrings.setdefault(".notdef", 0)
+    private = [
+        b"dup",
+        b"/Private 8 dict dup begin",
+        b"/RD{string currentfile exch readstring pop}executeonly def",
+        b"/ND{noaccess def}executeonly def",
+        b"/NP{noaccess put}executeonly def",
+        b"/lenIV %d def" % len_iv,
+        b"/Subrs 0 array ND",
+        b"2 index /CharStrings %d dict dup begin" % len(charstrings),
+    ]
+    for name, width in sorted(charstrings.items()):
+        blob = _t1_charstring(width)
+        private.append(
+            b"/%s %d RD " % (name.encode("ascii"), len(blob)) + blob + b" ND"
+        )
+    private += [
+        b"end",
+        b"end",
+        b"readonly put",
+        b"put",
+        b"dup/FontName get exch definefont pop",
+        b"mark currentfile closefile",
+        b"",
+    ]
+    cipher, _r = eexec.encrypt(b"ZOO!" + b"\n".join(private), 55665)
+    if drop_cipher:
+        cipher = cipher[:-drop_cipher]
+    program = clear + cipher
+    if trailer_zeros:
+        program += (
+            b"\n"
+            + (b"0" * 64 + trailer_sep) * (trailer_zeros // 64)
+            + b"cleartomark\n"
+        )
+    return program, len(clear), len(cipher)
+
+
+#: Sentinel for "omit the entry entirely", distinct from a declared 0.
+_OMIT = object()
+
+
+def _symbolic_type1_font(
+    pdf, program, length1, length2, *, length3=None, widths=None, first_char=None
+):
+    """A symbolic Type1 dict (no /Encoding, no /ToUnicode) carrying `program`
+    as its embedded /FontFile — the slot the program derivation targets.
+    `/Length3` defaults to what the program's own bytes make it (0 when the
+    trailer was dropped, per ISO 32000-2 Table 125); pass a value to declare
+    something else, or `_OMIT` to leave all three entries out."""
+    stream = pdf.make_stream(program)
+    if length3 is not _OMIT:
+        stream["/Length1"] = length1
+        stream["/Length2"] = length2
+        stream["/Length3"] = (
+            max(len(program) - length1 - length2, 0) if length3 is None else length3
+        )
+    desc = Dictionary(
+        Type=Name("/FontDescriptor"),
+        FontName=Name("/ZooT1"),
+        Flags=4,  # symbolic — forces the program-derivation path
+        FontFile=stream,
+    )
+    font = Dictionary(
+        Type=Name("/Font"),
+        Subtype=Name("/Type1"),
+        BaseFont=Name("/ABCDEF+ZooT1"),
+        FontDescriptor=desc,
+    )
+    if widths is not None:
+        font["/FirstChar"] = first_char
+        font["/Widths"] = Array(widths)
+    return pdf.make_indirect(font)
+
+
 class TestSimpleFonts:
     def test_winansi_round_trip_and_inventory(self):
         pdf = pikepdf.new()
@@ -327,6 +474,156 @@ class TestAnEmbeddedCMapNamesItselfAndNothingElse:
         assert "CIDSystemInfo" not in reason
         assert chr(10) not in reason
         assert len(reason) < 80
+
+
+class TestCodesThroughTheCodespace:
+    """A composite font's codes are read through its CMap's codespace ranges
+    (ISO 32000-2 §9.7.6.2): each byte of a code lies between the range's
+    bounds at its position. A code that matches no range is consumed by the
+    partial match of §9.7.6.3 and counts as invalid; a string holding one has
+    no single width, so it does not measure."""
+
+    def test_a_code_matches_byte_by_byte_not_by_value(self):
+        from engine.pdf_fonts import CodeSpace
+
+        space = CodeSpace([(b"\x81\x40", b"\x9f\xfc")])
+        assert space.read(b"\x81\x40", 0) == (2, True)
+        # 0x81FF lies between 0x8140 and 0x9FFC as a number; its second byte
+        # lies outside 0x40..0xFC.
+        assert space.read(b"\x81\xff", 0) == (2, False)
+
+    def test_a_first_byte_no_range_starts_with_takes_the_shortest_codes(self):
+        from engine.pdf_fonts import CodeSpace
+
+        space = CodeSpace([(b"\x81\x40", b"\x9f\xfc"), (b"\xa1", b"\xdf")])
+        assert space.split(b"\x20\xa1") == [(0x20, 1, False), (0xA1, 1, True)]
+
+    def test_the_longest_partial_match_wins_and_a_tie_takes_the_shorter(self):
+        from engine.pdf_fonts import CodeSpace
+
+        space = CodeSpace(
+            [(b"\x81\x30\x81\x30", b"\xfe\x39\xfe\x39"), (b"\x81\x40", b"\xfe\xfe")]
+        )
+        # 0x81 starts both ranges and 0x20 continues neither: the tie goes to
+        # the two-byte codes.
+        assert space.read(b"\x81\x20\x20\x20", 0) == (2, False)
+        # 0x81 0x35 continues only the four-byte range.
+        assert space.read(b"\x81\x35\x20\x20", 0) == (4, False)
+
+    def _embedded(self, pdf, spaces: bytes, widths=None):
+        program = (
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap "
+            + spaces
+            + b" 1 begincidrange <20> <7E> 32 endcidrange"
+            b" endcmap CMapName currentdict /CMap defineresource pop end end"
+        )
+        cmap = pdf.make_stream(program, Type=Name("/CMap"), CMapName=Name("/OneByte"))
+        kid = Dictionary(
+            Type=Name("/Font"), Subtype=Name("/CIDFontType2"), BaseFont=Name("/Embedded"),
+            CIDSystemInfo=Dictionary(Registry=b"Adobe", Ordering=b"Identity", Supplement=0),
+            DW=600,
+        )
+        if widths is not None:
+            kid["/W"] = Array(widths)
+        return pdf.make_indirect(
+            Dictionary(
+                Type=Name("/Font"), Subtype=Name("/Type0"), BaseFont=Name("/Embedded"),
+                Encoding=cmap, DescendantFonts=Array([pdf.make_indirect(kid)]),
+            )
+        )
+
+    def test_an_embedded_cmap_reads_its_own_one_byte_codes(self):
+        pdf = pikepdf.new()
+        cap = font_capability(
+            self._embedded(pdf, b"1 begincodespacerange <00> <FF> endcodespacerange", [0x51, Array([900])])
+        )
+        assert not cap.editable
+        assert cap.codes(b"PQ") == [(0x50, 1), (0x51, 1)]
+        # P is CID 0x50 at /DW; Q is CID 0x51 at its own /W entry.
+        assert cap.decoded_width(b"PQ") == 600 + 900
+        assert cap.measures(b"PQ")
+
+    def test_an_embedded_cmap_font_reads_through_its_tounicode_and_encodes_nothing(self):
+        pdf = pikepdf.new()
+        font = self._embedded(pdf, b"1 begincodespacerange <00> <FF> endcodespacerange")
+        font["/ToUnicode"] = _tounicode_stream(pdf, {0x50: "P", 0x51: "Q"})
+        cap = font_capability(font)
+        assert not cap.editable
+        assert cap.decode(b"PQ") == "PQ"
+        with pytest.raises(ValueError):
+            cap.encode("P")
+
+    def test_an_embedded_code_outside_every_range_does_not_measure(self):
+        pdf = pikepdf.new()
+        cap = font_capability(self._embedded(pdf, b"1 begincodespacerange <20> <7E> endcodespacerange"))
+        assert cap.measures(b"PQ")
+        assert not cap.measures(b"P\x01")
+
+    def test_an_embedded_cmap_built_on_identity_reads_its_two_byte_codes(self):
+        from engine.pdf_fonts import EmbeddedCMap
+
+        cmap = EmbeddedCMap(
+            b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap "
+            b"/Identity-H usecmap 1 begincidchar <0041> 7 endcidchar endcmap end end"
+        )
+        assert cmap.code_space.split(b"\x00\x41\x00\x42") == [(0x41, 2, True), (0x42, 2, True)]
+        assert (cmap.cid(b"\x00\x41"), cmap.cid(b"\x00\x42")) == (7, 0x42)
+
+    def test_a_fixed_two_byte_font_s_odd_last_byte_does_not_measure(self):
+        pdf = pikepdf.new()
+        kid = Dictionary(
+            Type=Name("/Font"), Subtype=Name("/CIDFontType2"), BaseFont=Name("/Identity"),
+            CIDSystemInfo=Dictionary(Registry=b"Adobe", Ordering=b"Identity", Supplement=0), DW=600,
+        )
+        cap = font_capability(
+            pdf.make_indirect(
+                Dictionary(
+                    Type=Name("/Font"), Subtype=Name("/Type0"), BaseFont=Name("/Identity"),
+                    Encoding=Name("/Identity-H"), DescendantFonts=Array([pdf.make_indirect(kid)]),
+                )
+            )
+        )
+        assert cap.measures(b"\x00\x41")
+        assert not cap.measures(b"\x00\x41\x00")
+
+    def test_an_unreadable_embedded_cmap_counts_every_byte_as_a_code(self):
+        pdf = pikepdf.new()
+        cap = font_capability(self._embedded(pdf, b""))
+        assert cap.code_count(b"PQ") == 2
+        assert not cap.measures(b"PQ")
+
+    def test_a_predefined_code_that_leaves_the_trie_is_consumed_whole(self):
+        pdf = pikepdf.new()
+        cap = font_capability(
+            TestPredefinedCjkCMaps()._cjk_font(pdf, {0x41: "A", 0x82A0: KANA}, "90ms-RKSJ-H")
+        )
+        # 0x81 leads a two-byte code; 0x81 0x20 is not one the CMap maps.
+        assert cap.codes(b"\x81\x20A") == [(0x8120, 2), (0x41, 1)]
+        assert not cap.measures(b"\x81\x20A")
+        assert cap.measures(b"A\x82\xa0")
+
+    def test_a_predefined_code_absent_from_tounicode_measures_through_its_cid(self):
+        from pdfminer.cmapdb import CMapDB
+
+        pdf = pikepdf.new()
+        cid = list(CMapDB.get_cmap("90ms-RKSJ-H").decode(b"\x82\xa0"))[0]
+        cap = font_capability(
+            TestPredefinedCjkCMaps()._cjk_font(
+                pdf, {0x41: "A"}, "90ms-RKSJ-H", cid_widths={cid: 880}, dw=500
+            )
+        )
+        assert cap.decoded_width(b"\x82\xa0") == 880
+
+    def test_word_spacing_finds_the_single_byte_space_of_a_cmap(self):
+        from engine.text_metrics import _spaces_in
+
+        pdf = pikepdf.new()
+        cap = font_capability(
+            TestPredefinedCjkCMaps()._cjk_font(pdf, {0x41: "A", 0x82A0: KANA}, "90ms-RKSJ-H")
+        )
+        assert _spaces_in(b"A \x82\xa0 A", cap) == 2
+        # 0x20 inside a two-byte code is not a space.
+        assert _spaces_in(b"\x81\x20", cap) == 0
 
 
 class TestPredefinedCjkCMaps:
@@ -769,7 +1066,7 @@ class TestSymbolicProgramDerivedEncoding:
         assert cap.reason == "no resolvable encoding (symbolic font without ToUnicode)"
 
 class TestWidthsGuardHardening:
-    """Review round: the /Widths subset guard vs degenerate arrays."""
+    """The /Widths subset guard vs degenerate arrays."""
 
     def test_empty_widths_array_does_not_collapse_encodability(self):
         # regression: /Widths [] inverted the guard range and
@@ -1094,6 +1391,533 @@ class TestT9BareProgramFonts:
         assert cap.editable
         assert cap.decode(b"\x41") == "A"
         assert cap.char_width("A") > 0
+
+
+class TestType1EexecTrailerRecovery:
+    """A PDF-embedded Type 1 program normally carries NO eexec trailer: ISO
+    32000-2:2020, 9.9.1, Table 125 lets `/Length3 0` declare that the 512
+    zeros and `cleartomark` were left out for the processor to add. fontTools
+    bounds the encrypted section by scanning for exactly those zeros, so
+    without them an otherwise complete program does not parse. Regression:
+    that failure was swallowed into an empty derivation, and every such font
+    — all TeX output, whose CM faces embed this way — reported as having no
+    resolvable encoding.
+
+    Each t1Lib parse is a full PostScript interpretation of untrusted bytes,
+    so HOW MANY parses, of WHICH bytes, is behaviour under test here, observed
+    through the `parses` spy."""
+
+    NAMES = {0x0B: "ff", 0x41: "alpha", 0x42: "beta"}
+    WIDTHS = {"ff": 620, "alpha": 700, "beta": 550}
+    # code → what the builtin encoding + AGL must yield. 0x41 is NOT "A": the
+    # map comes from the font's own /Encoding array, never from the code's
+    # ASCII meaning.
+    DECODED = {0x0B: "\ufb00", 0x41: "\u03b1", 0x42: "\u03b2"}
+    REASON = "no resolvable encoding (symbolic font without ToUnicode)"
+    # Written out here rather than imported: a test that reads the constant
+    # under test cannot notice the constant changing. No leading separator —
+    # the completion appends the fixed content directly (see the newline
+    # decision in `_type1_encoding_map`).
+    TABLE_125_TRAILER = (b"0" * 64 + b"\n") * 8 + b"cleartomark\n"
+
+    @pytest.fixture
+    def parses(self, monkeypatch):
+        """Every program handed to t1Lib, in order."""
+        from engine import pdf_fonts
+
+        seen: list[bytes] = []
+        real = pdf_fonts._parse_type1_program
+
+        def spy(raw):
+            seen.append(raw)
+            return real(raw)
+
+        monkeypatch.setattr(pdf_fonts, "_parse_type1_program", spy)
+        return seen
+
+    def _program(self, **kwargs):
+        return _type1_program(self.NAMES, self.WIDTHS, **kwargs)
+
+    def _cap_of(self, program, length1=0, length2=0, **font_kwargs):
+        pdf = pikepdf.new()
+        return font_capability(
+            _symbolic_type1_font(pdf, program, length1, length2, **font_kwargs)
+        )
+
+    def _cap(self, program_kwargs=None, **font_kwargs):
+        program, length1, length2 = self._program(**(program_kwargs or {}))
+        return self._cap_of(program, length1, length2, **font_kwargs), program
+
+    def _assert_derived(self, cap):
+        assert cap.editable and cap.reason is None and cap.diagnostic is None
+        for code, expected in self.DECODED.items():
+            assert cap.decode(bytes([code])) == expected
+            assert cap.encode(expected) == bytes([code])
+        assert set(cap.encodable()) == set(self.DECODED.values())
+        # Charstring advances, keyed by the derived codes (upem 1000).
+        assert cap.char_width("\u03b1") == 700
+        assert cap.char_width("\u03b2") == 550
+        assert cap.char_width("\ufb00") == 620
+
+    # ── which program is parsed: decided by the bytes ─────────────────────
+
+    def test_program_with_its_trailer_parses_as_embedded(self, parses):
+        cap, program = self._cap()
+        self._assert_derived(cap)
+        assert parses == [program]
+
+    def test_program_without_its_trailer_parses_completed(self, parses):
+        # The shape a TeX-produced PDF embeds (`/Length3 0`, no trailer). One
+        # parse, of exactly the program plus Table 125's fixed content.
+        cap, program = self._cap({"trailer_zeros": 0})
+        self._assert_derived(cap)
+        assert parses == [program + self.TABLE_125_TRAILER]
+
+    def test_truncated_trailer_parses_completed(self, parses):
+        # 128 zeros is no zero run fontTools accepts; the leftovers ride along
+        # and are discarded past the decrypted `closefile`.
+        cap, program = self._cap({"trailer_zeros": 128})
+        self._assert_derived(cap)
+        assert parses == [program + self.TABLE_125_TRAILER]
+
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            pytest.param(0, id="length3-zero"),
+            pytest.param(533, id="length3-positive"),
+            pytest.param(_OMIT, id="undeclared"),
+        ],
+    )
+    def test_declared_length3_never_changes_which_program_is_parsed(
+        self, parses, declared
+    ):
+        # The bytes answer what /Length3 only declares. Trusting a false
+        # `/Length3 0` would complete a program that kept its trailer — whose
+        # second `cleartomark` then fails the parse — and trusting a positive
+        # one over a missing trailer would parse a program that cannot parse.
+        trailerless, _l1, _l2 = self._program(trailer_zeros=0)
+        self._assert_derived(self._cap_of(trailerless, length3=declared))
+        assert parses == [trailerless + self.TABLE_125_TRAILER]
+        parses.clear()
+        complete, _l1, _l2 = self._program()
+        self._assert_derived(self._cap_of(complete, length3=declared))
+        assert parses == [complete]
+
+    def test_pfb_program_is_never_completed(self, parses):
+        # PFB segment headers bound the encrypted part, so t1Lib never scans
+        # for the zero run and a segmented program needs no trailer. Nor may
+        # one be appended: past the last segment it is not a segment.
+        program, length1, length2 = self._program(trailer_zeros=0)
+        clear, cipher = program[:length1], program[length1:length1 + length2]
+        pfb = (
+            b"\x80\x01" + len(clear).to_bytes(4, "little") + clear
+            + b"\x80\x02" + len(cipher).to_bytes(4, "little") + cipher
+            + b"\x80\x03"
+        )
+        self._assert_derived(self._cap_of(pfb, length1, length2, length3=0))
+        assert parses == [pfb]
+
+    def test_program_without_an_eexec_section_is_not_completed(self, parses):
+        raw = b"%!PS-AdobeFont-1.0: NoSection\n/FontType 1 def\n"
+        cap = self._cap_of(raw)
+        assert parses == [raw]
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            "the embedded Type 1 program will not parse "
+            "(T1Error: not an encrypted Type 1 font)"
+        )
+
+    # ── bounds on work done for untrusted bytes ───────────────────────────
+
+    @pytest.mark.parametrize("over", [0, 1], ids=["at-the-bound", "one-byte-over"])
+    def test_program_size_bound(self, parses, monkeypatch, over):
+        # The smallest input that proves the bound: the real comparison runs
+        # against a lowered limit, so no oversized fixture is needed. Over
+        # the bound NOTHING is interpreted — the refusal cannot hang.
+        from engine import pdf_fonts
+
+        program, length1, length2 = self._program(trailer_zeros=0)
+        monkeypatch.setattr(pdf_fonts, "MAX_TYPE1_PROGRAM_BYTES", len(program) - over)
+        cap = self._cap_of(program, length1, length2, widths=[601, 602], first_char=0x41)
+        if not over:
+            assert cap.editable
+            assert len(parses) == 1
+            return
+        assert parses == []
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            f"the embedded Type 1 program is larger than {len(program) - 1} "
+            "bytes and was not parsed"
+        )
+        # /Widths needs no encoding, so the advances survive the refusal.
+        assert cap.decoded_width(bytes([0x41])) == pytest.approx(601.0)
+        assert cap.decoded_width(bytes([0x42])) == pytest.approx(602.0)
+
+    @pytest.mark.parametrize("with_trailer", [False, True], ids=["trailerless", "with-trailer"])
+    @pytest.mark.parametrize("blocks", [64, 65], ids=["at-the-bound", "one-block-over"])
+    def test_zero_run_screen(self, parses, with_trailer, blocks):
+        # fontTools' own end-of-section scan is quadratic in every zero run
+        # shorter than 512, so runs of that kind are counted before it runs:
+        # 16-zero blocks outside whole 512-runs, past 64 of them refused
+        # unscanned. The two-kilobyte input is the smallest that crosses the
+        # bound. A whole trailer's own 32 blocks do not count against it, and
+        # the junk sits where a truncated trailer's leftovers would: after
+        # the cipher, discarded past `closefile`, so admitted means derived.
+        program, length1, length2 = self._program(trailer_zeros=0)
+        junk = (b"0" * 16 + b"x") * blocks
+        program += junk + (self.TABLE_125_TRAILER if with_trailer else b"")
+        cap = self._cap_of(program, length1, length2, widths=[601], first_char=0x41)
+        if blocks <= 64:
+            self._assert_derived_within_widths(cap)
+            expected = program if with_trailer else program + self.TABLE_125_TRAILER
+            assert parses == [expected]
+            return
+        assert parses == []
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            "the embedded Type 1 program was not parsed: its encrypted "
+            "section holds zero runs no encrypted section has"
+        )
+        assert cap.decoded_width(bytes([0x41])) == pytest.approx(601.0)
+
+    def _assert_derived_within_widths(self, cap):
+        # /Widths [601] from 0x41 restricts ENCODING to that one code.
+        assert cap.editable and cap.diagnostic is None
+        for code, expected in self.DECODED.items():
+            assert cap.decode(bytes([code])) == expected
+        assert set(cap.encodable()) == {"\u03b1"}
+
+    # ── the refusal, and what it says ─────────────────────────────────────
+
+    def test_unparseable_program_refuses_naming_the_completion(self, parses):
+        # The encrypted section is cut short, so the decrypted
+        # `currentfile closefile` no trailer can restore is gone.
+        cap, _program = self._cap(
+            {"trailer_zeros": 0, "drop_cipher": 400},
+            widths=[601, 602],
+            first_char=0x41,
+        )
+        assert len(parses) == 1
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            "the embedded Type 1 program will not parse once completed "
+            "(T1Error: can't find end of eexec part)"
+        )
+        # /Widths needs no encoding, so the advances survive the refusal.
+        assert cap.decoded_width(bytes([0x41])) == pytest.approx(601.0)
+
+    @pytest.mark.parametrize(
+        "trailer_zeros, expected",
+        [
+            pytest.param(
+                512,
+                "the embedded Type 1 program will not parse (AssertionError)",
+                id="as-embedded",
+            ),
+            pytest.param(
+                0,
+                "the embedded Type 1 program will not parse once completed (AssertionError)",
+                id="completed",
+            ),
+        ],
+    )
+    def test_failure_after_interpretation_names_its_type_only(
+        self, parses, trailer_zeros, expected
+    ):
+        # t1Lib interprets the whole program and only THEN rejects the
+        # negative lenIV — an argument-less AssertionError, named by its type
+        # with no dangling colon. The clause says whether the program was
+        # completed, which separates a failed completion from a program that
+        # failed as embedded.
+        cap, _program = self._cap({"trailer_zeros": trailer_zeros, "len_iv": -1})
+        assert len(parses) == 1
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == expected
+
+    def test_diagnostic_never_repeats_the_documents_own_bytes(self, parses):
+        # psLib's name error splices the undefined token — the document's
+        # bytes — into its message. The TYPE is what travels.
+        secret = b"ClientName_Q4_Acquisition_DO_NOT_DISCLOSE"
+        cap, _program = self._cap({"trailer_zeros": 0, "clear_extra": [secret]})
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            "the embedded Type 1 program will not parse once completed (PSError)"
+        )
+
+    @pytest.mark.parametrize(
+        "exc, expected",
+        [
+            pytest.param(
+                PermissionError(
+                    13, "Permission denied", r"C:\Users\someone\AppData\Local\Temp\tmp1.pfa"
+                ),
+                "PermissionError",
+                id="local-path",
+            ),
+            pytest.param(ValueError("bad chunk code: b'\\x07'"), "ValueError", id="document-byte"),
+            pytest.param(AssertionError(), "AssertionError", id="no-message"),
+            pytest.param(
+                RuntimeError("dictstack underflow"),
+                "RuntimeError: dictstack underflow",
+                id="library-constant",
+            ),
+            pytest.param(
+                __import__("binascii").Error("Non-hexadecimal digit found"),
+                "binascii.Error",
+                id="generic-name-qualified-by-module",
+            ),
+        ],
+    )
+    def test_parser_failure_carries_the_type_and_only_constant_text(self, exc, expected):
+        from engine.pdf_fonts import _parser_failure
+
+        assert _parser_failure(exc) == expected
+
+    def test_diagnostic_is_clipped(self):
+        from engine.pdf_fonts import FontCapability
+
+        cap = FontCapability(False, "r", {}, {}, {}, 500.0, 1, diagnostic="x" * 5000)
+        assert cap.diagnostic == "x" * 200 + "…"
+
+    # ── the public surface ────────────────────────────────────────────────
+
+    def _page_pdf(self, tmp_path, name, program_kwargs):
+        program, length1, length2 = self._program(**program_kwargs)
+        pdf = pikepdf.new()
+        font = _symbolic_type1_font(pdf, program, length1, length2)
+        page = pdf.add_blank_page(page_size=(200, 200))
+        page.obj["/Resources"] = Dictionary(Font=Dictionary(F1=font))
+        page.obj["/Contents"] = pdf.make_stream(b"BT /F1 12 Tf 10 100 Td (AB) Tj ET")
+        path = tmp_path / name
+        pdf.save(path)
+        return str(path)
+
+    def test_trailerless_program_lists_editable_through_the_engine_reply(self, tmp_path):
+        from engine.text_paragraphs import list_text_paragraphs
+
+        path = self._page_pdf(tmp_path, "derived.pdf", {"trailer_zeros": 0})
+        listing = list_text_paragraphs(path, 1)
+        assert [(p["text"], p["editable"]) for p in listing["paragraphs"]] == [
+            ("\u03b1\u03b2", True)
+        ]
+
+    def test_refusal_through_the_engine_reply_carries_no_diagnostic(self, tmp_path):
+        # The diagnostic is engine-internal: the reply carries the catalog
+        # reason and nothing a surface does not render.
+        from engine.text_paragraphs import list_text_paragraphs
+
+        path = self._page_pdf(
+            tmp_path, "refused.pdf", {"trailer_zeros": 0, "drop_cipher": 400}
+        )
+        listing = list_text_paragraphs(path, 1)
+        assert len(listing["runs"]) == 1
+        run = listing["runs"][0]
+        assert run["editable"] is False and run["reason"] == self.REASON
+        assert "diagnostic" not in run
+        assert all(not p["editable"] for p in listing["paragraphs"])
+
+    def test_declared_widths_win_and_program_widths_fill_the_rest(self):
+        cap, _program = self._cap({"trailer_zeros": 0}, widths=[601], first_char=0x41)
+        assert cap.editable
+        assert cap.decoded_width(bytes([0x41])) == pytest.approx(601.0)  # declared
+        assert cap.decoded_width(bytes([0x42])) == pytest.approx(550.0)  # charstring
+        # The /Widths subset guard still restricts ENCODING to the declared
+        # range, unchanged by the derivation source.
+        assert set(cap.encodable()) == {"\u03b1"}
+
+
+    # ── the interpreter is bounded (a Type 1 program is a PostScript program) ─
+
+    def _hostile(self, body, **kw):
+        # A program whose CLEAR TEXT runs `body`, with declared /Widths so the
+        # refusal's advances can be checked to survive.
+        program, length1, length2 = self._program(
+            clear_extra=[body], trailer_zeros=0, **kw
+        )
+        pdf = pikepdf.new()
+        return self._cap_of(
+            program, length1, length2, widths=[601, 602], first_char=0x41
+        )
+
+    def _assert_bounded_refusal(self, body, expected_diag, **kw):
+        import time
+
+        start = time.perf_counter()
+        cap = self._hostile(body, **kw)
+        elapsed = time.perf_counter() - start
+        # Bounded return: the working bound trips in well under a second; the
+        # ceiling is generous so a slow machine never flakes. A REMOVED bound
+        # does not reach here — it never returns — which is a CI-visible fail,
+        # not a silent pass.
+        assert elapsed < 8.0, f"took {elapsed:.1f}s"
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == expected_diag
+        # /Widths needs no encoding, so the advances survive the refusal.
+        assert cap.decoded_width(bytes([0x41])) == pytest.approx(601.0)
+        assert cap.decoded_width(bytes([0x42])) == pytest.approx(602.0)
+        return cap
+
+    def test_infinite_loop_refuses_by_step_budget(self):
+        # `0 0 -1 {pop} for` never returns on an unbounded interpreter (the
+        # increment is 0, so the counter never reaches the limit).
+        self._assert_bounded_refusal(
+            b"0 0 -1 {pop} for",
+            "the embedded Type 1 program exceeded the interpreter step budget "
+            "and was not parsed",
+        )
+
+    def test_empty_body_loop_refuses_by_stack_bound(self):
+        # `0 0 -1 {} for` calls no `handle_object` (empty body), so only the
+        # per-iteration `call_procedure` tick and the operand-stack growth
+        # bound it; the stack cap trips first.
+        self._assert_bounded_refusal(
+            b"0 0 -1 {} for",
+            "the embedded Type 1 program overflowed the interpreter stack and "
+            "was not parsed",
+        )
+
+    def test_array_allocation_bomb_refuses(self):
+        self._assert_bounded_refusal(
+            b"50000000 array pop",
+            "the embedded Type 1 program requested more interpreter memory "
+            "than allowed and was not parsed",
+        )
+
+    def test_string_allocation_bomb_refuses(self):
+        self._assert_bounded_refusal(
+            b"400000000 string pop",
+            "the embedded Type 1 program requested more interpreter memory "
+            "than allowed and was not parsed",
+        )
+
+    def test_a_real_font_stays_well_inside_the_budget(self):
+        # The guard against a false refusal: the reporter's own program (95
+        # glyphs) derives, so the budget is not brushing real work.
+        cap, _p = self._cap()
+        assert cap.editable and cap.diagnostic is None
+        assert len(cap.encodable()) == 3
+
+    # ── the trailer's own whitespace (EEXECEND accepts space/tab/CR/LF) ────
+
+    @pytest.mark.parametrize(
+        "sep", [b" ", b"\t", b"\r", b"\r\n"],
+        ids=["space", "tab", "cr", "crlf"],
+    )
+    def test_trailer_whitespace_is_recognized_so_the_program_is_not_completed(
+        self, parses, sep
+    ):
+        # A real trailer's 512 zeros may be split by any of these. If the
+        # section screen dropped one from its strip set, the run would look
+        # interrupted, the program would be completed, and the second trailer
+        # would fail the parse. So: recognized, parsed AS EMBEDDED.
+        cap, program = self._cap({"trailer_sep": sep})
+        self._assert_derived(cap)
+        assert parses == [program]
+
+    # ── a parse that succeeds but maps nothing is not silent ──────────────
+
+    def test_parsed_but_no_mappable_glyph_says_so(self, parses):
+        # Real TeX subsets whose glyph names are outside the AGL (e.g. CMEX10's
+        # math glyphs) parse but derive no code. That must be distinguishable
+        # from "no program", which is the whole point of the diagnostic. Both
+        # names here are non-AGL and not uniXXXX forms, so nothing maps.
+        program, length1, length2 = _type1_program(
+            {0x41: "zzundefinedone", 0x42: "zzundefinedtwo"},
+            {"zzundefinedone": 500, "zzundefinedtwo": 500},
+            trailer_zeros=0,
+        )
+        pdf = pikepdf.new()
+        cap = font_capability(_symbolic_type1_font(pdf, program, length1, length2))
+        assert len(parses) == 1  # it PARSED (one interpretation), then mapped nothing
+        assert not cap.editable and cap.reason == self.REASON
+        assert cap.diagnostic == (
+            "the embedded Type 1 program parsed but names no character "
+            "the Adobe Glyph List maps"
+        )
+
+    # ── the completion appends no separator ────────────────────────────────
+
+    def test_completion_appends_the_fixed_content_with_no_separator(self, parses):
+        # Dropping the leading newline is never worse on the corpus and
+        # recovers a program cut exactly at its zero run whose last cipher byte
+        # is 0x30; the exact-bytes pins across this class already encode it, and
+        # this states it directly.
+        cap, program = self._cap({"trailer_zeros": 0})
+        self._assert_derived(cap)
+        assert parses == [program + self.TABLE_125_TRAILER]
+        assert parses[0][len(program):len(program) + 1] != b"\n"
+
+
+class TestCffDefaultCharset:
+    """A bare-CFF (Type1C) Top DICT may omit the charset operator, which
+    declares the CFF default charset, ISOAdobe. cffLib applies that default
+    only when the operator is present with value 0; absent, reading the charset
+    raises `AttributeError`, and so does building the CharStrings. The reader
+    supplies the default instead of refusing."""
+
+    def _cff_without_charset(self):
+        # Every byte generated here; no third-party font is read. FontBuilder
+        # always writes a charset operator, so it is removed at the object
+        # level before recompiling — the shape a subsetter that relies on the
+        # default produces.
+        from fontTools.cffLib import CFFFontSet  # noqa: F401
+        from fontTools.fontBuilder import FontBuilder
+        from fontTools.pens.t2CharStringPen import T2CharStringPen
+
+        order = [".notdef", "A", "B"]
+        fb = FontBuilder(1000, isTTF=False)
+        fb.setupGlyphOrder(order)
+        fb.setupCharacterMap({0x41: "A", 0x42: "B"})
+        charstrings = {}
+        for name in order:
+            pen = T2CharStringPen(600, None)
+            pen.moveTo((0, 0))
+            pen.lineTo((0, 500))
+            pen.lineTo((500, 500))
+            pen.closePath()
+            charstrings[name] = pen.getCharString()
+        fb.setupCFF("BareProg", {}, charstrings, {})
+        fb.setupHorizontalMetrics({n: (600, 0) for n in order})
+        fb.setupHorizontalHeader(ascent=800, descent=-200)
+        fb.setupNameTable({"familyName": "BareProg", "styleName": "Regular"})
+        fb.setupOS2()
+        fb.setupPost()
+        cff = fb.font["CFF "].cff
+        top = cff[cff.fontNames[0]]
+        _ = top.CharStrings  # realize before mutating
+        del top.charset
+        top.order = [op for op in top.order if op != "charset"]
+        return fb.font.getTableData("CFF ")
+
+    def test_cff_map_recovers_via_the_isoadobe_default(self):
+        from engine.pdf_fonts import _cff_encoding_map
+
+        raw = self._cff_without_charset()
+        code2uni, widths, diag = _cff_encoding_map(raw)
+        # Without a charset, glyphs ARE named by ISOAdobe order, so codes map
+        # through it rather than crashing.
+        assert diag is None
+        assert code2uni  # non-empty
+        assert all(isinstance(v, str) and v for v in code2uni.values())
+
+    def test_font_capability_editable_for_a_charsetless_type1c(self):
+        pdf = pikepdf.new()
+        desc = Dictionary(
+            Type=Name("/FontDescriptor"),
+            FontName=Name("/BareProg"),
+            Flags=4,  # symbolic — forces the program-derivation path
+            FontFile3=pdf.make_stream(self._cff_without_charset()),
+        )
+        font = pdf.make_indirect(
+            Dictionary(
+                Type=Name("/Font"),
+                Subtype=Name("/Type1"),
+                BaseFont=Name("/BareProg"),
+                FontDescriptor=desc,
+            )
+        )
+        cap = font_capability(font)
+        assert cap.editable and cap.reason is None
 
 
 class TestT7Type3Fonts:

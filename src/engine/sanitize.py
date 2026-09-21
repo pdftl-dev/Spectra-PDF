@@ -34,6 +34,7 @@ from engine.docmdp import certification_of_pdf
 from engine.inplace import is_same_file, staged_write
 from engine.pdf_save import save_pdf
 from engine.sanitize_content import analyze_page, off_ocg_set
+from engine.pdf_tree import token_text
 
 # Every category, in report order. `signatures` is reported and never removed.
 CATEGORY_IDS = (
@@ -95,7 +96,7 @@ OCR_TEXT_KIND = "ocr_layer"
 
 def _text_of(obj) -> str:
     try:
-        return str(obj) if obj is not None else ""
+        return token_text(obj) if obj is not None else ""
     except Exception:
         return ""
 
@@ -323,7 +324,7 @@ def _detect_comments(pdf, page_numbers):
         for annot in annots:
             if not isinstance(annot, pikepdf.Dictionary):
                 continue
-            subtype = str(annot.get("/Subtype", ""))
+            subtype = token_text(annot.get("/Subtype", ""))
             if subtype not in MARKUP_SUBTYPES:
                 continue
             rows.append(
@@ -363,7 +364,7 @@ def _field_rows(acro) -> list:
             if isinstance(kids, pikepdf.Array):
                 child_fields = [
                     k for k in kids
-                    if isinstance(k, pikepdf.Dictionary) and str(k.get("/Subtype", "")) != "/Widget"
+                    if isinstance(k, pikepdf.Dictionary) and token_text(k.get("/Subtype", "")) != "/Widget"
                 ]
             if child_fields:
                 walk(child_fields, name, depth + 1)
@@ -372,7 +373,7 @@ def _field_rows(acro) -> list:
                 rows.append(
                     {
                         "name": name or "(unnamed)",
-                        "type": str(node.get("/FT", "")).lstrip("/"),
+                        "type": token_text(node.get("/FT", "")).lstrip("/"),
                         "value": _text_of(node.get("/V")),
                     }
                 )
@@ -389,7 +390,7 @@ def _detect_form_fields(pdf, page_numbers):
 
 
 def _is_js_action(action) -> bool:
-    return isinstance(action, pikepdf.Dictionary) and str(action.get("/S", "")) == "/JavaScript"
+    return isinstance(action, pikepdf.Dictionary) and token_text(action.get("/S", "")) == "/JavaScript"
 
 
 def _action_chain(action, depth: int = 0):
@@ -419,7 +420,7 @@ def _detect_javascript(pdf, page_numbers):
             rows.append({"site": "open_action", "where": "open action"})
     catalog_aa = pdf.Root.get("/AA")
     if isinstance(catalog_aa, pikepdf.Dictionary):
-        for key in catalog_aa.keys():
+        for key in sorted(catalog_aa.keys()):
             for action in _action_chain(catalog_aa[key]):
                 if _is_js_action(action):
                     rows.append(
@@ -429,7 +430,7 @@ def _detect_javascript(pdf, page_numbers):
         page = pdf.pages[n - 1].obj
         page_aa = page.get("/AA")
         if isinstance(page_aa, pikepdf.Dictionary):
-            for key in page_aa.keys():
+            for key in sorted(page_aa.keys()):
                 for action in _action_chain(page_aa[key]):
                     if _is_js_action(action):
                         rows.append(
@@ -445,10 +446,10 @@ def _detect_javascript(pdf, page_numbers):
         for annot in annots:
             if not isinstance(annot, pikepdf.Dictionary):
                 continue
-            label = _text_of(annot.get("/T")) or str(annot.get("/Subtype", "")).lstrip("/")
+            label = _text_of(annot.get("/T")) or token_text(annot.get("/Subtype", "")).lstrip("/")
             annot_aa = annot.get("/AA")
             if isinstance(annot_aa, pikepdf.Dictionary):
-                for key in annot_aa.keys():
+                for key in sorted(annot_aa.keys()):
                     for action in _action_chain(annot_aa[key]):
                         if _is_js_action(action):
                             rows.append(
@@ -513,7 +514,7 @@ def _detect_unreferenced(pdf):
 def _link_target(pdf, annot) -> tuple:
     action = annot.get("/A")
     if isinstance(action, pikepdf.Dictionary):
-        kind = str(action.get("/S", ""))
+        kind = token_text(action.get("/S", ""))
         if kind == "/URI":
             return "uri", _text_of(action.get("/URI"))
         if kind == "/GoTo":
@@ -533,13 +534,13 @@ def _detect_links_and_actions(pdf, page_numbers):
             for annot in annots:
                 if not isinstance(annot, pikepdf.Dictionary):
                     continue
-                subtype = str(annot.get("/Subtype", ""))
+                subtype = token_text(annot.get("/Subtype", ""))
                 if subtype == "/Link":
                     kind, target = _link_target(pdf, annot)
                     rows.append({"page": n, "site": "link", "kind": kind, "target": target})
                     continue
                 for action in _action_chain(annot.get("/A")):
-                    kind = str(action.get("/S", ""))
+                    kind = token_text(action.get("/S", ""))
                     if kind in NON_LINK_ACTIONS:
                         rows.append(
                             {
@@ -551,9 +552,9 @@ def _detect_links_and_actions(pdf, page_numbers):
                         )
         page_aa = page.get("/AA")
         if isinstance(page_aa, pikepdf.Dictionary):
-            for key in page_aa.keys():
+            for key in sorted(page_aa.keys()):
                 for action in _action_chain(page_aa[key]):
-                    kind = str(action.get("/S", ""))
+                    kind = token_text(action.get("/S", ""))
                     if kind in NON_LINK_ACTIONS:
                         rows.append(
                             {
@@ -564,7 +565,7 @@ def _detect_links_and_actions(pdf, page_numbers):
                             }
                         )
     for action in _action_chain(pdf.Root.get("/OpenAction")):
-        kind = str(action.get("/S", ""))
+        kind = token_text(action.get("/S", ""))
         if kind in NON_LINK_ACTIONS:
             rows.append(
                 {
@@ -575,9 +576,9 @@ def _detect_links_and_actions(pdf, page_numbers):
             )
     catalog_aa = pdf.Root.get("/AA")
     if isinstance(catalog_aa, pikepdf.Dictionary):
-        for key in catalog_aa.keys():
+        for key in sorted(catalog_aa.keys()):
             for action in _action_chain(catalog_aa[key]):
-                kind = str(action.get("/S", ""))
+                kind = token_text(action.get("/S", ""))
                 if kind in NON_LINK_ACTIONS:
                     rows.append(
                         {"site": "catalog_aa", "kind": kind.lstrip("/"), "target": ""}
@@ -617,6 +618,8 @@ def certification_level(pdf) -> str | None:
     A certification whose level cannot be read still reports as certified: the
     warning that matters is the certification's existence, not its degree."""
     state = certification_of_pdf(pdf)
+    if state.get("error"):
+        return "unknown"
     if not state["certified"]:
         return None
     return state["level"] or "unknown"
@@ -850,7 +853,7 @@ def _remove_comments(pdf) -> int:
         kept = []
         for annot in annots:
             subtype = (
-                str(annot.get("/Subtype", "")) if isinstance(annot, pikepdf.Dictionary) else ""
+                token_text(annot.get("/Subtype", "")) if isinstance(annot, pikepdf.Dictionary) else ""
             )
             if subtype in sweep:
                 removed += 1
@@ -875,7 +878,7 @@ def _remove_form_fields(pdf, mode: str) -> int:
             a
             for a in annots
             if not (
-                isinstance(a, pikepdf.Dictionary) and str(a.get("/Subtype", "")) == "/Widget"
+                isinstance(a, pikepdf.Dictionary) and token_text(a.get("/Subtype", "")) == "/Widget"
             )
         ]
         _write_annots(page, kept)
@@ -1005,7 +1008,7 @@ def _remove_javascript(pdf) -> int:
 
 
 def _is_non_link_action(action) -> bool:
-    return isinstance(action, pikepdf.Dictionary) and str(action.get("/S", "")) in NON_LINK_ACTIONS
+    return isinstance(action, pikepdf.Dictionary) and token_text(action.get("/S", "")) in NON_LINK_ACTIONS
 
 
 def _remove_links_and_actions(pdf) -> int:
@@ -1019,7 +1022,7 @@ def _remove_links_and_actions(pdf) -> int:
             continue
         kept = []
         for annot in annots:
-            if isinstance(annot, pikepdf.Dictionary) and str(annot.get("/Subtype", "")) == "/Link":
+            if isinstance(annot, pikepdf.Dictionary) and token_text(annot.get("/Subtype", "")) == "/Link":
                 removed += 1
                 continue
             kept.append(annot)
@@ -1227,6 +1230,10 @@ def sanitize_pdf(
 
     options = {"form_fields_mode": form_fields_mode, "hidden_text_ocr": bool(hidden_text_ocr)}
     with pikepdf.open(file) as pdf:
+        from engine.incremental import signature_policy_of_pdf
+        from engine.docmdp import refuse_unreadable_policy
+        if signature_policy_of_pdf(pdf).get("error"):
+            refuse_unreadable_policy()
         # Report order is also apply order, and two pairs depend on it: hidden
         # layers are dropped before hidden text is re-analyzed, so the layer's
         # words are not looked for twice, and a flatten stamps its appearances

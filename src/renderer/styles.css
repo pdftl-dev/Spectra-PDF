@@ -62,7 +62,7 @@
    The workbench CHROME themes via semantic vars (--bar-bg etc.); panel
    BODIES deliberately kept their utility classes when they were ported, so
    this remap is their theming mechanism and deleting it would delete the
-   light theme. Audited class-by-class; a NEW dark utility class used on a
+   light theme. Each class has its remap; a NEW dark utility class used on a
    panel must add its light remap here in the same change.
    Selector specificity ([data-theme] .class) beats a bare Tailwind class.
    ──────────────────────────────────────────────────────────────────────── */
@@ -265,6 +265,7 @@
 [data-theme="light"] .home-action:hover { background: #f3f4f6; border-color: #9ca3af; }
 [data-theme="light"] .home-recent-icon { background: #f3f4f6; color: #4b5563; }
 [data-theme="light"] .home-recent:hover .home-recent-icon { color: #111827; }
+[data-theme="light"] .home-recent-remove:hover { color: #111827; background: #e5e7eb; }
 [data-theme="light"] .bookmark-add-btn { color: #4b5563; }
 [data-theme="light"] .bookmark-add-btn:hover { color: #111827; }
 [data-theme="light"] .signatures-nav-recheck-btn { color: #4b5563; }
@@ -595,9 +596,9 @@ input:not([type]) {
 /* ── Action idioms ────────────────────────────────────────────────────────
    Three classes, applied where the meaning applies, so that "what happens if
    I press this" is answered by shape rather than by the panel it lives in.
-   The audit measured the alternative: Delete and Remove as bare text beside
-   bordered buttons on four surfaces, and five surfaces spelling one class of
-   action three ways (a pill, a bordered button, an underlined link).
+   The alternative is Delete and Remove as bare text beside bordered buttons,
+   and one class of action spelled three ways (a pill, a bordered button, an
+   underlined link).
    ──────────────────────────────────────────────────────────────────────── */
 
 /* DESTRUCTIVE: removes something the user cannot get back by pressing again.
@@ -1125,8 +1126,8 @@ input:not([type]) {
 [data-theme="light"] .search-hit:hover { background: #f3f4f6; }
 [data-theme="light"] .search-hit-page { color: #1f2937; }
 [data-theme="light"] .search-hit-snippet { color: #6b7280; }
-/* N13: both result surfaces drew the matched term in the body colour, so a
-   snippet was a wall of context with the searched word hidden in it. The mark
+/* A matched term drawn in the body colour hides the searched word in a wall
+   of context. The mark
    is the SAME wash the canvas paints a find hit with, so "this is your match"
    looks the same in the list and on the page. `<mark>`'s UA colours are
    overridden outright — its default is a light-theme yellow. */
@@ -1292,10 +1293,10 @@ input:not([type]) {
      A "you are here" marker is a THIRD thing and never borrows either: it is
      an edge rule (`.thumb-row.current`), because position and selection can
      be true of different items at the same time.
-     The audit found five idioms — cyan fill, teal border, blue top band,
-     grey fill, bold text — because each surface picked its own literal. A
-     new surface takes this token in one of these two forms; a literal here
-     is how a sixth idiom is born. */
+     A surface that picks its own literal adds an idiom (a cyan fill, a
+     teal border, a blue top band, a grey fill, bold text). A new surface
+     takes this token in one of these two forms; a literal here is how
+     another idiom is born. */
   --select: var(--accent, #0078d4);
   --hover: rgba(255, 255, 255, 0.08);
   --group-bg: rgba(255, 255, 255, 0.05);
@@ -3751,14 +3752,8 @@ input:not([type]) {
   overflow: hidden;
 }
 .home-recent {
-  display: grid;
-  grid-template-columns: 34px minmax(0, 1.2fr) minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
-  gap: 10px;
-  padding-block: 9px;
-  padding-inline: 10px 14px;
-  text-align: start;
-  cursor: pointer;
   border-bottom: 1px solid #232328;
   transition: background 100ms;
 }
@@ -3767,6 +3762,37 @@ input:not([type]) {
 }
 .home-recent:hover {
   background: #232327;
+}
+/* The open control carries the column layout the row itself used to own: the
+   content sits one level in so a second, independent control can stand beside
+   it without a button nested inside a button. */
+.home-recent-open {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1.2fr) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding-block: 9px;
+  padding-inline: 10px 14px;
+  text-align: start;
+  cursor: pointer;
+}
+.home-recent-remove {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  margin-inline-end: 8px;
+  border-radius: 5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.home-recent-remove:hover {
+  color: #e7e7ea;
+  background: #2e2e34;
 }
 .home-recent-icon {
   display: flex;
@@ -4022,7 +4048,7 @@ input:not([type]) {
   gap: 2px;
 }
 
-/* Properties bar (I.6, Ctrl+E) — the strip under the secondary toolbar. */
+/* Properties bar (Ctrl+E) — the strip under the secondary toolbar. */
 .properties-bar {
   display: flex;
   align-items: center;
@@ -4101,7 +4127,7 @@ input:not([type]) {
   outline-offset: 1px;
 }
 
-/* Resize handles (rung 1) — 8 grips on the single-selected annotation. */
+/* Resize handles — 8 grips on the single-selected annotation. */
 .annot-handle {
   position: absolute;
   width: 8px;
@@ -4128,7 +4154,7 @@ input:not([type]) {
   pointer-events: none;
 }
 
-/* Drawing shapes + callouts (rung 2) — pixel-space SVG bodies. */
+/* Drawing shapes + callouts — pixel-space SVG bodies. */
 .page-annot-shape-svg {
   position: absolute;
   inset: 0;
@@ -4147,7 +4173,7 @@ input:not([type]) {
   pointer-events: none;
 }
 
-/* Properties-bar style controls (rung 2). */
+/* Properties-bar style controls. */
 .properties-bar-select {
   background: #232323;
   color: #d4d4d4;
@@ -4348,7 +4374,7 @@ input:not([type]) {
 .text-selection-error { align-self: center; padding: 0 4px; font-size: 11px; color: #f87171; }
 [data-theme="light"] .text-selection-url { border-color: #d1d5db; background: #ffffff; color: #111827; }
 
-/* Rung 3 — the recalibrate popover (right-click a measurement). */
+/* The recalibrate popover (right-click a measurement). */
 .recal-popover {
   position: fixed;
   z-index: 60;
@@ -4409,8 +4435,9 @@ input:not([type]) {
   background: #333;
 }
 
-/* ── HIGH-CONTRAST THEME — GENERATED from the light block by
-   gen-hc-theme.local.py; edit the MAP there, not these lines. ── */
+/* ── HIGH-CONTRAST THEME — mirrors of the light-theme rules above with their
+   colours mapped to the high-contrast palette, then the rules only this theme
+   has. ── */
 [data-theme="high-contrast"] .bg-neutral-900 { background-color: #000000; }
 [data-theme="high-contrast"] .bg-neutral-850 { background-color: #000000; }
 [data-theme="high-contrast"] .bg-neutral-800 { background-color: #0d0d0d; }
@@ -4601,7 +4628,7 @@ input:not([type]) {
 [data-theme="high-contrast"] .pageview-detail {
   filter: none;
 }
-/* ── end high-contrast (generated) ── */
+/* ── end high-contrast ── */
 
 /* Snapping. The marker rides the snapped point in its own
    16×16 box (the annotation overlays' 0..1 viewBox would squash the glyphs),

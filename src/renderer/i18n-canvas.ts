@@ -19,7 +19,7 @@
 //     precedent); the blend VALUE is the PDF name written into the content
 //     stream — only its human LABEL localizes, through the keys below.
 //   • Engine text: an edit refusal, an extract's output name, a search-core
-//     timeout. Those cross the slice-D boundary and pass through verbatim
+//     timeout. Those pass through verbatim
 //     inside a localized frame.
 export const CANVAS_STRINGS = {
   // ── Shared across the canvas surfaces ────────────────────────────────
@@ -40,7 +40,7 @@ export const CANVAS_STRINGS = {
   'canvas.toolbar.lockHint':
     'Keep the selected tool ready after each mark, so you can mark page after page without picking it again.',
 
-  // Shape mode options (rung 2).
+  // Shape mode options.
   'canvas.toolbar.shapeGroup': 'Shape',
   'canvas.shape.rect': 'Rectangle',
   'canvas.shape.ellipse': 'Ellipse',
@@ -205,8 +205,8 @@ export const CANVAS_STRINGS = {
   'canvas.pbar.lineStart': 'Line start',
   'canvas.pbar.lineEnd': 'Line end',
   // One key per (ending, end) PAIR: "Open arrow" + " start" is two fragments
-  // whose order differs per language, which is the concatenation the brief
-  // bans. The VALUE stays the PDF's /LE name.
+  // whose order differs per language, and concatenation is banned. The VALUE
+  // stays the PDF's /LE name.
   'canvas.pbar.endingStart.None': 'Plain start',
   'canvas.pbar.endingStart.OpenArrow': 'Open arrow start',
   'canvas.pbar.endingStart.ClosedArrow': 'Closed arrow start',
@@ -535,6 +535,11 @@ export const CANVAS_STRINGS = {
     '{{name}}: {{count}} saved redaction mark is not shown — its page is no longer in this document.',
   'canvas.redact.seedOrphaned_other':
     '{{name}}: {{count}} saved redaction marks are not shown — their pages are no longer in this document.',
+  // Unsaved marks whose page left the document for good: an operation, an
+  // undo or a reopen gave the document new bytes, or a commit wrote a
+  // pending page deletion.
+  'canvas.redact.marksCleared_one': 'The document changed. {{count}} unsaved redaction mark was cleared.',
+  'canvas.redact.marksCleared_other': 'The document changed. {{count}} unsaved redaction marks were cleared.',
   'canvas.doc.mergedCannotClose':
     '"{{name}}" is merged into another document — Apply changes first, then close it.',
 

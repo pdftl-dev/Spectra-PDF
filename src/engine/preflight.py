@@ -42,6 +42,8 @@ import pikepdf
 from pikepdf import Name  # noqa: F401  (re-exported for callers of the walk)
 
 from engine.font_embedding import font_embedded
+from engine.pdf_fonts import name_str
+from engine.pdf_version import parse_version, version_facts
 from engine.processing_steps import (
     CUSTOM,
     MISSING_GROUP,
@@ -57,6 +59,7 @@ from engine.preflight_profiles import (
     resolve_profile,
     resolved_params,
 )
+from engine.pdf_tree import token_text
 
 _MAX_DEPTH = 12
 
@@ -250,7 +253,7 @@ def walk_page_resources(
                     obj = xo[key]
                     if not mark(obj):
                         continue
-                    sub = str(obj.get("/Subtype"))
+                    sub = token_text(obj.get("/Subtype"))
                     if sub == "/Image":
                         on_image(obj)
                         img_cs = obj.get("/ColorSpace")
@@ -264,7 +267,7 @@ def walk_page_resources(
                                 )
                     elif sub == "/Form":
                         grp = obj.get("/Group")
-                        if grp is not None and str(grp.get("/S")) == "/Transparency":
+                        if grp is not None and token_text(grp.get("/S")) == "/Transparency":
                             on_transparency()
                         stream(obj, origin)
                         visit_res(obj.get("/Resources"), depth + 1, origin)
@@ -277,11 +280,23 @@ def walk_page_resources(
                 try:
                     gs = eg[key]
                     on_extgstate(gs, origin)
+                    chosen = gs.get("/Font")
+                    if (
+                        isinstance(chosen, pikepdf.Array)
+                        and len(chosen) >= 1
+                        and isinstance(chosen[0], pikepdf.Dictionary)
+                    ):
+                        # A graphics state's /Font selects a font as `Tf`
+                        # does (ISO 32000-2 Table 57).
+                        try:
+                            on_font(chosen[0], origin)
+                        except Exception as exc:
+                            unreadable((FONT,), f"a font will not read: {exc}")
                     ca = gs.get("/ca")
                     caa = gs.get("/CA")
                     if (ca is not None and float(ca) < 1.0) or (caa is not None and float(caa) < 1.0):
                         on_transparency()
-                    if gs.get("/SMask") is not None and str(gs.get("/SMask")) != "/None":
+                    if gs.get("/SMask") is not None and token_text(gs.get("/SMask")) != "/None":
                         on_transparency()
                 except Exception as exc:
                     unreadable((TRANSPARENCY,), f"a graphics state will not read: {exc}")
@@ -324,7 +339,7 @@ def walk_page_resources(
 def _font_name(font) -> str:
     try:
         bf = font.get("/BaseFont")
-        return str(bf).lstrip("/") if bf is not None else "(unnamed)"
+        return name_str(bf).lstrip("/") if bf is not None else "(unnamed)"
     except Exception:
         return "(unnamed)"
 
@@ -501,7 +516,7 @@ def _annotation_rows(pdf) -> tuple:
             continue
         for ordinal, annot in enumerate(listed):
             try:
-                subtype = str(annot.get("/Subtype") or "").lstrip("/")
+                subtype = token_text(annot.get("/Subtype") or "").lstrip("/")
                 flags = int(annot.get("/F") or 0)
             except Exception as exc:
                 unreadable.append(
@@ -519,8 +534,9 @@ def _annotation_rows(pdf) -> tuple:
 
 def _javascript_sites(pdf) -> list:
     """Every place a document carries JavaScript, not only the catalog name
-    tree. F16 measured four sites where the name tree reports one, and a
-    profile that forbids scripting has to be told about all of them."""
+    tree. A document can carry scripts in four sites where the name tree
+    reports one, and a profile that forbids scripting has to be told about
+    all of them."""
     sites: list = []
 
     def note(where: str, obj) -> None:
@@ -538,7 +554,7 @@ def _javascript_sites(pdf) -> list:
                 entry = holder.get(key) if holder is not None else None
                 if entry is None:
                     continue
-                if str(entry.get("/S") or "") == "/JavaScript":
+                if token_text(entry.get("/S") or "") == "/JavaScript":
                     sites.append(where)
                     continue
                 for trigger in list(entry.keys()):
@@ -575,12 +591,19 @@ def _check_pdf_version(check, reads) -> None:
     version = reads["version"]
     if not version:
         check.status = REVIEW
-        check.findings = [_finding(_page_address(), "read_failed", values={"reason": ""})]
+        check.findings = [_finding(_page_address(), "read_failed", values={"reason": "The PDF version cannot be determined."})]
         return
     findings = []
     maximum = _version_tuple(check.params["max_version"])
     minimum = _version_tuple(check.params["min_version"])
-    current = _version_tuple(version)
+    # Do not turn an unreadable fact into a pass even if a caller supplied
+    # reads directly rather than through the ordinary gathering boundary.
+    try:
+        current = parse_version(version)
+    except ValueError:
+        check.status = REVIEW
+        check.findings = [_finding(_page_address(), "read_failed", values={"reason": "The PDF version cannot be determined."})]
+        return
     if maximum and current and current > maximum:
         findings.append(_finding(
             _page_address(), "version_above_max",
@@ -1574,7 +1597,15 @@ def _gather(file: str, profile: dict, gs_path: str, font_dir) -> dict:
             non_embedded.append(name)
 
     with pikepdf.open(file) as pdf:
-        reads["version"] = str(pdf.pdf_version)
+        # The effective declared version, not conformance or the header: a
+        # ceiling a catalog declaration exceeds is exceeded (Table 29). A
+        # declaration that cannot be read leaves the fact absent, which the
+        # check reports for review rather than passing — and never ends the
+        # whole run, since every other check still has its own reads.
+        try:
+            reads["version"] = version_facts(pdf)["version"]
+        except ValueError:
+            reads["version"] = ""
         try:
             reads["permissions"] = (bool(pdf.allow.print_lowres),
                                     bool(pdf.allow.print_highres))
@@ -1761,7 +1792,7 @@ def _output_intents(pdf, note) -> list | None:
         for intent in intents:
             identifier = intent.get("/OutputConditionIdentifier")
             out.append({
-                "subtype": str(intent.get("/S") or "").lstrip("/"),
+                "subtype": token_text(intent.get("/S") or "").lstrip("/"),
                 "identifier": str(identifier) if identifier is not None else "",
                 "condition": str(intent.get("/OutputCondition") or ""),
                 "embedded": intent.get("/DestOutputProfile") is not None,

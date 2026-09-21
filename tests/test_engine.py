@@ -537,21 +537,39 @@ class TestRedact:
             xobjects = node.Resources.get("/XObject", {})
             assert list(xobjects.keys() if xobjects else []) == []
 
-    def test_redact_drops_the_whole_instruction_on_partial_overlap(self, tmp_dir):
-        # A region overlapping only PART of a large image/text run must
-        # still remove the entire instruction — the module's documented
-        # "over-redact rather than risk a false negative" behavior.
+    def test_redact_destroys_only_the_marked_pixels_on_partial_overlap(self, tmp_dir):
+        # A region overlapping only PART of an image removes THOSE PIXELS and
+        # keeps the rest. Dropping the whole instruction — what this did until
+        # the pixel path existed — blanked a page that is one scanned image the
+        # moment a few lines of it were marked, and reported success. The
+        # over-removal direction is kept where it still matters: the pixel
+        # bounds round outward, and an unmappable placement still goes whole.
         src = os.path.join(tmp_dir, "redact_partial.pdf")
         out = os.path.join(tmp_dir, "redact_partial_out.pdf")
         _make_redact_fixture(src)
 
-        # The image spans (200,50)-(300,150); this region only clips its
-        # bottom-left corner.
+        # The 3x3 image spans (200,50)-(300,150), so one pixel is 33.3 points;
+        # this region clips its bottom-left pixel only.
         result = redact(file=src, output=out, regions=[{"page": 1, "rect": [190, 40, 220, 70]}])
-        assert result["images_removed"] == 1
+        assert result["images_removed"] == 0
+        assert result["images_modified"] == 1
         with pikepdf.open(out) as pdf:
-            xobjects = pdf.pages[0].get("/Resources", {}).get("/XObject", {})
-            assert list(xobjects.keys() if xobjects else []) == []
+            xobjects = pdf.pages[0]["/Resources"]["/XObject"]
+            names = [str(k) for k in xobjects.keys()]
+            assert names == ["/RdxIm0"], names
+            samples = bytes(xobjects[Name("/RdxIm0")].read_bytes())
+        # Row 2 (the bottom row) column 0 is black; every other pixel is still
+        # the fixture's red.
+        assert samples[2 * 9 : 2 * 9 + 3] == bytes([0, 0, 0])
+        assert samples[: 2 * 9] == bytes([255, 0, 0] * 6)
+        assert samples[2 * 9 + 3 :] == bytes([255, 0, 0] * 2)
+        # And the original image object is unreachable: nothing else drew it.
+        with pikepdf.open(out) as pdf:
+            assert not any(
+                _stream_contains(obj, bytes([255, 0, 0] * 9))
+                for obj in pdf.objects
+                if isinstance(obj, pikepdf.Stream)
+            )
 
     def test_redact_tracks_rotated_cm_and_multiple_text_lines(self, tmp_dir):
         # A rotated cm (image placement) and two Td-separated lines of text
@@ -744,7 +762,7 @@ class TestRedact:
             assert [float(v) for v in annots[0].Rect] == [50, 20, 200, 60]
 
     def test_redact_cascades_to_linked_popup_annotations(self, tmp_dir):
-        # Review finding: removing a markup annotation whose /Popup sits at a
+        # Removing a markup annotation whose /Popup sits at a
         # non-overlapping /Rect must ALSO remove the popup — its /Parent keeps
         # the "removed" markup object (and its secret /Contents) reachable
         # otherwise. Verified by a full-object byte scan of the output.
@@ -776,7 +794,7 @@ class TestRedact:
                 assert contents is None or "TOPSECRETCOMMENT" not in str(contents)
 
     def test_redact_restores_font_size_across_q_q(self, tmp_dir):
-        # Review finding: text-state (font size / leading) is part of the
+        # Text-state (font size / leading) is part of the
         # graphics state and must be restored by Q. A transient small font
         # inside q..Q must not leave a stale size that under-sizes a later
         # bbox — that under-estimate is an under-redaction leak.
@@ -802,7 +820,7 @@ class TestRedact:
         assert "SECRETBIG" not in extract_text(out)["text"]
 
     def test_redact_survives_malformed_content_and_annots(self, tmp_dir):
-        # Review finding: adversarial/malformed input must not crash the
+        # Adversarial/malformed input must not crash the
         # whole operation. A 1-operand Td, a non-array TJ, and a null /Annots
         # entry are all tolerated; a valid region on the page still redacts.
         src = os.path.join(tmp_dir, "redact_malformed.pdf")
@@ -834,7 +852,7 @@ class TestRedact:
                 assert b"REALSECRET" not in data
 
     def test_redact_form_nesting_past_depth_cap_fails_closed(self, tmp_dir):
-        # Re-review finding: a Form chain deeper than MAX_FORM_DEPTH must
+        # A Form chain deeper than MAX_FORM_DEPTH must
         # NOT leave content intact — and the drop must be SIGNALLED so it isn't
         # silently reverted by an enclosing form bottoming out. A 20-wrapper
         # chain (deeper than the cap) around a secret, all placed inside the
@@ -875,7 +893,7 @@ class TestRedact:
                 assert b"DEEPSECRET" not in data
 
     def test_redact_accounts_for_horizontal_scaling(self, tmp_dir):
-        # Re-review finding: Tz (horizontal scaling) > 100 makes text WIDER
+        # Tz (horizontal scaling) > 100 makes text WIDER
         # than the flat width estimate; the bbox must fold it in so expanded
         # text that reaches into a region is still caught.
         src = os.path.join(tmp_dir, "redact_tz.pdf")
@@ -955,13 +973,13 @@ def _identity_h_font(doc, widths: dict[int, int], default: int = 1000):
 
 
 class TestRedactMeasuresWithTheFont:
-    """Slice A. `redact.py` sized every show operator at a flat 0.5 em per
-    BYTE while `text_runs.py` computed the real advance in the same walk. The
-    guess ran NARROW on any face averaging more than half an em — every
-    monospace document, bold sans, and plain Helvetica by ~1.5 characters — so
-    text that a mark visibly covered fell outside the box the region was tested
-    against and SURVIVED, with `regions_applied: 1` reported as success. On a
-    2-byte CID font it ran 2× WIDE and deleted runs a mark never touched."""
+    """Redaction sizes each show operator by the real advance `text_runs.py`
+    computes in the same walk. A flat 0.5 em per BYTE runs NARROW on any face
+    averaging more than half an em — every monospace document, bold sans, and
+    plain Helvetica by ~1.5 characters — so text that a mark visibly covers
+    falls outside the box the region is tested against and SURVIVES, with
+    `regions_applied: 1` reported as success. On a 2-byte CID font it runs 2×
+    WIDE and deletes runs a mark never touches."""
 
     # face → (advance in 1000/em of the repeated glyph, the glyph)
     PIN_TABLE = {
@@ -1285,11 +1303,12 @@ def _cid_font(doc, widths: dict[int, int], mapping: dict[int, str],
 
 
 class TestRedactSplitsPartiallyCoveredRuns:
-    """Slice B. `redact.py` kept or dropped a WHOLE show operator, so a mark
-    on one name inside a line a generator emitted as a single `Tj` deleted the
-    line — the user got a word-sized black box over text that was no longer
-    there. Word-sized marks are exactly what a search produces, so this is the
-    dominant shape for the own feature, not an edge case."""
+    """Redaction splits a show operator rather than keeping or dropping it
+    WHOLE: a mark on one name inside a line a generator emitted as a single
+    `Tj` would otherwise delete the line, leaving a word-sized black box over
+    text that is no longer there. Word-sized marks are exactly what a search
+    produces, so this is the dominant shape for the own feature, not an edge
+    case."""
 
     LINE = "John Smith lives at 12 Oak Street Portland"
 
@@ -1327,7 +1346,7 @@ class TestRedactSplitsPartiallyCoveredRuns:
 
         after = _char_positions(out)
         assert len(after) == len(before) - len("John Smith")
-        # The brief's pin: every surviving character within 0.01 pt of where it
+        # The pin: every surviving character within 0.01 pt of where it
         # was. A TJ jump replaces the removed advance exactly, so nothing after
         # the redaction slides left into the hole.
         assert _worst_drift(before, after) < 0.01
@@ -1698,7 +1717,7 @@ class TestWatermark:
         # the /Rotate part of the turn into its own placement matrix, so
         # angle=0 is DRAWN at 0 and reads level in the displayed orientation.
         # Composing angle + /Rotate here turns the stamp twice and lays it on
-        # its side (proved by rendering: `rotprobe3.local.py`).
+        # its side (proved by rendering).
         src = os.path.join(tmp_dir, "wm_rot.pdf")
         out = os.path.join(tmp_dir, "wm_rot_out.pdf")
         _make_watermark_fixture(src, page_count=1, rotate=90)
@@ -1944,7 +1963,7 @@ class TestWatermark:
 
     def test_watermark_unicode_without_font_dir_refused(self, tmp_dir):
         # Without a fonts dir, a non-Latin-1 watermark is refused (not silently
-        # "?"-mapped) — the silent-degradation this slice closes.
+        # "?"-mapped) — a silent degradation.
         src = os.path.join(tmp_dir, "wn_in.pdf")
         out = os.path.join(tmp_dir, "wn_out.pdf")
         _make_watermark_fixture(src, page_count=1)
@@ -3565,7 +3584,7 @@ class TestPrintPdf:
         params = set(_inspect.signature(print_pdf).parameters)
         assert {
             "file", "printer", "gs_path", "pages", "copies", "fit",
-            # The O2 widening — every dialog control has a wire key.
+            # Every dialog control has a wire key.
             "scale_percent", "collate", "subset", "reverse", "duplex",
             "paper", "orientation", "color", "annots", "as_image",
             "image_dpi", "layout", "nup_rows", "nup_cols", "nup_order",
@@ -3585,7 +3604,7 @@ class TestPrintPdf:
 
     @pytest.mark.parametrize("bad", [0, -1, 1000, 2.5, "2", True])
     def test_refuses_bad_copies(self, sample_pdf, bad):
-        # 100 became legal when the cap moved to 999 (O4); 1000 is out.
+        # The cap is 999; 1000 is out.
         with pytest.raises(ValueError, match="[Cc]opies"):
             print_pdf(file=sample_pdf, printer="P", copies=bad)
 
@@ -3602,7 +3621,7 @@ class TestPrintPdf:
     def test_refuses_unknown_printer_without_running_gs(self, sample_pdf, monkeypatch):
         # THE fail-fast that matters: gs's mswinpr2, handed a name it can't
         # open, raises its own (invisible) printer dialog and hangs to the
-        # timeout — observed live at exactly 600s in the M-P e2e. The REAL
+        # timeout — observed live at exactly 600s in an e2e run. The REAL
         # winspool check must refuse before any subprocess exists.
         import engine.printer as printer_mod
 
@@ -3841,7 +3860,7 @@ class TestPrintFitSemantics:
 
 
 class TestPrintOrderMath:
-    """expand/subset/booklet/nup/placement/poster — the pure O2 math."""
+    """expand/subset/booklet/nup/placement/poster — the pure print-order math."""
 
     def test_expand_preserves_spec_order(self):
         assert expand_page_spec("", 3) == [0, 1, 2]

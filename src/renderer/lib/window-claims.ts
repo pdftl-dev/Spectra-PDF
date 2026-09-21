@@ -15,6 +15,7 @@
 // and the loser's whole session disappears with no error anywhere.
 
 import { claims } from './tauri-bridge';
+import type { OpenFile } from '../state/types';
 
 export type ClaimMode = 'write' | 'read';
 
@@ -35,6 +36,35 @@ export interface ClaimPartition {
   refused: ClaimRefusal[];
 }
 
+// The arbiter's claim is idempotent per window and its release drops the
+// window's claim whatever preceded it, so the ORDER in which one window's
+// calls on a path are processed decides who holds the path afterwards. Both
+// are async commands, and arrival order does not fix processing order: a
+// close's release still in flight when a reopen claims the same path can be
+// processed second and leave the reopened document with no claim. Each call
+// on a path is therefore sent only after the previous call on that path from
+// this window has answered, whatever its outcome.
+export type CallOrder = <T>(key: string, call: () => Promise<T>) => Promise<T>;
+
+export function createCallOrder(): CallOrder {
+  const lastCallOn = new Map<string, Promise<void>>();
+  return <T>(key: string, call: () => Promise<T>): Promise<T> => {
+    const previous = lastCallOn.get(key) ?? Promise.resolve();
+    const current = previous.then(call);
+    const settled = current.then(
+      () => {},
+      () => {},
+    );
+    lastCallOn.set(key, settled);
+    void settled.then(() => {
+      if (lastCallOn.get(key) === settled) lastCallOn.delete(key);
+    });
+    return current;
+  };
+}
+
+const inPathOrder = createCallOrder();
+
 /**
  * Claim every path, keeping what was granted and reporting what was not.
  *
@@ -51,11 +81,51 @@ export async function claimPaths(
   const granted: string[] = [];
   const refused: ClaimRefusal[] = [];
   for (const path of paths) {
-    const outcome = await claims.claim(path, mode);
+    const outcome = await inPathOrder(path, () => claims.claim(path, mode));
     if (outcome.granted) granted.push(path);
     else refused.push({ path, owner: outcome.owner });
   }
   return { granted, refused };
+}
+
+/** The flows of this window that hold the claim on each path while they run
+ * (an open, an import), counted. The arbiter keeps one claim per path and
+ * window, so each of them holds that same claim. */
+export interface ClaimHolds {
+  hold(paths: readonly string[]): void;
+  drop(paths: readonly string[]): void;
+  held(path: string): boolean;
+}
+
+export function createClaimHolds(): ClaimHolds {
+  const counts = new Map<string, number>();
+  return {
+    hold(paths) {
+      for (const path of paths) counts.set(path, (counts.get(path) ?? 0) + 1);
+    },
+    drop(paths) {
+      for (const path of paths) {
+        const left = (counts.get(path) ?? 0) - 1;
+        if (left > 0) counts.set(path, left);
+        else counts.delete(path);
+      }
+    },
+    held: (path) => (counts.get(path) ?? 0) > 0,
+  };
+}
+
+/**
+ * The byte-only import sources `previous` held that `next` no longer holds.
+ *
+ * A source leaves `files` once no page references it, and nothing else
+ * releases its read claim: another window could not open that file for
+ * editing until this window closed.
+ */
+export function departedImportSources(
+  previous: ReadonlyMap<string, OpenFile>,
+  next: ReadonlyMap<string, OpenFile>,
+): string[] {
+  return [...previous.values()].filter((f) => f.importOnly && !next.has(f.path)).map((f) => f.path);
 }
 
 /**
@@ -69,14 +139,26 @@ export function soleOwner(refused: readonly ClaimRefusal[]): string | null {
 }
 
 /** Release each path this window no longer holds. Failures are ignored: the
- * window's own destruction releases everything it held. */
-export async function releasePaths(paths: readonly string[]): Promise<void> {
-  for (const path of paths) {
-    try {
-      await claims.release(path);
-    } catch {
-      // The claim outlives only this window; a failed release is not a state
-      // the user can be asked to do anything about.
-    }
-  }
+ * window's own destruction releases everything it held.
+ *
+ * `inUse` is asked when the release's turn comes, not when it is called. The
+ * arbiter keeps one claim per path and window, so another open, import or
+ * document of this window that took the path meanwhile holds that same claim,
+ * and the release would drop it; a path still in use is kept. */
+export async function releasePaths(
+  paths: readonly string[],
+  inUse: (path: string) => boolean = () => false,
+): Promise<void> {
+  // Every release takes its place in its path's order now, not after the
+  // releases before it answer: a claim made meanwhile must queue behind it.
+  await Promise.all(
+    paths.map((path) =>
+      inPathOrder(path, async () => {
+        if (!inUse(path)) await claims.release(path);
+      }).catch(() => {
+        // The claim outlives only this window; a failed release is not a
+        // state the user can be asked to do anything about.
+      }),
+    ),
+  );
 }

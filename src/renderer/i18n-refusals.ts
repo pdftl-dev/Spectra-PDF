@@ -47,9 +47,9 @@ export const REFUSAL_STRINGS = {
   'refusal.action.runParamOneOf': '{{step}}: set {{params}} — exactly one of them.',
   'refusal.action.encryptNeedsPassword': 'Encrypt: set an open or an owner password.',
   'refusal.action.needsGhostscript':
-    '{{steps}} need Ghostscript, which Spectra PDF does not include. Install it and point Spectra PDF at it in Settings ▸ Engine, or take those steps out of this action.',
+    '{{steps}} need Ghostscript, which Spectra PDF does not include. Install it and point Spectra PDF at it in Preferences ▸ Engine, or take those steps out of this action.',
   'refusal.action.needsGhostscriptOne':
-    '{{steps}} needs Ghostscript, which Spectra PDF does not include. Install it and point Spectra PDF at it in Settings ▸ Engine, or take that step out of this action.',
+    '{{steps}} needs Ghostscript, which Spectra PDF does not include. Install it and point Spectra PDF at it in Preferences ▸ Engine, or take that step out of this action.',
 
   // ── Guided actions: importing an action FILE ─────────────────────────
   'refusal.actionFile.notJson': 'Not a valid JSON file.',
@@ -188,6 +188,7 @@ export const REFUSAL_STRINGS = {
   'refusal.scan.notResponding': 'The scanner stopped responding.',
   'refusal.scan.paperJam': 'Clear the paper jam, then scan again.',
   'refusal.scan.paperProblem': 'Check the paper in the feeder.',
+  'refusal.scan.pageUnreadable': 'The scanned page could not be read: {{folder}}.',
   'refusal.scan.scratchFull':
     'Too many scans are still open. Close some, or remove the folders in {{folder}}, then try again.',
   'refusal.scan.settingRejected': 'The scanner rejected one of the requested settings.',

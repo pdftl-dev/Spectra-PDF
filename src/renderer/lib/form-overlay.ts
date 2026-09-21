@@ -9,8 +9,8 @@
 // module), and PageCell re-projects by the in-memory rotation at render via
 // rotateNormalizedRect — exactly the Find-word recipe.
 //
-// Pending values are name-keyed per file — deliberately NOT the positional-id
-// lifecycle of redaction marks/selection: a field NAME is stable across page
+// Pending values are name-keyed per file — deliberately NOT the page-id
+// lifecycle of redaction marks and selection: a field NAME is stable across page
 // edits, commits, and unrelated whole-file ops, so half-typed values survive
 // an Apply-changes (dropping them would punish routine edits). They are
 // PRUNED against each re-read of the file's fields (name gone, no longer
@@ -193,6 +193,15 @@ export function fillClosure(calc: FormCalculation, typed: readonly string[]): st
   return closure(typed, calc.scripts, calc.order, calc.terminals);
 }
 
+/** Remove only the submitted value versions after a successful fill. Maps and
+ * array values are immutable in the overlay, so newer edits retain ownership. */
+export function remainingFormValues(current: ReadonlyMap<string, FormFieldValue>,
+  applied: ReadonlyMap<string, FormFieldValue>): ReadonlyMap<string, FormFieldValue> {
+  const next = new Map(current);
+  for (const [name, value] of applied) if (next.get(name) === value) next.delete(name);
+  return next;
+}
+
 /** What a widget draws for a raw value: its format script's output, or the
  * raw value when it carries none or the script cannot run this value. */
 export function shownValue(format: FieldScript | undefined, raw: string): string {
@@ -285,7 +294,7 @@ export function resolveFillTargets(
 ): FillResolution {
   const preBy = new Map(preFields.map((f) => [f.name, f]));
   const postBy = new Map(postFields.map((f) => [f.name, f]));
-  const resolved: Record<string, FormFieldValue> = {};
+  const resolved: Record<string, FormFieldValue> = Object.create(null);
   const skipped: { name: string; reason: string }[] = [];
 
   const accept = (target: FormField, name: string, value: FormFieldValue): void => {

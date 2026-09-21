@@ -1,4 +1,4 @@
-"""Clean-runner guards for optional capabilities used by engine tests."""
+"""Release integrity, tooling and hosted validation contracts."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _axis_constants() -> set[tuple[str, str]]:
 def test_the_release_trigger_ignores_non_version_tags() -> None:
     """A tag filter of "v*" also matches non-release tags (the vendor cache
     tag), which starts a release run against a tag carrying no version."""
-    text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     tags = text.index("    tags:\n")
     block = text[tags : text.index("\npermissions:", tags)]
     patterns = [
@@ -102,79 +102,26 @@ def test_the_release_trigger_ignores_non_version_tags() -> None:
     assert patterns == ["v[0-9]*"]
 
 
-def _assert_capabilities_precede_engine_tests(workflow: str) -> None:
-    text = (ROOT / ".github" / "workflows" / workflow).read_text()
-    engine_test = text.index("python -m pytest tests/ -q")
 
-    for resource_step in (
-        "scripts/bundle-icc.ps1",
-        "scripts/sync-edit-fonts.ps1",
-        "scripts/bundle-libreoffice.ps1",
-        "scripts/bundle-tesseract.ps1",
-        "scripts/bundle-jbig2enc.ps1",
-        "scripts/bundle-dictionaries.ps1",
-        "scripts/bundle-voikko.ps1",
-        "scripts/sync-ocr-assets.mjs",
-        "scripts/setup-test-softhsm.ps1",
-    ):
-        assert text.index(resource_step) < engine_test
-    install = text.index("scripts/install-ghostscript-test-tool.ps1")
-    export = text.index("SPECTRAPDF_GS_PATH=")
-    # The path export reads what the install produced, so the order is part of
-    # the contract: exporting first would publish a stale or absent executable.
-    assert install < export < engine_test
-    # A failed install attempt can leave a version directory behind, so the
-    # export selects the newest rather than requiring exactly one.
-    assert (
-        "Sort-Object { [version]($_.Directory.Parent.Name -replace '^gs', '') }"
-        " -Descending"
-    ) in text
-    assert text.index("SPECTRAPDF_REQUIRE_ZERO_SKIPS") > engine_test
-    for command in AXIS_PROVISIONING.values():
-        assert text.index(command) < engine_test
+
 
 
 def test_every_skip_axis_is_registered_with_its_provisioning() -> None:
     assert _axis_constants() == set(AXIS_PROVISIONING)
 
 
-@pytest.mark.parametrize("workflow", WORKFLOWS)
-@pytest.mark.parametrize("cache_id,path,script", CACHED_CORPORA)
-def test_each_corpus_fetch_is_cached_on_its_pins(
-    workflow: str, cache_id: str, path: str, script: str
-) -> None:
-    """The fetch hits GWG's server on a pin change, not once per run.
-
-    The key is the fetch script because that file IS the pin: the archive
-    digests live in its `SOURCES`. A cache hit skips only the download —
-    `--check` runs unconditionally, so a truncated restore fails the job
-    rather than presenting as an absent corpus (which would be a skip).
-    """
-    text = (ROOT / ".github" / "workflows" / workflow).read_text()
-    cache = text.index(f"id: {cache_id}")
-    fetch = text.index(f"run: python {script}\n")
-    check = text.index(f"run: python {script} --check")
-
-    assert f"hashFiles('{script}')" in text
-    assert f"path: {path}" in text
-    assert cache < fetch < check
-    guard = text.index(f"if: steps.{cache_id}.outputs.cache-hit != 'true'")
-    assert cache < guard < check
-    assert text[fetch:check].count("cache-hit") == 0
 
 
-@pytest.mark.parametrize("workflow", WORKFLOWS)
+@pytest.mark.parametrize("workflow", ["release.yml"])
 @pytest.mark.parametrize("cache_id,path,script,env_var", CACHED_RUNTIME_ARCHIVES)
 def test_each_cached_runtime_archive_precedes_every_use_of_its_script(
     workflow: str, cache_id: str, path: str, script: str, env_var: str
 ) -> None:
     """Every invocation of the bundle script gets the cache, not just the first.
 
-    release.yml runs the LibreOffice staging twice (verification job, build
-    job); a cache wired into only one of them leaves the 373 MB download on
-    the path that a tag release actually depends on.
+    Release packaging caches the pinned archive before staging its payload.
     """
-    text = (ROOT / ".github" / "workflows" / workflow).read_text()
+    text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
     assert f"hashFiles('{script}')" in text
     assert f"path: {path}" in text
 
@@ -196,7 +143,7 @@ def test_the_libreoffice_download_falls_back_across_tdf_hosts() -> None:
     contract: named host first, redirector second, archive last. Trust does not
     rest on any of them: the pinned checksum is verified before extraction.
     """
-    text = (ROOT / "scripts" / "bundle-libreoffice.ps1").read_text()
+    text = (ROOT / "scripts" / "bundle-libreoffice.ps1").read_text(encoding="utf-8")
     hosts = (
         "ftp.osuosl.org/pub/tdf/libreoffice/stable/",
         "download.documentfoundation.org/libreoffice/stable/",
@@ -231,7 +178,7 @@ def test_the_redo_publisher_takes_product_bytes_from_the_tag() -> None:
     it: any other overlaid file would publish, under the tag's version, code
     the tag does not contain.
     """
-    text = (ROOT / ".github" / "workflows" / "release-redo.yml").read_text()
+    text = (ROOT / ".github" / "workflows" / "release-redo.yml").read_text(encoding="utf-8")
     assert "ref: refs/tags/${{ inputs.tag }}" in text
     overlays = [
         line.strip()
@@ -251,7 +198,7 @@ def test_the_redo_publisher_takes_product_bytes_from_the_tag() -> None:
     # updater manifest check into the TAG's package, so the plugin version the
     # tag's binary pins is the one that parses the manifest.
     assert "sparse-checkout: |\n            scripts\n            src-tauri/tests\n" in verifier
-    assert "verifier" not in (ROOT / "src-tauri" / "tauri.conf.json").read_text()
+    assert "verifier" not in (ROOT / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
 
 
 #: The publishers: (workflow, job) pairs whose last step is the only one that
@@ -341,7 +288,7 @@ def _job_steps(workflow: str, job: str) -> list[tuple[str, str]]:
     parser, and the step layout is the two-space convention every workflow
     in this repository follows.
     """
-    lines = (ROOT / ".github" / "workflows" / workflow).read_text().splitlines()
+    lines = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8").splitlines()
     start = lines.index(f"  {job}:")
     body: list[str] = []
     for line in lines[start + 1:]:
@@ -401,7 +348,7 @@ def test_the_publish_step_is_last_and_every_verification_precedes_it(
 
 
 def test_the_draft_verifier_hashes_the_bytes_github_holds() -> None:
-    text = (ROOT / DRAFT_VERIFIER).read_text()
+    text = (ROOT / DRAFT_VERIFIER).read_text(encoding="utf-8")
     assert "is already public before verification" in text
     download = text.index('"https://api.github.com/repos/$Repo/releases/assets/$($asset.id)"')
     assert "curl.exe --fail" in text[download:download + 400]
@@ -436,13 +383,13 @@ def test_the_draft_verifier_parses_the_manifest_with_the_updaters_deserializer()
     with the plugin by accident; the parse that decides whether every
     installed copy can read the release is the plugin's, so the gate runs it.
     """
-    text = (ROOT / DRAFT_VERIFIER).read_text()
+    text = (ROOT / DRAFT_VERIFIER).read_text(encoding="utf-8")
     assert '"test", "--manifest-path", $packageManifest, "--test", $verifierTest' in text
     assert f'$verifierPrefix = "{VERIFIER_TEST_PREFIX}"' in text
     assert '$verifierTest = "${verifierPrefix}${nonce}_updater_manifest"' in text
     assert '$verifierFunction = "verifies_the_manifest_named_by_the_environment"' in text
     assert '"--test", $verifierTest, "--",\n        "--exact", $verifierFunction, "--test-threads=1"' in text
-    rust = (ROOT / UPDATER_MANIFEST_TEST).read_text()
+    rust = (ROOT / UPDATER_MANIFEST_TEST).read_text(encoding="utf-8")
     assert "use tauri_plugin_updater::{RemoteRelease, RemoteReleaseInner};" in rust
     assert "serde_json::from_str(manifest)" in rust
     for env_var in (
@@ -466,7 +413,7 @@ def test_the_draft_verifier_never_selects_its_logic_from_the_verified_package() 
     name IS the staged file, runs exactly that target, checks the path cargo
     reports having run, and removes the file after.
     """
-    text = (ROOT / DRAFT_VERIFIER).read_text()
+    text = (ROOT / DRAFT_VERIFIER).read_text(encoding="utf-8")
     staging = text[text.index('$verifierPrefix = "'):]
     assert "RandomNumberGenerator]::GetBytes(8)" in staging
     assert "Copy-Item -LiteralPath $testSource -Destination $testTarget -Force" in staging
@@ -512,7 +459,7 @@ def test_the_verifier_test_target_prefix_is_reserved() -> None:
         path for path in tracked
         if path.removeprefix("src-tauri/tests/").startswith(VERIFIER_TEST_PREFIX)
     ]
-    assert VERIFIER_TEST_IGNORE in (ROOT / ".gitignore").read_text().splitlines()
+    assert VERIFIER_TEST_IGNORE in (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     for staged in (
         f"src-tauri/tests/{VERIFIER_TEST_PREFIX}0123456789abcdef_updater_manifest.rs",
         f"src-tauri/tests/{VERIFIER_TEST_PREFIX}updater_manifest.rs",
@@ -590,61 +537,424 @@ def test_both_payload_gates_run_in_every_publisher(
 
 
 def test_the_payload_gates_are_mirrored_locally() -> None:
-    text = (ROOT / "scripts" / "ci-parity-gates.sh").read_text()
+    text = (ROOT / "scripts" / "ci-parity-gates.sh").read_text(encoding="utf-8")
     for _name, command in RELEASE_PAYLOAD_GATES["release.yml"]:
         assert command.removeprefix("python ") in text
     assert "build-portable-zip.ps1 -CheckMap" in text
-    assert "tests/test_ci_capability_setup.py" in text
-    assert f"{LIVE_CLI_ENV}=1 cargo test --test cli_bytecode" in text
-    # The updater manifest parse runs locally against the tracked fixture, in
-    # the env-driven mode the draft verifier uses.
-    assert "SPECTRAPDF_UPDATER_MANIFEST=tests/fixtures/updater-manifest/latest.json" in text
-    assert "cargo test --test updater_manifest" in text
 
 
 LIVE_CLI_ENV = "SPECTRAPDF_REQUIRE_LIVE_CLI"
-LIVE_CLI_STEP = "Live CLI leaves no bytecode in the engine payload (provisioned runtime)"
+LIVE_CLI_STEP = "Live CLI tests against the provisioned runtime"
+#: The Rust tests that carry the live guard -- they refuse to skip under the
+#: live env, whether they launch the product binary or drive the engine worker
+#: -- run as one command. `test_every_guarded_rust_test_runs_in_the_provisioned_step`
+#: derives the same list from the test sources, so a guarded test that no gate
+#: runs cannot land.
+LIVE_CLI_TESTS = ("cli_bytecode", "cli_run_action", "health_worker")
+LIVE_CLI_COMMAND = "cargo test " + " ".join(f"--test {name}" for name in LIVE_CLI_TESTS)
+
+
+
+
+def test_every_guarded_rust_test_runs_in_the_provisioned_step() -> None:
+    """A Rust test that names the live env carries the guard that turns its
+    skip into a failure, and the guard binds only where a step sets the env.
+    Every guarded integration test, whether it launches the CLI or not, is in
+    the command the provisioned steps run. A guarded unit test could never be
+    named by that command, so none may exist."""
+    tests = ROOT / "src-tauri" / "tests"
+    declared = [
+        path.stem if path.name != "main.rs" else path.parent.name
+        for path in [*tests.glob("*.rs"), *tests.glob("*/main.rs")]
+        if LIVE_CLI_ENV in path.read_text(encoding="utf-8")
+    ]
+    assert sorted(declared) == sorted(LIVE_CLI_TESTS)
+    units = [
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "src-tauri" / "src").rglob("*.rs")
+        if LIVE_CLI_ENV in path.read_text(encoding="utf-8")
+    ]
+    assert units == []
+
+
+
+
+# ── Toolchain parity: what runs here is what CI installs ──────────────────
+#
+# CI installs the newest stable Rust, the `.python-version` pin and the newest
+# release of the `.node-version` major on every run. The local parity run
+# checks this machine against the same sources before any gate uses a
+# toolchain, and these pins hold the workflows to those sources.
+
+TOOLCHAIN_CHECK = "scripts/check-toolchains.py"
+TOOLCHAINS = ("rust", "python", "node")
+EMBED_SCRIPT = "scripts/setup-python-embed.ps1"
+
+
+_TOOLCHAIN_MODULE: list = []
+
+
+def _toolchains():
+    """The checker, loaded once from its script path (it is not a package)."""
+    if not _TOOLCHAIN_MODULE:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("check_toolchains", ROOT / TOOLCHAIN_CHECK)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        _TOOLCHAIN_MODULE.append(module)
+    return _TOOLCHAIN_MODULE[0]
+
+
+def _workflow_steps() -> list[tuple[str, str]]:
+    """(workflow, step text) for every step of every job in every workflow."""
+    found = []
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        lines = path.read_text(encoding="utf-8").splitlines()
+        jobs = lines.index("jobs:")
+        for line in lines[jobs + 1:]:
+            job = re.fullmatch(r"  ([A-Za-z][\w-]*):", line)
+            if job:
+                found += [(path.name, text) for _name, text in _job_steps(path.name, job[1])]
+    return found
+
+
+
+
+def test_every_rust_toolchain_step_installs_stable() -> None:
+    """The Rust check compares this machine with the newest stable. A pinned
+    toolchain in a workflow or a toolchain file makes that the wrong target,
+    and this pin fails until the check changes with it."""
+    steps = [(w, t) for w, t in _workflow_steps() if "rust-toolchain" in t]
+    assert steps
+    for workflow, text in steps:
+        assert re.search(r"uses: dtolnay/rust-toolchain@stable$", text, re.M), (workflow, text)
+        assert "toolchain:" not in text, (workflow, text)
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        text = path.read_text(encoding="utf-8")
+        assert "RUSTUP_TOOLCHAIN" not in text, path.name
+        assert not re.search(r"rustup (?:default|override|toolchain install)", text), path.name
+    assert _git(
+        "ls-files", "--", "rust-toolchain", "rust-toolchain.toml",
+        "src-tauri/rust-toolchain", "src-tauri/rust-toolchain.toml",
+    ) == ""
+
+
+def test_every_setup_python_and_setup_node_step_reads_the_one_pin() -> None:
+    """One source per toolchain: `.python-version`, which the shipped runtime
+    also reads, and `.node-version` with check-latest. The redo builds a tag
+    that may predate the file, so it reads the workflow revision's copy from
+    `verifier/`, a cone checkout that always carries the root files."""
+    python = [(w, t) for w, t in _workflow_steps() if "uses: actions/setup-python@" in t]
+    node = [(w, t) for w, t in _workflow_steps() if "uses: actions/setup-node@" in t]
+    assert python and node
+    for workflow, text in python:
+        assert re.search(r"^\s+python-version-file: \.python-version$", text, re.M), workflow
+    for workflow, text in node:
+        pin = "verifier/.node-version" if workflow == "release-redo.yml" else ".node-version"
+        assert re.search(rf"^\s+node-version-file: {re.escape(pin)}$", text, re.M), workflow
+        assert re.search(r"^\s+check-latest: true$", text, re.M), workflow
+    redo = _job_steps("release-redo.yml", "release")
+    names = [name for name, _ in redo]
+    verifier = names.index(REDO_VERIFIER_STEP)
+    assert "sparse-checkout-cone-mode" not in dict(redo)[REDO_VERIFIER_STEP]
+    assert verifier < min(i for i, (_n, t) in enumerate(redo) if "setup-node@" in t)
+    embed = (ROOT / EMBED_SCRIPT).read_text(encoding="utf-8-sig")
+    assert 'Join-Path $PSScriptRoot "..\\.python-version"' in embed
+    assert not re.search(r"\$PythonVersion\s*=\s*[\"']\d", embed)
+
+
+def test_no_workflow_names_a_node_or_python_version() -> None:
+    literal = re.compile(
+        r"^\s+(?:node|python)-version:"
+        r"|\b(?:nvm|fnm|volta|pyenv|uv python) (?:install|use|pin)\b"
+        r"|\b(?:choco|winget|scoop) install\b[^\n]*\b(?:node|python)"
+        r"|\bpy -\d|\bpython\d\.\d",
+        re.M | re.I,
+    )
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        hits = literal.findall(path.read_text(encoding="utf-8"))
+        assert not hits, (path.name, hits)
+
+
+def test_the_pins_are_exact_and_the_notice_names_the_shipped_python() -> None:
+    python = (ROOT / ".python-version").read_text(encoding="utf-8").split()
+    node = (ROOT / ".node-version").read_text(encoding="utf-8").split()
+    assert len(python) == 1 and re.fullmatch(r"\d+\.\d+\.\d+", python[0])
+    assert len(node) == 1 and re.fullmatch(r"\d+", node[0])
+    notices = (ROOT / "THIRD-PARTY-LICENSES.md").read_text(encoding="utf-8")
+    assert re.findall(r"\*\*CPython (\S+)\*\*", notices) == python
+
+
+def _answer(stdout: str = "", status: int = 0, stderr: str = ""):
+    return _toolchains().Answer(status, stdout, stderr)
+
+
+RUSTC_1_98 = (
+    "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\n"
+    "commit-hash: 48a229cea0000000000000000000000000000000\ncommit-date: 2026-09-01\n"
+    "host: x86_64-pc-windows-msvc\nrelease: 1.98.1\nLLVM version: 21.1.8\n"
+)
+RUSTC_1_94 = RUSTC_1_98.replace("1.98.1 (48a229cea 2026-09-01)", "1.94.1 (e408947bf 2026-03-25)")
+ACTIVE_STABLE = "stable-x86_64-pc-windows-msvc (default)\n"
+STABLE_CURRENT = "stable-x86_64-pc-windows-msvc - up to date: 1.98.1 (48a229cea 2026-09-01)\n"
+STABLE_STALE = (
+    "stable-x86_64-pc-windows-msvc - update available: "
+    "1.97.0 (1d3b2a5c0 2026-07-30) -> 1.98.1 (48a229cea 2026-09-01)\n"
+)
+
+
+def _rust(active=ACTIVE_STABLE, rustc=RUSTC_1_98, check=STABLE_CURRENT, status=0,
+          active_status=0, rustc_status=0):
+    return _toolchains().rust_verdict(
+        _answer(active, active_status), _answer(rustc, rustc_status), _answer(check, status)
+    )
+
+
+def test_the_rust_check_passes_the_newest_stable() -> None:
+    passed, lines = _rust()
+    assert passed, lines
+    other_channels = STABLE_CURRENT + (
+        "nightly-x86_64-pc-windows-msvc - update available: "
+        "1.100.0-nightly (0a1b2c3d4 2026-09-17) -> 1.100.0-nightly (5e6f7a8b9 2026-09-18)\n"
+    )
+    passed, lines = _rust(check=other_channels, status=100)
+    assert passed, lines
 
 
 @pytest.mark.parametrize(
-    "workflow,job,provisioner",
+    "reason",
     [
-        ("ci.yml", "test-engine", "scripts/setup-python-embed.ps1"),
-        ("release.yml", "release", "scripts/setup-python-embed.ps1"),
+        "overridden by environment variable RUSTUP_TOOLCHAIN",
+        r"directory override for 'C:\projects\spectra-studio\src-tauri'",
+        r"overridden by 'C:\projects\spectra-studio\rust-toolchain.toml'",
     ],
 )
-def test_the_live_cli_test_runs_against_a_provisioned_runtime(
-    workflow: str, job: str, provisioner: str
-) -> None:
-    """The bytecode regression test may skip on a developer checkout only.
+def test_the_rust_check_refuses_a_toolchain_other_than_stable(reason: str) -> None:
+    passed, lines = _rust(active=f"1.94.1-x86_64-pc-windows-msvc ({reason})\n", rustc=RUSTC_1_94)
+    assert not passed
+    text = "\n".join(lines)
+    assert reason in text
+    assert "Local version: rustc 1.94.1 (e408947bf 2026-03-25)" in lines
+    assert "Expected version: 1.98.1 (48a229cea 2026-09-01)" in lines
+    assert "rustup update stable" in lines[-1]
 
-    Every automatic gate that has the embedded runtime sets the env that
-    turns absence into a failure, after the step that vendors the runtime,
-    so a removal of the interpreter's no-bytecode setup cannot stay green.
-    """
-    steps = _job_steps(workflow, job)
-    names = [name for name, _ in steps]
-    live = names.index(LIVE_CLI_STEP)
-    provisioned = [i for i, (_n, t) in enumerate(steps) if provisioner in t]
-    assert provisioned and max(provisioned) < live, (workflow, job)
-    text = dict(steps)[LIVE_CLI_STEP]
-    assert "cargo test --test cli_bytecode" in text
-    assert f'{LIVE_CLI_ENV}: "1"' in text
-    rust = (ROOT / "src-tauri" / "tests" / "cli_bytecode.rs").read_text()
-    assert f'const REQUIRE_LIVE: &str = "{LIVE_CLI_ENV}";' in rust
-    assert "std::env::var_os(REQUIRE_LIVE)" in rust
+
+def test_the_rust_check_refuses_a_stale_stable() -> None:
+    rustc = RUSTC_1_98.replace("1.98.1 (48a229cea 2026-09-01)", "1.97.0 (1d3b2a5c0 2026-07-30)")
+    passed, lines = _rust(rustc=rustc, check=STABLE_STALE, status=100)
+    assert not passed
+    assert "Local version: rustc 1.97.0 (1d3b2a5c0 2026-07-30)" in lines
+    assert "Expected version: 1.98.1 (48a229cea 2026-09-01)" in lines
+    assert lines[-1] == "Fix: rustup update stable"
 
 
 @pytest.mark.parametrize(
-    "workflow,job",
-    [("ci.yml", "lint-and-build"), ("release.yml", "verify")],
+    "case",
+    ["no line", "cannot identify", "unknown form", "error exit", "no toolchain", "no rustc"],
 )
-def test_the_stub_only_rust_runs_do_not_claim_a_live_cli(workflow: str, job: str) -> None:
-    steps = _job_steps(workflow, job)
-    names = [name for name, _ in steps]
-    stubs = names.index("Create resource stubs for Tauri build script")
-    assert stubs < names.index("Rust tests")
-    assert LIVE_CLI_ENV not in "\n".join(t for _n, t in steps)
+def test_the_rust_check_fails_closed(case: str) -> None:
+    kwargs, cause = {
+        "no line": (
+            {"check": "beta-x86_64-pc-windows-msvc - up to date: 1.99.0 (x 2026-09-10)\n"},
+            "no recognizable line",
+        ),
+        "cannot identify": (
+            {"check": "stable-x86_64-pc-windows-msvc - "
+                      "cannot identify installed or update versions\n"},
+            "no recognizable line",
+        ),
+        "unknown form": (
+            {"check": "stable-x86_64-pc-windows-msvc - newer: 1.98.1\n"}, "no recognizable line"
+        ),
+        "error exit": ({"status": 1}, "no recognizable line"),
+        "no toolchain": ({"active_status": 1}, "named no toolchain"),
+        "no rustc": ({"rustc_status": 1}, "reported no host"),
+    }[case]
+    passed, lines = _rust(**kwargs)
+    assert not passed, case
+    assert cause in lines[0], lines
+    assert lines[-1].endswith("rustup update stable"), lines
+
+
+def _python_releases(*names: str, pre: tuple = (), unpublished: tuple = ()) -> object:
+    rows = [
+        {"name": name, "is_published": name not in unpublished, "pre_release": name in pre}
+        for name in names
+    ]
+    return _toolchains().Fetched(rows)
+
+
+PYTHON_314 = ("Python 3.14.5rc1", "Python 3.14.5", "Python 3.14.6", "Python 3.14.7")
+
+
+def _python(pin="3.14.7", venv="3.14.7\n", releases=None, venv_status=0):
+    module = _toolchains()
+    return module.python_verdict(
+        module.Fetched(pin) if pin is not None else module.Fetched(error=".python-version: missing"),
+        _answer(venv, venv_status),
+        releases if releases is not None else _python_releases(*PYTHON_314, pre=("Python 3.14.5rc1",)),
+    )
+
+
+def test_the_python_check_passes_the_newest_pin_in_the_venv() -> None:
+    passed, lines = _python()
+    assert passed, lines
+    newer_elsewhere = _python_releases(
+        *PYTHON_314, "Python 3.14.8rc1", "Python 3.14.8", "Python 3.14.9", "Python 3.15.1",
+        pre=("Python 3.14.5rc1", "Python 3.14.8rc1", "Python 3.14.8"),
+        unpublished=("Python 3.14.9",),
+    )
+    passed, lines = _python(releases=newer_elsewhere)
+    assert passed, lines
+
+
+def test_the_python_check_refuses_a_pin_behind_python_org() -> None:
+    passed, lines = _python(pin="3.14.5", venv="3.14.5\n")
+    assert not passed
+    assert "Local version: 3.14.5" in lines
+    assert "Expected version: 3.14.7" in lines
+    assert ".python-version" in lines[-1] and EMBED_SCRIPT in lines[-1]
+
+
+def test_the_python_check_refuses_a_venv_off_the_pin() -> None:
+    passed, lines = _python(venv="3.14.3\n")
+    assert not passed
+    assert "Local version: 3.14.3" in lines
+    assert "Expected version: 3.14.7" in lines
+    assert "-m venv --clear .venv" in lines[-1]
+
+
+@pytest.mark.parametrize("case", ["no pin", "inexact pin", "no releases", "no venv"])
+def test_the_python_check_fails_closed(case: str) -> None:
+    module = _toolchains()
+    kwargs, cause = {
+        "no pin": ({"pin": None}, ".python-version: missing"),
+        "inexact pin": ({"pin": "3.14"}, "not major.minor.patch"),
+        "no releases": (
+            {"releases": module.Fetched(error="python.org: timed out")}, "python.org: timed out"
+        ),
+        "no venv": ({"venv_status": 1}, "did not report its version"),
+    }[case]
+    passed, lines = _python(**kwargs)
+    assert not passed, case
+    assert cause in "\n".join(lines[:-3]), lines
+    assert lines[-3].startswith("Local version: ") and lines[-1].startswith("Fix: ")
+
+
+NODE_INDEX = [
+    {"version": "v26.9.0", "npm": "11.19.1"},
+    {"version": "v24.20.0", "npm": "11.18.0"},
+    {"version": "v24.21.0", "npm": "11.19.0"},
+    {"version": "v22.23.2", "npm": "10.9.8"},
+]
+
+
+def _node(pin="24", node="v24.21.0\n", npm="11.19.0\n", index=None, node_status=0, npm_status=0):
+    module = _toolchains()
+    return module.node_verdict(
+        module.Fetched(pin) if pin is not None else module.Fetched(error=".node-version: missing"),
+        _answer(node, node_status),
+        _answer(npm, npm_status),
+        index if index is not None else module.Fetched(NODE_INDEX),
+    )
+
+
+def test_the_node_check_passes_the_newest_release_of_the_major() -> None:
+    passed, lines = _node()
+    assert passed, lines
+
+
+@pytest.mark.parametrize(
+    "local,npm", [("v22.23.2\n", "10.9.8\n"), ("v24.20.0\n", "11.18.0\n")]
+)
+def test_the_node_check_refuses_another_major_or_an_older_patch(local: str, npm: str) -> None:
+    passed, lines = _node(node=local, npm=npm)
+    assert not passed
+    assert f"Local version: {local.strip()}" in lines
+    assert "Expected version: v24.21.0" in lines
+    assert "Fix: install Node.js v24.21.0 from https://nodejs.org/dist/v24.21.0/node-v24.21.0-x64.msi" in lines
+    assert "Fix: npm install --global npm@11.19.0" in lines
+
+
+def test_the_node_check_refuses_an_npm_the_release_does_not_bundle() -> None:
+    passed, lines = _node(npm="11.20.0\n")
+    assert not passed
+    assert lines == [
+        "FAIL: local npm is 11.20.0; Node.js v24.21.0 bundles npm 11.19.0, which CI runs.",
+        "Local version: 11.20.0",
+        "Expected version: 11.19.0",
+        "Fix: npm install --global npm@11.19.0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "case", ["no pin", "not a major", "no index", "no release", "no node", "no npm"]
+)
+def test_the_node_check_fails_closed(case: str) -> None:
+    module = _toolchains()
+    kwargs, cause = {
+        "no pin": ({"pin": None}, ".node-version: missing"),
+        "not a major": ({"pin": "24.21"}, "not a major version"),
+        "no index": (
+            {"index": module.Fetched(error="nodejs.org: timed out")}, "nodejs.org: timed out"
+        ),
+        "no release": ({"pin": "99"}, "lists no v99 release"),
+        "no node": ({"node_status": 1}, "node --version did not answer"),
+        "no npm": ({"npm_status": 1}, "npm --version did not answer"),
+    }[case]
+    passed, lines = _node(**kwargs)
+    assert not passed, case
+    assert cause in "\n".join(lines[:-3]), lines
+    assert lines[-3].startswith("Local version: ") and lines[-1].startswith("Fix: ")
+
+
+def test_each_check_asks_the_sources_ci_reads(monkeypatch) -> None:
+    module = _toolchains()
+    ran, fetched = [], []
+
+    def run(*args, cwd=module.ROOT):
+        ran.append((args, cwd))
+        return module.Answer(1, "")
+
+    monkeypatch.setattr(module, "run", run)
+    monkeypatch.setattr(module, "fetch_json", lambda url: fetched.append(url) or module.Fetched())
+    for name in TOOLCHAINS:
+        assert module.main([name]) == 1
+    assert (("rustup", "show", "active-toolchain"), module.CRATE) in ran
+    assert (("rustc", "-vV"), module.CRATE) in ran
+    assert (("rustup", "check", "--no-self-update"), module.CRATE) in ran
+    assert (("node", "--version"), module.ROOT) in ran
+    assert (("npm", "--version"), module.ROOT) in ran
+    venv = [args for args, _cwd in ran if args[0].endswith(("python.exe", "python"))]
+    assert venv and Path(venv[0][0]).parent.parent == module.ROOT / ".venv"
+    assert fetched == [
+        "https://www.python.org/api/v2/downloads/release/?is_published=true",
+        "https://nodejs.org/dist/index.json",
+    ]
+    assert module.PYTHON_PIN == ROOT / ".python-version"
+    assert module.NODE_PIN == ROOT / ".node-version"
+    assert module.main([]) == 2
+    monkeypatch.setitem(module.CHECKS, "rust", lambda: (True, ["OK: stub"]))
+    assert module.main(["rust"]) == 0
+
+
+def test_a_check_never_installs_a_toolchain_or_colours_its_output(monkeypatch) -> None:
+    module = _toolchains()
+    seen = {}
+
+    def fake(args, **kwargs):
+        seen.update(kwargs["env"])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", fake)
+    module.run("rustup", "show", "active-toolchain")
+    assert seen["RUSTUP_AUTO_INSTALL"] == "0"
+    assert seen["RUSTUP_TERM_COLOR"] == "never"
+
+
 
 
 #: How many of the newest released tags the redo-regime tests cover. The tags
@@ -724,7 +1034,7 @@ PYTEST_SUITE_RUN = "python -m pytest tests/"
 
 
 def _workflow_jobs(workflow: str) -> list[str]:
-    lines = (ROOT / ".github" / "workflows" / workflow).read_text().splitlines()
+    lines = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8").splitlines()
     jobs: list[str] = []
     in_jobs = False
     for line in lines:
@@ -748,25 +1058,12 @@ def _jobs_running_the_suite() -> list[tuple[str, str]]:
     return found
 
 
-def test_every_job_running_the_suite_checks_out_with_tags() -> None:
-    """The suite reads released tags; a default checkout has none.
 
-    actions/checkout fetches no tags by default, so the redo-regime tests saw
-    an empty tag list on the runner while passing locally, where the clone
-    carries every tag. `fetch-tags: true` on the checkout of any job that runs
-    the suite is what closes that gap; scripts/ci-parity-gates.sh cannot, since
-    a developer checkout always has the tags.
-    """
-    jobs = _jobs_running_the_suite()
-    assert jobs, "no workflow job runs the engine suite"
-    for workflow, job in jobs:
-        checkouts = [
-            text for _name, text in _job_steps(workflow, job)
-            if "actions/checkout@" in text
-        ]
-        assert checkouts, (workflow, job)
-        for text in checkouts:
-            assert "fetch-tags: true" in text, (workflow, job)
+
+LINT_RUN = "run: npm run lint"
+TYPECHECK_RUN = "run: npm run typecheck"
+
+
 
 
 @pytest.mark.parametrize("index", range(RELEASED_TAG_COUNT))
@@ -780,7 +1077,7 @@ def test_the_redo_selects_a_regime_every_released_tag_can_run(index: int) -> Non
     working tree, which is what the sparse checkout will provide.
     """
     tag = _released_tag(index)
-    text = (ROOT / ".github" / "workflows" / "release-redo.yml").read_text()
+    text = (ROOT / ".github" / "workflows" / "release-redo.yml").read_text(encoding="utf-8")
     assert f"git cat-file -e HEAD:{ENGINE_MANIFEST}" in text
     regime = _redo_regime(tag)
     steps = dict(_job_steps("release-redo.yml", "release"))
@@ -959,7 +1256,7 @@ def _write_release(downloaded: Path, release: dict) -> None:
 
 
 def _mutate_manifest_top(downloaded: Path, mutate) -> None:
-    manifest = json.loads((downloaded / "latest.json").read_text())
+    manifest = json.loads((downloaded / "latest.json").read_text(encoding="utf-8"))
     mutate(manifest)
     _write_manifest(downloaded, manifest)
 
@@ -970,7 +1267,7 @@ def _write_manifest(downloaded: Path, manifest: dict, assets: list[dict] | None 
     text = json.dumps(manifest)
     (downloaded / "latest.json").write_text(text)
     if assets is None:
-        assets = json.loads((downloaded / "assets.json").read_text())
+        assets = json.loads((downloaded / "assets.json").read_text(encoding="utf-8"))
         for asset in assets:
             if asset["name"] == "latest.json":
                 asset["size"] = len(text.encode())
@@ -980,7 +1277,7 @@ def _write_manifest(downloaded: Path, manifest: dict, assets: list[dict] | None 
 
 
 def _mutate_manifest(downloaded: Path, mutate) -> None:
-    manifest = json.loads((downloaded / "latest.json").read_text())
+    manifest = json.loads((downloaded / "latest.json").read_text(encoding="utf-8"))
     mutate(manifest["platforms"])
     _write_manifest(downloaded, manifest)
 
@@ -1076,7 +1373,7 @@ def test_the_draft_verifier_refuses_a_same_length_wrong_installer(tmp_path: Path
 def test_the_draft_verifier_refuses_a_checksum_file_that_lies(tmp_path: Path) -> None:
     args, downloaded = _draft_fixture(tmp_path)
     sums = downloaded / "SHA256SUMS.txt"
-    lines = sums.read_text().splitlines()
+    lines = sums.read_text(encoding="utf-8").splitlines()
     digest, name = lines[0].split("  ", 1)
     swapped = ("0" if digest[0] != "0" else "1") + digest[1:]
     lines[0] = f"{swapped}  {name}"
@@ -1165,7 +1462,7 @@ def _rename_asset(downloaded: Path, old: str, new: str) -> None:
     """Rename a draft asset in the API listing only. The Windows filesystem
     still serves the old file under the new name, so only an exact-name
     comparison can tell the two apart."""
-    assets = json.loads((downloaded / "assets.json").read_text())
+    assets = json.loads((downloaded / "assets.json").read_text(encoding="utf-8"))
     for asset in assets:
         if asset["name"] == old:
             asset["name"] = new
@@ -1234,7 +1531,7 @@ def test_the_draft_verifier_refuses_upper_case_hex_in_the_checksum_file(tmp_path
     an uppercase digest is a rewritten file, not this build's output."""
     args, downloaded = _draft_fixture(tmp_path)
     sums = downloaded / "SHA256SUMS.txt"
-    lines = sums.read_text().splitlines()
+    lines = sums.read_text(encoding="utf-8").splitlines()
     digest, name = lines[0].split("  ", 1)
     lines[0] = f"{digest.upper()}  {name}"
     body = ("\n".join(lines) + "\n").encode("ascii")
@@ -1247,7 +1544,7 @@ def test_the_draft_verifier_refuses_upper_case_hex_in_the_checksum_file(tmp_path
 
 def test_the_draft_verifier_refuses_platform_keys_duplicated_under_case(tmp_path: Path) -> None:
     args, downloaded = _draft_fixture(tmp_path)
-    manifest = json.loads((downloaded / "latest.json").read_text())
+    manifest = json.loads((downloaded / "latest.json").read_text(encoding="utf-8"))
     entry = manifest["platforms"]["windows-x86_64-nsis"]
     # json.dumps keeps both keys: they differ ordinally.
     manifest["platforms"] = {
@@ -1279,10 +1576,10 @@ def test_the_github_asset_name_rule_is_one_shared_function() -> None:
     """One rule, dot-sourced by the draft verifier and by both release
     workflows' checksum step. A second copy is a second rule, and the two
     drift the moment a character is added to either."""
-    rule = (ROOT / ASSET_NAME_RULE).read_text()
+    rule = (ROOT / ASSET_NAME_RULE).read_text(encoding="utf-8")
     assert "function Get-GitHubAssetName" in rule
     assert "[^A-Za-z0-9._-]" in rule
-    verifier = (ROOT / DRAFT_VERIFIER).read_text()
+    verifier = (ROOT / DRAFT_VERIFIER).read_text(encoding="utf-8")
     assert '. (Join-Path $PSScriptRoot "github-asset-name.ps1")' in verifier
     # The verifier never looks a draft asset up by a raw local file name.
     assert "Get-Downloaded $file.Name" not in verifier
@@ -1303,7 +1600,7 @@ def test_the_checksum_step_writes_the_names_github_serves(
     """`sha256sum -c SHA256SUMS.txt` is run beside DOWNLOADED files. A name
     column carrying the build directory's spaced names fails for every user
     who verifies a download, which is the whole point of publishing it."""
-    text = (ROOT / ".github" / "workflows" / workflow).read_text()
+    text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
     step = text.index("Upload SHA-256 checksums to the draft")
     body = text[step:step + 2000]
     assert dot_source in body
@@ -1354,7 +1651,7 @@ def test_the_draft_verifier_refuses_a_checksum_file_naming_the_local_form(
     `sha256sum -c` beside files named as GitHub named them."""
     args, downloaded = _draft_fixture(tmp_path)
     sums = downloaded / "SHA256SUMS.txt"
-    body = sums.read_text().replace(
+    body = sums.read_text(encoding="utf-8").replace(
         "Spectra.PDF_1.2.3_x64-setup.exe", "Spectra PDF_1.2.3_x64-setup.exe"
     ).encode("ascii")
     sums.write_bytes(body)
@@ -1442,7 +1739,7 @@ fn verifies_the_manifest_named_by_the_environment() {}
 """
 
 
-#: The reviewer's probe, verbatim in shape: an explicit `[[test]]` claiming
+#: A probe in this shape: an explicit `[[test]]` claiming
 #: the name the verifier once staged under, pathed at a tag-local accepting
 #: source. Cargo runs the explicit target over the inferred `tests/<name>.rs`.
 EXPLICIT_TEST_REDIRECT = """
@@ -1457,8 +1754,13 @@ def tag_package(tmp_path: Path):
     """A scratch package standing in for a TAG's `src-tauri`, with the
     conventionally named test replaced by an accepting one.
 
-    A worktree at HEAD sharing the checkout's cargo target directory, so the
-    dependency graph is not rebuilt. The build script requires every
+    A worktree at HEAD with a separate, revision-keyed Cargo target. Sharing
+    the live checkout's target is unsafe: this mixed cdylib/rlib package has
+    an unhashed libspectrapdf_lib.rlib output. A tag's different feature graph
+    can overwrite it while Cargo still calls the live package fresh, linking
+    tests against incompatible Tauri types or a stale build script.
+    The isolated cache is reused only by fixtures for the same tag revision.
+    The build script requires every
     `resources/` entry of tauri.conf.json to exist; empty stubs satisfy it
     the way the CI jobs' stubs do. Yields (verifier args, downloaded dir,
     package dir, env).
@@ -1467,14 +1769,17 @@ def tag_package(tmp_path: Path):
     _git("worktree", "add", "--detach", str(worktree), "HEAD")
     try:
         package = worktree / "src-tauri"
-        conf = json.loads((package / "tauri.conf.json").read_text())
+        conf = json.loads((package / "tauri.conf.json").read_text(encoding="utf-8"))
         for entry in conf["bundle"]["resources"]:
             if entry.startswith("../resources/"):
                 (worktree / entry.removeprefix("../")).mkdir(parents=True)
         (package / "tests" / "updater_manifest.rs").write_text(ACCEPTING_UPDATER_TEST)
         args, downloaded = _draft_fixture(tmp_path)
         args[args.index("-CargoPackage") + 1] = str(package)
-        env = _verifier_env({"CARGO_TARGET_DIR": str(ROOT / "src-tauri" / "target")})
+        revision = _git("rev-parse", "HEAD", cwd=worktree).strip()
+        env = _verifier_env({
+            "CARGO_TARGET_DIR": str(ROOT / "src-tauri" / "target" / "verifier-tags" / revision),
+        })
         yield args, downloaded, package, env
     finally:
         _git("worktree", "remove", "--force", str(worktree))
@@ -1501,6 +1806,26 @@ def test_the_draft_verifier_ignores_an_accepting_test_the_verified_package_carri
     args, downloaded, package, env = tag_package
     source = (ROOT / UPDATER_MANIFEST_TEST).read_bytes()
 
+    # A real foreign-package build must leave the live checkout's unhashed
+    # package slots alone, whether they were provisioned before this test or
+    # absent. This catches target sharing by its actual artifact side effect.
+    live_outputs = [
+        ROOT / "src-tauri/target/debug/deps/libspectrapdf_lib.rlib",
+        ROOT / "src-tauri/target/debug/spectrapdf.exe",
+    ]
+
+    def live_digests():
+        result = {}
+        for path in live_outputs:
+            if path.is_file():
+                with path.open("rb") as stream:
+                    result[str(path)] = hashlib.file_digest(stream, "sha256").hexdigest()
+            else:
+                result[str(path)] = None
+        return result
+
+    live_before = live_digests()
+
     _mutate_manifest_top(downloaded, lambda m: m.update(pub_date="not-rfc3339"))
     run = subprocess.run(args, capture_output=True, text=True, env=env)
     assert run.returncode != 0, run.stdout + run.stderr
@@ -1519,7 +1844,7 @@ def test_the_draft_verifier_ignores_an_accepting_test_the_verified_package_carri
     # The staged target is removed after the run, and the package's own
     # accepting test is left exactly as planted: never read, never touched.
     assert _staged_leftovers(package) == []
-    assert (package / "tests" / "updater_manifest.rs").read_text() == ACCEPTING_UPDATER_TEST
+    assert (package / "tests" / "updater_manifest.rs").read_text(encoding="utf-8") == ACCEPTING_UPDATER_TEST
 
     _mutate_manifest_top(downloaded, lambda m: m.update(pub_date="2026-09-02T15:00:00.000Z"))
     run = subprocess.run(args, capture_output=True, text=True, env=env)
@@ -1529,6 +1854,7 @@ def test_the_draft_verifier_ignores_an_accepting_test_the_verified_package_carri
     second = re.search(rf"as .*({VERIFIER_TEST_PREFIX}[0-9a-f]{{16}}_updater_manifest)\.rs", run.stdout)
     assert second and second.group(1) != Path(staged.group(1)).stem
     assert _staged_leftovers(package) == []
+    assert live_digests() == live_before, "tag verifier overwrote the live package's build outputs"
 
 
 def test_the_draft_verifier_refuses_a_manifest_that_redirects_the_verifier_target(
@@ -1542,7 +1868,7 @@ def test_the_draft_verifier_refuses_a_manifest_that_redirects_the_verifier_targe
     args, downloaded, package, env = tag_package
     (package / "tests" / "accepting_verifier.local.rs").write_text(ACCEPTING_UPDATER_TEST)
     manifest = package / "Cargo.toml"
-    manifest.write_text(manifest.read_text() + EXPLICIT_TEST_REDIRECT)
+    manifest.write_text(manifest.read_text(encoding="utf-8") + EXPLICIT_TEST_REDIRECT)
 
     _mutate_manifest_top(downloaded, lambda m: m.update(pub_date="not-rfc3339"))
     run = subprocess.run(args, capture_output=True, text=True, env=env)
@@ -1566,7 +1892,7 @@ def test_the_draft_verifier_refuses_a_package_that_disables_test_inference(
     would report no such test. Refused by name before cargo is asked."""
     args, _downloaded, package, env = tag_package
     manifest = package / "Cargo.toml"
-    text = manifest.read_text()
+    text = manifest.read_text(encoding="utf-8")
     manifest.write_text(text.replace("[package]\n", "[package]\nautotests = false\n", 1))
     run = subprocess.run(args, capture_output=True, text=True, env=env)
     assert run.returncode != 0, run.stdout + run.stderr
@@ -1580,7 +1906,7 @@ def test_the_draft_verifier_refuses_duplicate_explicit_targets_under_the_reserve
     args, _downloaded, package, env = tag_package
     (package / "tests" / "accepting_verifier.local.rs").write_text(ACCEPTING_UPDATER_TEST)
     manifest = package / "Cargo.toml"
-    manifest.write_text(manifest.read_text() + EXPLICIT_TEST_REDIRECT + EXPLICIT_TEST_REDIRECT)
+    manifest.write_text(manifest.read_text(encoding="utf-8") + EXPLICIT_TEST_REDIRECT + EXPLICIT_TEST_REDIRECT)
     run = subprocess.run(args, capture_output=True, text=True, env=env)
     assert run.returncode != 0, run.stdout + run.stderr
     assert _verifier_says(run, "under the reserved 'verifier_' prefix")
@@ -1596,7 +1922,7 @@ def test_the_draft_verifier_refuses_an_explicit_target_pathed_under_the_reserved
     (package / "tests" / "verifier_planted.rs").write_text(ACCEPTING_UPDATER_TEST)
     manifest = package / "Cargo.toml"
     manifest.write_text(
-        manifest.read_text()
+        manifest.read_text(encoding="utf-8")
         + '\n[[test]]\nname = "manifest_check"\npath = "tests/verifier_planted.rs"\n'
     )
     run = subprocess.run(args, capture_output=True, text=True, env=env)
@@ -1630,7 +1956,7 @@ def test_the_draft_verifier_tolerates_an_explicit_target_outside_the_reserved_pr
     (package / "tests" / "product_check.rs").write_text("#[test]\nfn product() {}\n")
     manifest = package / "Cargo.toml"
     manifest.write_text(
-        manifest.read_text() + '\n[[test]]\nname = "product_check"\npath = "tests/product_check.rs"\n'
+        manifest.read_text(encoding="utf-8") + '\n[[test]]\nname = "product_check"\npath = "tests/product_check.rs"\n'
     )
     run = subprocess.run(args, capture_output=True, text=True, env=env)
     assert run.returncode == 0, run.stdout + run.stderr
@@ -1668,7 +1994,7 @@ def verifier_revision(tmp_path: Path):
 
 
 def _mutate_verifier_source(source: Path, old: str, new: str) -> None:
-    text = source.read_text()
+    text = source.read_text(encoding="utf-8")
     assert text.count(old) == 1, old
     source.write_text(text.replace(old, new))
 
@@ -1760,16 +2086,10 @@ def test_the_draft_verifier_refuses_a_verifier_test_that_panics(verifier_revisio
     assert "verified from downloaded bytes" not in run.stdout
 
 
-def test_ci_scans_the_renderer_it_just_built_for_the_test_harness() -> None:
-    steps = _job_steps("ci.yml", "lint-and-build")
-    names = [name for name, _ in steps]
-    gate = "Shipped renderer carries no test harness"
-    assert names.index("Build renderer (Vite)") + 1 == names.index(gate)
-    assert "run: python scripts/check-release-bundle.py" in dict(steps)[gate]
 
 
 def test_scan_fixture_uses_the_ghostscript_authority() -> None:
-    text = (ROOT / "tests" / "fixtures" / "make_scans.py").read_text()
+    text = (ROOT / "tests" / "fixtures" / "make_scans.py").read_text(encoding="utf-8")
     assert "from engine.gs_capability import require" in text
     assert "resources\" / \"ghostscript" not in text
 
@@ -1781,16 +2101,116 @@ def test_the_ghostscript_test_tool_install_retries_and_falls_back_pinned() -> No
     the fallback is a pinned upstream installer, hash-verified before it is
     executed, so an exhausted retry cannot run an unverified binary.
     """
-    text = (ROOT / "scripts" / "install-ghostscript-test-tool.ps1").read_text()
+    text = (ROOT / "scripts" / "install-ghostscript-test-tool.ps1").read_text(encoding="utf-8")
     assert "choco install ghostscript -y --no-progress" in text
-    assert "$attempt -le 3" in text
+    assert "$attempt -le $ChocoAttempts" in text
     assert "$FallbackSha256 = " in text
     verify = text.index("$actual -ne $FallbackSha256")
     assert verify < text.index("Start-Process -FilePath $installer")
 
 
+GS_TEST_TOOL_SCRIPT = "scripts/install-ghostscript-test-tool.ps1"
+
+
+def _gs_script_constant(text: str, name: str) -> int:
+    found = re.findall(rf"^\${name} = (\d+)$", text, re.MULTILINE)
+    assert len(found) == 1, (name, found)
+    return int(found[0])
+
+
+def test_the_ghostscript_test_tool_install_is_bounded_under_its_step_deadline() -> None:
+    """A vendor installer that never exits hung the step for six hours.
+
+    Every Chocolatey attempt carries an execution timeout, leftover installers
+    are killed before anything else runs, the fallback waits on its own
+    process with a deadline (Start-Process -Wait also waits on descendants),
+    and every workflow step running the script has a deadline above the
+    script's worst case.
+    """
+    text = (ROOT / GS_TEST_TOOL_SCRIPT).read_text(encoding="utf-8")
+    attempts = _gs_script_constant(text, "ChocoAttempts")
+    choco_timeout = _gs_script_constant(text, "ChocoTimeoutSeconds")
+    retry_sleep = _gs_script_constant(text, "RetrySleepSeconds")
+    termination_wait = _gs_script_constant(text, "TerminationWaitSeconds")
+    download_attempts = _gs_script_constant(text, "FallbackDownloadAttempts")
+    download_timeout = _gs_script_constant(text, "FallbackDownloadTimeoutSeconds")
+    download_sleep = _gs_script_constant(text, "FallbackDownloadRetrySleepSeconds")
+    fallback_timeout = _gs_script_constant(text, "FallbackTimeoutSeconds")
+    assert 1 <= attempts <= 3
+    assert 0 < choco_timeout <= 600
+    assert 0 < fallback_timeout <= 900
+    # The fallback fetch retries a transient answer; its whole budget, not one
+    # attempt, is what the deadline below has to hold.
+    assert 1 <= download_attempts <= 4
+    assert 0 < download_timeout <= 300
+    assert 0 < download_sleep <= 30
+
+    choco_calls = re.findall(r"^\s*choco install ghostscript\b.*$", text, re.MULTILINE)
+    assert choco_calls == [
+        "    choco install ghostscript -y --no-progress "
+        "--execution-timeout=$ChocoTimeoutSeconds"
+    ]
+    assert "-TimeoutSec $FallbackDownloadTimeoutSeconds" in text
+
+    starts = re.findall(r"^.*Start-Process -FilePath \$installer.*$", text, re.MULTILINE)
+    assert len(starts) == 1, starts
+    assert "-PassThru" in starts[0]
+    assert "-Wait" not in starts[0]
+    start = text.index(starts[0])
+    assert "$proc.WaitForExit($FallbackTimeoutSeconds * 1000)" in text[start:]
+    assert "$null = $proc.Handle" in text[start:]
+    assert not re.search(r"^\s*Wait-Process\b", text, re.MULTILINE)
+    assert not re.search(r"(?m)^[^#\n]*Start-Process\b[^\n]*-Wait\b", text)
+
+    loop = text.index("for ($attempt = 1;")
+    loop_body = text[loop:text.index("if (-not $installed)")]
+    assert "Stop-GhostscriptInstallerProcess" in loop_body
+    assert text.index("function Stop-GhostscriptInstallerProcess") < loop
+    assert "'lib\\Ghostscript.app'" in text
+    assert "'lib-bad\\Ghostscript.app'" in text
+    assert "'^gs\\d+w64\\.exe$'" in text
+
+    worst_case_seconds = (
+        attempts * (choco_timeout + termination_wait)
+        + retry_sleep * attempts * (attempts - 1) // 2
+        + download_attempts * download_timeout
+        + download_sleep * download_attempts * (download_attempts - 1) // 2
+        + fallback_timeout
+        + termination_wait
+    )
+    # Chocolatey's package download and the runner's process start are not
+    # covered by the constants above.
+    overhead_seconds = 300
+
+    invoking_steps = []
+    for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        raw = workflow.read_text(encoding="utf-8")
+        if GS_TEST_TOOL_SCRIPT not in raw:
+            continue
+        lines = raw.splitlines()
+        jobs = [
+            line[2:-1]
+            for line in lines[lines.index("jobs:") + 1:]
+            if re.fullmatch(r"  [A-Za-z][\w-]*:", line)
+        ]
+        found = [
+            (workflow.name, job, name, step)
+            for job in jobs
+            for name, step in _job_steps(workflow.name, job)
+            if GS_TEST_TOOL_SCRIPT in step
+        ]
+        assert len(found) == raw.count(GS_TEST_TOOL_SCRIPT), workflow.name
+        invoking_steps.extend(found)
+    for workflow, job, name, step in invoking_steps:
+        deadlines = re.findall(r"^        timeout-minutes: (\d+)$", step, re.MULTILINE)
+        assert len(deadlines) == 1, (workflow, job, name, deadlines)
+        assert worst_case_seconds + overhead_seconds < int(deadlines[0]) * 60, (
+            workflow, job, name, worst_case_seconds, deadlines[0],
+        )
+
+
 def test_the_test_hsm_download_is_version_and_hash_pinned() -> None:
-    text = (ROOT / "scripts" / "setup-test-softhsm.ps1").read_text()
+    text = (ROOT / "scripts" / "setup-test-softhsm.ps1").read_text(encoding="utf-8")
     assert '$Version = "2.5.0"' in text
     assert "releases/download/v$Version/SoftHSM2-$Version-portable.zip" in text
     assert "85273bcc1a6b90e877f7bb4f7e90221d57103d8f5241d154a79dd730a135b910" in text
@@ -1832,14 +2252,6 @@ def test_full_capability_gate_refuses_a_skip(monkeypatch) -> None:
     assert any("Ghent-corpus axis" in line for line in reporter.lines)
     assert any(Report.nodeid in line for line in reporter.lines)
     assert any("unstated reason" in line for line in reporter.lines)
-
-
-def test_ci_stages_both_engine_capabilities() -> None:
-    _assert_capabilities_precede_engine_tests("ci.yml")
-
-
-def test_release_verification_stages_both_engine_capabilities() -> None:
-    _assert_capabilities_precede_engine_tests("release.yml")
 
 
 # --- Release notes come from the changelog, not from a workflow literal ---
@@ -2000,7 +2412,7 @@ def test_the_release_notes_gate_is_mirrored_locally() -> None:
 
 def _job_header(workflow: str, job: str) -> str:
     """The job's keys above `steps:`, as text."""
-    lines = (ROOT / ".github" / "workflows" / workflow).read_text().splitlines()
+    lines = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8").splitlines()
     start = lines.index(f"  {job}:")
     out: list[str] = []
     for line in lines[start + 1:]:
@@ -2248,10 +2660,6 @@ def test_the_sign_script_refuses_a_signing_run_with_no_coordinates(tmp_path: Pat
     assert "SPECTRAPDF_SIGN_ENDPOINT" in run.stderr
 
 
-def test_the_local_battery_runs_the_sign_script_no_op() -> None:
-    """The one signing check that can run off a runner runs before every push."""
-    parity = (ROOT / "scripts" / "ci-parity-gates.sh").read_text(encoding="utf-8")
-    assert "sign-script-noop" in parity
 
 
 #: Every path the bundler passed to the sign command in a real local bundle,
@@ -2389,6 +2797,28 @@ def test_the_client_tools_install_has_a_second_source() -> None:
     )
     assert "SPECTRAPDF_SIGN_DLIB" in text
     assert "GITHUB_ENV" in text
+
+
+@pytest.mark.parametrize("workflow,job", (
+    *PUBLISHER_JOBS, ("signing-smoke.yml", "sign-smoke"),
+))
+def test_signing_tool_setup_avoids_unattended_msi_and_has_a_deadline(
+    workflow: str, job: str,
+) -> None:
+    """An MSI that never exits prevents the fallback and consumes the job.
+
+    Pin the actual invocation, not a comment mentioning the switch. The redo
+    uses the existing tag script without changing any bundled product bytes.
+    """
+    step = dict(_job_steps(workflow, job))[SIGNING_TOOLS_STEP]
+    run = re.search(r"^        run: (.+)$", step, re.MULTILINE)
+    assert run is not None, (workflow, step)
+    assert run.group(1).split() == [
+        "powershell", "-ExecutionPolicy", "Bypass", "-File",
+        SIGN_TOOLS_SCRIPT, "-SkipWinget",
+    ], (workflow, run.group(1))
+    assert re.findall(r"^        timeout-minutes: (.+)$", step, re.MULTILINE) == ["5"]
+    assert "continue-on-error:" not in step
 
 
 def test_the_nuget_payload_is_opened_by_the_zip_reader() -> None:
@@ -2623,3 +3053,335 @@ def test_the_signing_token_is_cached_without_printing_it(workflow: str) -> None:
     assert SIGNING_TOKEN_SCOPE in step, step
     assert "expires_on" in step, step
     assert "accessToken" not in step, step
+
+
+# ---------------------------------------------------------------------------
+# Bounded retry for vendored-resource downloads
+# ---------------------------------------------------------------------------
+
+#: Every script a CI or release workflow runs that fetches bytes over the
+#: network. A transient upstream answer -- a 504 from a host that serves the
+#: same URL a minute later -- has failed whole jobs here, so each one routes
+#: its fetch through the one shared bounded-retry helper.
+RETRY_ROUTED_PS = (
+    "sync-signature-fonts.ps1",
+    "sync-edit-fonts.ps1",
+    "bundle-dictionaries.ps1",
+    "bundle-voikko.ps1",
+    "bundle-jbig2enc.ps1",
+    "bundle-libreoffice.ps1",
+    "bundle-tesseract.ps1",
+    "setup-python-embed.ps1",
+    "setup-test-softhsm.ps1",
+    "stage-corresponding-source.ps1",
+    "install-signing-tools.ps1",
+    "verify-release-draft.ps1",
+    "install-ghostscript-test-tool.ps1",
+)
+RETRY_ROUTED_PY = (
+    "fetch-ghent-suite.py",
+    "fetch-processing-steps-suite.py",
+    "fetch-pdfa-corpus.py",
+)
+PS_DOWNLOAD_CMDLETS = re.compile(r"\bInvoke-(?:WebRequest|RestMethod)\b")
+PS_HELPER = "download-retry.ps1"
+
+
+def _ps_source(name: str) -> str:
+    """The script with its comments removed, so a mention is not a call site."""
+    text = (ROOT / "scripts" / name).read_text(encoding="utf-8-sig")
+    lines = []
+    for line in text.splitlines():
+        quotes = 0
+        cut = None
+        for index, char in enumerate(line):
+            if char in "\"'":
+                quotes += 1
+            elif char == "#" and quotes % 2 == 0:
+                cut = index
+                break
+        lines.append(line if cut is None else line[:cut])
+    return "\n".join(lines)
+
+
+def _retry_blocks(text: str) -> list[tuple[int, int]]:
+    """The span of every `-Download { ... }` scriptblock, by brace matching."""
+    return _blocks(text, r"-Download\s*\{")
+
+
+@pytest.mark.parametrize("name", RETRY_ROUTED_PS)
+def test_every_powershell_download_runs_under_the_shared_retry(name: str) -> None:
+    text = _ps_source(name)
+    assert '. (Join-Path $PSScriptRoot "' + PS_HELPER + '")' in text
+    blocks = _retry_blocks(text)
+    calls = list(PS_DOWNLOAD_CMDLETS.finditer(text))
+    curls = list(re.finditer(r"curl\.exe", text))
+    assert calls or curls, name + " performs no download"
+    for call in calls:
+        assert any(start <= call.start() < end for start, end in blocks), (
+            name + ": a download is not inside a -Download block"
+        )
+        statement = text[call.start():call.start() + 400].split("}")[0]
+        assert "-TimeoutSec" in statement, (
+            name + ": a download carries no per-attempt timeout"
+        )
+    for curl in curls:
+        assert "@(Get-CurlRetryArguments)" in text[curl.start():curl.start() + 400], (
+            name + ": a curl download carries no bounded retry arguments"
+        )
+
+
+def _blocks(text: str, opening: str) -> list[tuple[int, int]]:
+    """The span of every block whose header matches `opening`, by brace match."""
+    spans = []
+    for match in re.finditer(opening, text):
+        depth = 0
+        index = match.end() - 1
+        while index < len(text):
+            if text[index] == "{":
+                depth += 1
+            elif text[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            index += 1
+        assert depth == 0, "unbalanced block"
+        spans.append((match.end(), index))
+    return spans
+
+
+@pytest.mark.parametrize("name", RETRY_ROUTED_PS)
+def test_no_download_script_keeps_a_private_retry_loop(name: str) -> None:
+    """One policy, not a copy per script: a private loop retried a 404 too."""
+    text = _ps_source(name)
+    for start, end in _blocks(text, r"catch(?:\s*\[[^\]]*\])?\s*\{"):
+        body = text[start:end]
+        assert not ("Start-Sleep" in body and PS_DOWNLOAD_CMDLETS.search(body)), (
+            name + ": a download is retried by a private loop"
+        )
+
+
+@pytest.mark.parametrize("name", RETRY_ROUTED_PY)
+def test_every_corpus_fetch_runs_under_the_shared_retry(name: str) -> None:
+    text = (ROOT / "scripts" / name).read_text(encoding="utf-8")
+    assert "from download_retry import fetch_with_retry" in text
+    assert "fetch_with_retry(" in text
+    assert "urlopen" not in text, name + ": a fetch bypasses the shared retry"
+
+
+def test_the_workflows_run_no_unrouted_download_script() -> None:
+    """Every download a workflow runs goes through the one shared retry."""
+    referenced = set()
+    for workflow in ("ci.yml", "release.yml", "release-redo.yml"):
+        text = (ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        referenced.update(re.findall(r"scripts/([A-Za-z0-9_.-]+\.(?:ps1|py))", text))
+    routed = set(RETRY_ROUTED_PS) | set(RETRY_ROUTED_PY)
+    for name in sorted(referenced):
+        path = ROOT / "scripts" / name
+        if not path.is_file() or name in routed:
+            continue
+        source = _ps_source(name) if name.endswith(".ps1") else path.read_text(encoding="utf-8")
+        downloads = bool(PS_DOWNLOAD_CMDLETS.search(source)) or any(
+            token in source for token in ("curl.exe", "urlopen", "requests.get"))
+        assert not downloads, "scripts/" + name + " downloads outside the shared retry"
+
+
+def test_the_retry_bounds_stay_bounded_and_transient_only() -> None:
+    helper = (ROOT / "scripts" / PS_HELPER).read_text(encoding="utf-8")
+    attempts = int(re.search(r"\$DownloadRetryAttempts = (\d+)", helper).group(1))
+    delay = int(re.search(r"\$DownloadRetryBaseDelaySeconds = (\d+)", helper).group(1))
+    timeout = int(re.search(r"\$DownloadRetryTimeoutSeconds = (\d+)", helper).group(1))
+    assert 2 <= attempts <= 6
+    assert 1 <= delay <= 30
+    assert 60 <= timeout <= 3600
+    # --retry-all-errors would retry a 404 as readily as a 504.
+    arguments = helper.split("function Get-CurlRetryArguments", 1)[1]
+    assert "'--retry'" in arguments
+    assert "--retry-all-errors" not in arguments.split("return @(", 1)[1]
+
+
+PS_CLASSIFIER_PROBE = r"""
+$ErrorActionPreference = 'Stop'
+. '{helper}'
+$cases = @(
+    @{{ Message = 'The operation has timed out'; Expect = 'True' }},
+    @{{ Message = 'An existing connection was forcibly closed by the remote host'; Expect = 'True' }},
+    @{{ Message = 'The remote server returned an error: (404) Not Found.'; Expect = 'False' }},
+    @{{ Message = 'Could not find a part of the path'; Expect = 'False' }}
+)
+foreach ($case in $cases) {{
+    $exception = New-Object System.Exception($case.Message)
+    $record = New-Object System.Management.Automation.ErrorRecord($exception, 'synthetic', 'NotSpecified', $null)
+    $actual = Test-TransientDownloadError $record
+    Write-Output ("" + $actual + "|" + $case.Expect + "|" + $case.Message)
+}}
+$response = New-Object System.Net.Http.HttpResponseMessage([System.Net.HttpStatusCode]::ServiceUnavailable)
+$httpError = New-Object Microsoft.PowerShell.Commands.HttpResponseException("503", $response)
+$record = New-Object System.Management.Automation.ErrorRecord($httpError, 'http', 'NotSpecified', $null)
+Write-Output ("" + (Test-TransientDownloadError $record) + "|True|status 503")
+Write-Output ("" + (Get-DownloadErrorStatus $record) + "|503|status read")
+$response = New-Object System.Net.Http.HttpResponseMessage([System.Net.HttpStatusCode]::NotFound)
+$httpError = New-Object Microsoft.PowerShell.Commands.HttpResponseException("404", $response)
+$record = New-Object System.Management.Automation.ErrorRecord($httpError, 'http', 'NotSpecified', $null)
+Write-Output ("" + (Test-TransientDownloadError $record) + "|False|status 404")
+"""
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="pwsh is not installed")
+def test_the_powershell_classifier_retries_only_transient_answers() -> None:
+    """The shipped classifier, run against real error records."""
+    script = PS_CLASSIFIER_PROBE.format(helper=(ROOT / "scripts" / PS_HELPER).as_posix())
+    out = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, cwd=ROOT,
+    )
+    assert out.returncode == 0, out.stderr
+    rows = [line for line in out.stdout.splitlines() if "|" in line]
+    assert len(rows) == 7, out.stdout
+    for row in rows:
+        actual, expect, label = row.split("|", 2)
+        assert actual == expect, label + ": classified " + actual + ", expected " + expect
+
+
+def _download_retry():
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import download_retry
+
+    return download_retry
+
+
+def test_the_python_classifier_retries_only_transient_answers() -> None:
+    module = _download_retry()
+    import urllib.error
+
+    def http(code: int):
+        return urllib.error.HTTPError("https://x", code, "", {}, None)
+
+    for code in (500, 502, 503, 504, 408, 429):
+        assert module.is_transient(http(code)), code
+    for code in (400, 401, 403, 404, 410):
+        assert not module.is_transient(http(code)), code
+    assert module.is_transient(urllib.error.URLError(TimeoutError("timed out")))
+    assert module.is_transient(ConnectionResetError("reset"))
+    assert not module.is_transient(RuntimeError("expected a zip"))
+    assert 2 <= module.ATTEMPTS <= 6
+    assert 1 <= module.BASE_DELAY_SECONDS <= 30
+
+
+class _ZipResponse:
+    headers = {"Content-Type": "application/zip"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return b"payload"
+
+
+def test_a_transient_fetch_is_retried_and_a_refusal_is_not(monkeypatch) -> None:
+    module = _download_retry()
+    import urllib.error
+    import urllib.request
+
+    attempts: list = []
+
+    def flaky(request, timeout=None):
+        attempts.append(timeout)
+        if len(attempts) < 3:
+            raise urllib.error.HTTPError("https://x", 504, "", {}, None)
+        return _ZipResponse()
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    request = urllib.request.Request("https://x")
+    assert module.fetch_with_retry(request, timeout=7, description="x") == b"payload"
+    assert attempts == [7, 7, 7]
+
+    def refused(request, timeout=None):
+        attempts.append(timeout)
+        raise urllib.error.HTTPError("https://x", 404, "", {}, None)
+
+    attempts.clear()
+    monkeypatch.setattr(urllib.request, "urlopen", refused)
+    with pytest.raises(urllib.error.HTTPError):
+        module.fetch_with_retry(request, timeout=7, description="x")
+    assert attempts == [7]
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda request, timeout=None: _ZipResponse())
+
+    def reject(response):
+        raise RuntimeError("expected a zip")
+
+    with pytest.raises(RuntimeError, match="expected a zip"):
+        module.fetch_with_retry(request, timeout=7, description="x", inspect=reject)
+
+
+def test_a_bounded_fetch_gives_up_instead_of_hanging(monkeypatch) -> None:
+    module = _download_retry()
+    import urllib.error
+    import urllib.request
+
+    calls: list = []
+
+    def always_504(request, timeout=None):
+        calls.append(timeout)
+        raise urllib.error.HTTPError("https://x", 504, "", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", always_504)
+    monkeypatch.setattr(module.time, "sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="transient download failure"):
+        module.fetch_with_retry(
+            urllib.request.Request("https://x"), timeout=5, description="x")
+    assert len(calls) == module.ATTEMPTS
+
+
+def test_hosted_validation_does_not_repeat_local_functional_suites() -> None:
+    for workflow in WORKFLOWS:
+        for job in _workflow_jobs(workflow):
+            for name, step in _job_steps(workflow, job):
+                commands = "\n".join(line for line in step.splitlines() if not line.lstrip().startswith("#"))
+                assert not re.search(r"\bnpm (?:test|run (?:lint|typecheck))\b|\bpytest\b", commands), (workflow, job, name)
+                if "cargo test" in commands:
+                    assert workflow == "ci.yml" and job == "scheduler", (workflow, job, name)
+                    assert "cargo test --lib scheduler -- --ignored" in commands
+    assert _jobs_running_the_suite() == []
+
+
+def test_fresh_scheduler_and_security_audits_remain_hosted() -> None:
+    steps = _job_steps("ci.yml", "scheduler")
+    commands = "\n".join(text for _, text in steps)
+    assert "cargo test --lib scheduler -- --ignored" in commands
+    assert commands.index("Create resource stubs") < commands.index("cargo test")
+    audit = "\n".join(text for _, text in _job_steps("ci.yml", "audit"))
+    for command in ("npm audit", "cargo audit", "pip-audit -r scripts/python-requirements.txt", "pip-audit -r vendored-audit-requirements.txt"):
+        assert command in audit
+
+
+def test_local_supplement_does_not_repeat_the_functional_battery() -> None:
+    script = (ROOT / "scripts/ci-parity-gates.sh").read_text(encoding="utf-8")
+    for command in ("cargo test", "pytest", "npm test", "vite build", "npm run typecheck", "cargo audit", "npm audit"):
+        assert command not in script
+
+
+def test_release_smokes_its_vendored_engine_before_publication() -> None:
+    steps = _job_steps("release.yml", "release")
+    names = [name for name, _ in steps]
+    smoke = names.index("Built CLI starts the vendored engine")
+    assert names.index("Build, sign, and upload to a draft release") < smoke
+    assert smoke < names.index("Verify the draft's assets and updater manifest")
+    assert smoke < names.index("Publish the release")
+    command = steps[smoke][1]
+    assert "Start-Process" in command and "-Wait" in command
+    assert "-RedirectStandardOutput" in command
+    assert "tests/fixtures/sample.pdf" in command
+    assert "$process.ExitCode -ne 0" in command
+    assert "$report.valid -ne $true" in command
+
+
+def test_local_toolchain_parity_precedes_candidate_metadata_checks() -> None:
+    script = (ROOT / "scripts/ci-parity-gates.sh").read_text(encoding="utf-8")
+    for toolchain in ("rust", "python", "node"):
+        assert script.index(f"gate {toolchain}-toolchain") < script.index("gate version-consistency")

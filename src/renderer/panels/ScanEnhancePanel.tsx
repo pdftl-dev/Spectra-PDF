@@ -3,6 +3,7 @@ import { useAppState } from '../state/AppStateProvider';
 import { useActiveFile } from '../hooks/useActiveFile';
 import { useEngine } from '../hooks/useEngine';
 import { useOperations } from '../hooks/useOperations';
+import { useOwnedOperationRun } from '../hooks/useOwnedOperationRun';
 import { EDIT_DECLINED } from '../lib/edit-text';
 import { NoFileOpen } from '../components/NoFileOpen';
 import { invokeCommand } from '../commands/context';
@@ -10,9 +11,7 @@ import { StatusBar } from '../components/StatusBar';
 import { useTranslation } from 'react-i18next';
 import { tChrome, tChromeCount } from '../i18n';
 import { tesseractPath } from '../lib/ocr-recognize';
-import { gsBlocked, requireGsPath } from '../lib/gs-capability';
-import { useGsCapability } from '../hooks/useGsCapability';
-import { GsRequiredNotice } from '../components/GsRequiredNotice';
+import { gsPathIfAvailable } from '../lib/gs-capability';
 import {
   DEFAULT_SCAN_ENHANCE,
   previewCounts,
@@ -48,13 +47,14 @@ export function ScanEnhancePanel(): React.ReactElement {
   const { activeFile, openNewFiles } = useActiveFile();
   const { call } = useEngine();
   const { performOperation } = useOperations();
+  const beginRun = useOwnedOperationRun(activeFile);
 
   const [settings, setSettings] = useState<ScanEnhanceSettings>(DEFAULT_SCAN_ENHANCE);
   const [scope, setScope] = useState<ScanScope['kind']>('page');
   const [report, setReport] = useState<ScanAnalysis | null>(null);
   const [status, setStatus] = useState('');
+  useEffect(() => { setStatus(''); }, [activeFile?.path, activeFile?.workingPath]);
   const [busy, setBusy] = useState(false);
-  const gs = useGsCapability();
 
   const workingPath = activeFile?.workingPath ?? null;
   const filePath = activeFile?.path ?? null;
@@ -81,13 +81,15 @@ export function ScanEnhancePanel(): React.ReactElement {
 
   const counts = useMemo(() => previewCounts(report), [report]);
 
-  // The vendored binaries travel with EVERY call, not only when orientation
+  // The tool paths travel with EVERY call, not only when orientation
   // detection is on: Tesseract is what reads the orientation and Ghostscript
-  // is the fallback decoder for a codestream this build cannot open, and a
-  // request without them refuses by name rather than quietly doing less.
+  // is the fallback decoder for a codestream this build cannot open. The
+  // content decides whether Ghostscript is needed, so the call carries what
+  // is usable and the engine refuses by name the document whose scan needs
+  // the fallback when none is.
   const toolPaths = useCallback(
     async () => {
-      const [tesseract, gs] = await Promise.all([tesseractPath(), requireGsPath()]);
+      const [tesseract, gs] = await Promise.all([tesseractPath(), gsPathIfAvailable()]);
       return { tesseract_path: tesseract, gs_path: gs };
     },
     [],
@@ -152,30 +154,35 @@ export function ScanEnhancePanel(): React.ReactElement {
 
   const apply = useCallback(async () => {
     if (!filePath || problem) return;
+    const run = beginRun();
+    if (!run) return;
     setBusy(true);
     setStatus(tChrome('panel.scanEnhance.applying'));
     try {
       // The standard snapshot(gate) → engine → reload → UPDATE_FILE flow, so
       // the whole enhancement is ONE undo step.
-      const r = await performOperation(filePath, 'enhance_scan', {
+      const r = await run.perform(performOperation, 'enhance_scan', {
         ...params,
         ...(await toolPaths()),
       });
+      if (!run.visible()) return;
       if (r === EDIT_DECLINED) {
         setStatus('');
         return;
       }
       setStatus(tChromeCount('panel.scanEnhance.applied', counts.changing));
     } catch (e: unknown) {
+      if (!run.visible()) return;
       setStatus(
         tChrome('panel.common.error', {
           message: e instanceof Error ? e.message : String(e),
         }),
       );
     } finally {
+      run.finish();
       setBusy(false);
     }
-  }, [filePath, performOperation, params, problem, counts.changing, toolPaths]);
+  }, [filePath, performOperation, params, problem, counts.changing, toolPaths, beginRun]);
 
   const skew = worstSkew(report);
   const uncertain = uncertainOrientation(report, settings.osd_confidence);
@@ -395,11 +402,10 @@ export function ScanEnhancePanel(): React.ReactElement {
         )}
       </div>
 
-      <GsRequiredNotice capability={gs} testId="scanenhance-gs" />
       <div className="flex items-center gap-2">
         <button
           data-testid="scanenhance-measure"
-          disabled={busy || problem !== null || gsBlocked(gs)}
+          disabled={busy || problem !== null}
           onClick={() => void measure()}
           className="px-3 py-1.5 text-sm bg-neutral-800 border border-neutral-700 rounded hover:bg-neutral-700 disabled:opacity-60"
         >
@@ -407,7 +413,7 @@ export function ScanEnhancePanel(): React.ReactElement {
         </button>
         <button
           data-testid="scanenhance-apply"
-          disabled={busy || problem !== null || counts.changing === 0 || gsBlocked(gs)}
+          disabled={busy || problem !== null || counts.changing === 0}
           onClick={() => void apply()}
           className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-500 rounded disabled:opacity-60"
         >

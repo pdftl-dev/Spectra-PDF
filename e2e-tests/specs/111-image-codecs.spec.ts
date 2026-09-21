@@ -167,7 +167,7 @@ describe('MRC compression, end to end', () => {
     const before = statSync(SCAN).size;
     const after = statSync(out).size;
     console.log(`[mrc] ${(before / 1024).toFixed(0)} KB -> ${(after / 1024).toFixed(0)} KB`);
-    // "Materially smaller" is the register's claim; the pytest suite pins the
+    // The claim is a materially smaller file; the pytest suite pins the
     // exact bands against gs /ebook. Half is the loosest honest form of it.
     expect(after).toBeLessThan(before / 2);
 
@@ -207,7 +207,7 @@ describe('MRC compression, end to end', () => {
     await setView('operations');
     await setActiveOp('compress');
     const out = resolve(tmp, 'mrc-verified.pdf');
-    // Slice E's switch, through the panel that offers it. On this fixture the
+    // The text-verification switch, through the panel that offers it. On this fixture the
     // words DO survive, so the assertion is that the pass still ran — the
     // revert path itself is pinned deterministically in pytest, where the
     // score can be substituted instead of hoping a fixture fails.

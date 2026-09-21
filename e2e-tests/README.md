@@ -1,5 +1,9 @@
 # Spectra PDF — E2E test suite
 
+[![CI](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](../README.md#requirements)
+[![License](https://img.shields.io/github/license/jasonulbright/Spectra-PDF)](../LICENSE)
+
 WebdriverIO + `tauri-driver` driving the actual built binary against an
 embedded WebView2. Tests use a renderer-side test harness exposed at
 `window.__SPECTRA_TEST__`, only compiled in when `VITE_E2E=1` is set at
@@ -99,7 +103,7 @@ The run's own output is also saved to `logs/last-run.log` (gitignored), and any
 saved log can be re-scanned without re-running the suite:
 
 ```powershell
-npm run scan:log -- ..\battery-v1031.local.log
+npm run scan:log -- logs\last-run.log
 ```
 
 ## What's covered

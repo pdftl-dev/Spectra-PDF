@@ -25,7 +25,7 @@ Replacement (`replace_text_run`) rewrites exactly one show op:
     against the run's `encodable` set, so this is a belt);
   - ' and " targets are expanded to their spec equivalence (T* [+ Tw/Tc
     for "]) followed by a plain Tj, preserving their state side effects;
-  - the Δwidth anchor rule (the phase doc's design): text that FLOWS
+  - the Δwidth anchor rule: text that FLOWS
     (consecutive shows, no repositioning) shifts automatically via the tm
     advance; subsequent SAME-LINE Td/TD anchors (ty == 0) are absolute
     against the line matrix and are shifted by Δ explicitly — the
@@ -61,8 +61,8 @@ from engine.redact import (
     MAX_FORM_DEPTH,
     _as_matrix,
     _bbox_of_corners_under_matrix,
-    _bbox_of_rect_under_matrix,
     _copy_resources_for_write,
+    _lookup_resource,
     _lookup_xobject,
     _mat_mult,
     _resolve_resources,
@@ -80,8 +80,11 @@ from engine.text_metrics import (  # noqa: F401  (_operand_bytes is a re-export)
     _operand_bytes,
     _run_metrics,
     _show_segments,
-    _spaces_in,
+    ink_span,
+    show_items,
+    string_advance,
 )
+from engine.pdf_tree import key_name, key_text, token_text
 
 SHOW_OPS = ("Tj", "'", '"', "TJ")
 
@@ -90,6 +93,42 @@ SHOW_OPS = ("Tj", "'", '"', "TJ")
 # must compare against this constant rather than re-spell the sentence, because
 # a blank run is evidence about the text and none at all about the mapping.
 NOTHING_TO_EDIT = "nothing to edit"
+
+# The font an edit writes with is selected by a `Tf` naming a resource of the
+# run's own stream. A run drawn with a font that no name of its stream selects
+# (an ExtGState /Font entry; a font a form inherits under a name its own
+# resources give to another font) is read and measured, and not edited.
+UNNAMED_FONT = "an edit cannot select this text's font by name"
+
+
+def _resource_lookup(resources, fallback):
+    """The resolver a text state resolves `Tf` and `gs` names through: the
+    stream's own resources, then the invoker's."""
+
+    def lookup(category, name):
+        return _lookup_resource(resources, fallback, category, name)
+
+    return lookup
+
+
+def _same_font(one, other) -> bool:
+    if one is None or other is None:
+        return False
+    try:
+        if one.is_indirect and other.is_indirect:
+            return one.objgen == other.objgen
+        return one == other
+    except Exception:
+        return False
+
+
+def _names_its_font(state: GraphicsTextState) -> bool:
+    """Whether the font name the text state holds selects, in this stream,
+    the font dictionary the state draws with — the one condition under which
+    an edit's `Tf` writes with the font the text was drawn in."""
+    if state.font is None or not state.font_name or state.lookup is None:
+        return False
+    return _same_font(state.lookup("/Font", state.font_name), state.font)
 
 
 # ── listing ───────────────────────────────────────────────────────────────
@@ -137,7 +176,7 @@ def _bdc_mcid(operands: list, resources, fallback):
                 table = source.get("/Properties")
                 if table is None:
                     continue
-                found = table.get(str(props))
+                found = table.get(props)
             except (AttributeError, TypeError):
                 continue
             if found is not None:
@@ -206,7 +245,7 @@ def break_marker_count(operands: list, resources, fallback) -> int:
     Only a replacement text that is NOTHING BUT line breaks counts. An
     /ActualText carrying real replacement characters belongs to whoever wrote
     it, and reading one as a break would rewrite their text."""
-    if len(operands) < 2 or str(operands[0]) != BREAK_MARKER_TAG:
+    if len(operands) < 2 or key_text(operands[0]) != BREAK_MARKER_TAG:
         return 0
     props = operands[1]
     if isinstance(props, pikepdf.Name):
@@ -215,7 +254,7 @@ def break_marker_count(operands: list, resources, fallback) -> int:
                 continue
             try:
                 table = source.get("/Properties")
-                found = None if table is None else table.get(str(props))
+                found = None if table is None else table.get(props)
             except (AttributeError, TypeError):
                 continue
             if found is not None:
@@ -233,8 +272,45 @@ def break_marker_count(operands: list, resources, fallback) -> int:
     return len(text)
 
 
+# Far below any distance a glyph is drawn at, far above the rounding between
+# two sums of the same advances in text-space units.
+_SUM_SLACK = 1e-9
+
+
+def _click_box(operator, operands, cap, state, combined, raw_width, vertical) -> tuple:
+    """The box the user clicks, in device space. Across the writing direction
+    it is the em box on the baseline that `Ts` raises (ISO 32000-2 §9.3.7:
+    rise moves the baseline in either writing mode). Along it, it runs from
+    the pen start to the pen end and covers every glyph the show draws: a TJ
+    number can move the pen back over glyphs already drawn, or behind the
+    start, so neither end of the pen's path bounds the glyphs."""
+    lo, hi = min(0.0, raw_width), max(0.0, raw_width)
+    if cap is not None:
+        glyph_lo, glyph_hi = ink_span(show_items(operator, operands, cap, state))
+        # The glyph span sums per code and the pen path per string, so the
+        # two round apart; only a glyph that leaves the path moves an edge.
+        if glyph_lo < lo - _SUM_SLACK:
+            lo = glyph_lo
+        if glyph_hi > hi + _SUM_SLACK:
+            hi = glyph_hi
+    size = max(state.font_size, 0.01)
+    if vertical:
+        # One em-wide column centred on the pen (the vx = w/2 default); the
+        # span runs DOWNWARD from the pen start.
+        hi = max(hi, lo + 0.01)
+        half = size / 2.0
+        return _bbox_of_corners_under_matrix(combined, -half, state.rise - hi, half, state.rise - lo)
+    lo, hi = sorted((lo * state.h_scale, hi * state.h_scale))
+    hi = max(hi, lo + 0.01)
+    return _bbox_of_corners_under_matrix(combined, lo, state.rise, hi, state.rise + size)
+
+
 def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nested, fonts, parent_state=None, detail=None, stream_path=(), base_clip=None, breaks=None):
-    state = _child_state(base_ctm, parent_state)
+    # Text is read and measured with the font DICTIONARY the text state holds:
+    # the one a `Tf` names here, an ExtGState /Font entry sets, or the
+    # invoking stream's, which a form inherits whatever its own resources call
+    # by the same name (ISO 32000-2 §8.10.1, §9.3.1).
+    state = _child_state(base_ctm, parent_state, lookup=_resource_lookup(resources, fallback))
     # Clip tracking rides ADDITIVELY beside the state machine so a
     # run wholly outside the active clip lists as `clipped` (invisible) and the
     # renderer stops offering it as editable. `base_clip` is the parent stream's
@@ -262,14 +338,14 @@ def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nes
     # (break count, run count at open) per open sequence, parallel to `marks`.
     mark_breaks: list = []
     for instruction in instructions:
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         operands = list(instruction.operands)
         # Fed with the CURRENT ctm BEFORE state.feed (which consumes-and-
         # continues past q/Q/cm) — path-point ops never move the CTM.
         clips.feed(operator, operands, state.ctm)
         if operator in ("BDC", "BMC"):
             marks.append(_bdc_mcid(operands, resources, fallback) if operator == "BDC" else None)
-            mark_tags.append(str(operands[0]) if operands else "")
+            mark_tags.append(key_text(operands[0]) if operands else "")
             # An authored hard break is an EMPTY sequence, so the count is
             # held open and only recorded if no run lands inside it — an
             # /ActualText over real glyphs is replacement text, not a break.
@@ -307,23 +383,15 @@ def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nes
                         state.char_spacing = float(operands[1])
                     except (TypeError, ValueError):
                         pass
-            cap = fonts.capability(resources, fallback, state.font_name)
+            cap = fonts.capability_of(state.font)
             text, raw_width = _run_metrics(operator, operands, cap, state)
             combined = _mat_mult(state.tm, state.ctm)
-            vertical = bool(cap is not None and cap.vertical)
-            if vertical:
-                # v1 rect: a vertical run occupies one em-wide column
-                # centered on the pen (the vx = w/2 default) and spans the
-                # advance sum DOWNWARD from the start point.
-                half = max(state.font_size, 0.01) / 2.0
-                x0, y0, x1, y1 = _bbox_of_corners_under_matrix(
-                    combined, -half, -max(raw_width, 0.01), half, 0.0
-                )
-            else:
-                x0, y0, x1, y1 = _bbox_of_rect_under_matrix(
-                    combined, max(raw_width * state.h_scale, 0.01), max(state.font_size, 0.01)
-                )
-            editable = bool(cap and cap.editable and text.strip())
+            # `writes_vertical`, not `vertical`: a REFUSED Identity-V font
+            # still draws its column downward.
+            vertical = bool(cap is not None and cap.writes_vertical)
+            x0, y0, x1, y1 = _click_box(operator, operands, cap, state, combined, raw_width, vertical)
+            named = _names_its_font(state)
+            editable = bool(cap and cap.editable and text.strip() and named)
             reason = None
             if cap is None:
                 reason = "no font is active for this text"
@@ -331,6 +399,8 @@ def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nes
                 reason = cap.reason
             elif not text.strip():
                 reason = NOTHING_TO_EDIT
+            elif not named:
+                reason = UNNAMED_FONT
             out.append(
                 {
                     "index": len(out),
@@ -350,10 +420,10 @@ def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nes
                     # round-trip — the renderer's longest-match validation
                     # reads these next to `encodable`. [] when none/refused.
                     "sequences": cap.encodable_sequences() if (cap and cap.editable) else [],
-                    # Additive: True when this run's advances/rect
-                    # were computed in vertical-writing mode (the surface
-                    # reads it). A refused vertical font reports False —
-                    # the field describes the geometry actually computed.
+                    # Additive: True when this run's font writes vertically,
+                    # so its advances and rect run down a column (the surface
+                    # reads it). A refused vertical font reports True too:
+                    # the field describes the geometry computed.
                     "vertical": vertical,
                     # Additive: True when the run's bbox is fully
                     # outside the active clip (invisible). The renderer filters
@@ -394,13 +464,17 @@ def _walk_runs(pdf, instructions, resources, base_ctm, depth, fallback, out, nes
                         # can differ from the page's `F1`.
                         "resources": resources,
                         "fallback": fallback,
+                        # The font dictionary itself: what the text state
+                        # holds, whichever of `Tf`, an ExtGState or the
+                        # invoking stream selected it.
+                        "font": state.font,
                     }
                 )
             state.advance_after_show(raw_width, vertical)
         elif operator == "Do":
-            name = str(operands[0]) if operands else None
+            name = key_text(operands[0]) if operands else None
             xobj = _lookup_xobject(name, resources, fallback)
-            subtype = str(xobj.get("/Subtype", "")) if xobj is not None else ""
+            subtype = token_text(xobj.get("/Subtype", "")) if xobj is not None else ""
             if xobj is not None and subtype == "/Form" and depth < MAX_FORM_DEPTH:
                 form_matrix = _as_matrix(xobj.get("/Matrix")) or IDENTITY
                 form_res = xobj.get("/Resources")
@@ -477,9 +551,9 @@ class _TextEditState:
         # rewriter into the CORRECT resources (page, or the form COPY).
         self.pending_font: tuple[str, object] | None = None
         # Original form names superseded by edit copies — _finalize_page_
-        # rewrite drops them when unreferenced (review-measured: without
-        # this every nested edit left the prior copy fully embedded, and a
-        # convert stranded a whole font subset per orphan).
+        # rewrite drops them when unreferenced (without this every nested
+        # edit leaves the prior copy fully embedded, and a convert strands a
+        # whole font subset per orphan).
         self.superseded_forms: set = set()
 
 
@@ -514,16 +588,16 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
     global state across recursion levels would corrupt both the width math
     and the count agreement); applies the edit at the target and Δ-adjusts
     subsequent same-line Td/TD anchors within this stream. `base_ctm` is
-    form-matrix-composed like the lister's — nothing here READS ctm today
-    (all Δ math is text-space; review-verified inert), but a divergent ctm
-    is exactly the latent trap the next rewriter feature would fall into."""
-    gts = _child_state(base_ctm, parent_state)
+    form-matrix-composed like the lister's — nothing here READS ctm (all Δ
+    math is text-space), but a divergent ctm is exactly the latent trap the
+    next rewriter feature would fall into."""
+    gts = _child_state(base_ctm, parent_state, lookup=_resource_lookup(resources, fallback))
     kept: list = []
     changed = False
     new_forms: dict = {}  # copies made at THIS level, for the caller (staging rule)
     adjusting = False  # True after the edit, until a line boundary
     for instruction in instructions:
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         operands = list(instruction.operands)
 
         if adjusting:
@@ -584,7 +658,7 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
                 if operator in ("'", '"'):
                     kept.append(_instruction([], "T*"))
 
-                cap = fonts.capability(resources, fallback, gts.font_name)
+                cap = fonts.capability_of(gts.font)
                 # BOTH paths fail closed on an unusable run font — the
                 # builder path previously skipped the guard, so a direct
                 # convert_text_run call on a refused-font run mixed an
@@ -594,6 +668,8 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
                     raise ValueError("no font is active for this text run")
                 if not cap.editable:
                     raise ValueError(cap.reason or "this text is not editable")
+                if not _names_its_font(gts):
+                    raise ValueError("an edit cannot select this text's font by name")
                 edit.vertical = bool(cap.vertical)
                 if edit.vertical and edit.builder is not None:
                     # The fallback builder embeds a HORIZONTAL
@@ -617,10 +693,8 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
                     eff_size = (
                         edit.style_size if edit.style_size is not None else gts.font_size
                     )
-                    new_raw = (
-                        cap.decoded_width(encoded) / 1000.0 * eff_size
-                        + gts.char_spacing * cap.code_count(encoded)
-                        + gts.word_spacing * _spaces_in(encoded, cap)
+                    new_raw = string_advance(
+                        cap, encoded, eff_size, gts.char_spacing, gts.word_spacing
                     )
                     styled = edit.style_size is not None or edit.style_color is not None
                     if styled:
@@ -634,7 +708,7 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
                         if edit.style_size is not None and gts.font_name:
                             kept.append(
                                 _instruction(
-                                    [Name(gts.font_name), round(float(eff_size), 4)], "Tf"
+                                    [key_name(gts.font_name), round(float(eff_size), 4)], "Tf"
                                 )
                             )
                     kept.append(_instruction([pikepdf.String(encoded)], "Tj"))
@@ -658,17 +732,17 @@ def _rewrite_runs(pdf, instructions, resources, depth, fallback, edit, fonts, co
                         gts.char_spacing = float(operands[1])
                     except (TypeError, ValueError):
                         pass
-            cap = fonts.capability(resources, fallback, gts.font_name)
+            cap = fonts.capability_of(gts.font)
             _text, raw = _run_metrics(operator, operands, cap, gts)
-            gts.advance_after_show(raw, bool(cap is not None and cap.vertical))
+            gts.advance_after_show(raw, bool(cap is not None and cap.writes_vertical))
             kept.append(instruction)
             edit.seen += 1
             continue
 
         if operator == "Do" and not edit.done:
-            name = str(operands[0]) if operands else None
+            name = key_text(operands[0]) if operands else None
             xobj = _lookup_xobject(name, resources, fallback)
-            subtype = str(xobj.get("/Subtype", "")) if xobj is not None else ""
+            subtype = token_text(xobj.get("/Subtype", "")) if xobj is not None else ""
             if xobj is not None and subtype == "/Form" and depth < MAX_FORM_DEPTH:
                 form_res = xobj.get("/Resources")
                 read_res = form_res if form_res is not None else resources
@@ -934,11 +1008,8 @@ def convert_text_run(
             # Pick the fallback FACE matching the run's own
             # font (serif/sans/mono) so a serif document's converted text
             # stays serif. `font_path` is the vendored fonts DIR from the
-            # app; a concrete .ttf (tests) passes through untouched. The
-            # page `resources` back the lookup when a nested form's font
-            # lives there.
-            original = _lookup_font(gts.font_name, stream_resources, resources)
-            face = resolve_fallback_font(font_path, original, text=text)
+            # app; a concrete .ttf (tests) passes through untouched.
+            face = resolve_fallback_font(font_path, gts.font, text=text)
             font_dict, encode, width_1000 = build_fallback_font(pdf_, face, text)
             fname = _fresh_font_name(stream_resources, counter, reserved)
             holder["edit"].pending_font = (fname, font_dict)
@@ -956,7 +1027,7 @@ def convert_text_run(
             if gts.font_name:
                 # Restore the run's original font — subsequent runs must be
                 # byte-untouched by the fallback.
-                instructions.append(_instruction([Name(gts.font_name), gts.font_size], "Tf"))
+                instructions.append(_instruction([key_name(gts.font_name), gts.font_size], "Tf"))
             return instructions, new_raw
 
         edit = _TextEditState(int(index), str(new_text), builder=builder)
@@ -984,7 +1055,7 @@ def convert_text_run(
         if edit.pending_font is not None:
             fname, fdict = edit.pending_font
             if any(
-                str(i.operator) == "Tf" and i.operands and str(i.operands[0]) == fname
+                token_text(i.operator) == "Tf" and i.operands and key_text(i.operands[0]) == fname
                 for i in kept
             ):
                 _register_font(pdf, resources, fname, fdict)

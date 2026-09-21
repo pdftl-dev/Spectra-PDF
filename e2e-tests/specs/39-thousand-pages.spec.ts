@@ -12,12 +12,12 @@ import {
   setReactInputValue,
 } from '../support/harness.js';
 
-// The 1,000-page checkpoint: virtualized window
+// One thousand pages: virtualized window
 // over the existing raster pipeline — smooth scroll, bounded DOM, first
 // paint not held for the tail. Wall-clock numbers vary per box, so the
 // STRUCTURAL claims carry the gate (the render window stays bounded no
 // matter where you are in the document) with generous time caps as the
-// regression tripwire; the measured numbers are recorded in the phase doc.
+// regression tripwire.
 
 async function renderedCellCount(): Promise<number> {
   return (await browser.execute(

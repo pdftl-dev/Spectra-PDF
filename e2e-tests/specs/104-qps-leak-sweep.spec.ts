@@ -36,9 +36,9 @@ const SAMPLE_PDF = resolve(__dirname, '..', 'fixtures', 'sample.pdf');
 //     47 names per locale is 47 chances to be wrong when every locale's ICU
 //     data already spells them.
 //   • Document CONTENT — file names, page labels, signer names, bookmark
-//     titles, and the ENGINE's own refusal text (the slice-D boundary).
+//     titles, and the ENGINE's own refusal text, which passes through verbatim.
 //     None of it is ours to bracket.
-//   • NOTATION: the align/z-order GLYPHS, the find-mode toggles (Aa, \b, .*),
+//   • NOTATION: the align/z-order GLYPHS, the find-mode toggles (Aa, ab, .*),
 //     measure UNIT symbols, PDF blend-mode VALUES, bundled FACE NAMES
 //     (Liberation Sans), format names (PDF/A, XFA, PKCS#11), unit suffixes
 //     (pt, KB, MB), COLOUR VALUES (#ffd54a — a swatch names itself by its
@@ -91,7 +91,7 @@ const notCatalog = (text: string): boolean => {
   const exact = new Set([
     'Spectra PDF',
     'Liberation Sans', 'Liberation Serif', 'Liberation Mono',
-    'Aa', '\\b', '.*', 'A-1',
+    'Aa', 'ab', '.*', 'A-1',
     'Ctrl', 'Esc', 'Tab', 'Alt', 'AV',
     'pt', 'KB', 'MB', '%',
     'PDF', 'PDF/A', 'PDF/X', 'XFA', 'AcroForm', 'OCR', 'ICC', 'CMYK', 'RGB',
@@ -579,7 +579,7 @@ describe('qps pseudo-locale leak sweep', () => {
     );
   });
 
-  // Slice E's own tail: the refusals the RENDERER builds in its leaf libs.
+  // The refusals the RENDERER builds in its leaf libs.
   // They never render as chrome — they arrive as a thrown message — so no
   // container sweep can see them; each is driven to its throw and the
   // MESSAGE is checked for the pseudo-locale marker.

@@ -5,6 +5,7 @@
 import type { Dispatch } from 'react';
 import type { AppAction, AppState } from '../state/types';
 import type { CanvasHandle } from '../canvas/canvas-handle';
+import type { RecentEntry } from '../lib/recent-files';
 
 // Menu-bar namespaces. Every command id must live under one of them —
 // enforced by the `satisfies` check on COMMAND_IDS in registry.ts. The
@@ -42,6 +43,12 @@ export interface AppCommandHandlers {
   /** Open specific path(s) and focus the (last) opened document's tab — the
    * File ▸ Open Recent and Home-tab recent/open flows. */
   openPath(path: string): Promise<void>;
+  /** Open a remembered entry: the web dialog pre-filled for a `sourceUrl`
+   * entry, otherwise the path, followed by the probe that prunes the row only
+   * when the file is positively confirmed gone. The Home row and File ▸ Open
+   * Recent share this one implementation so they cannot disagree about
+   * pruning. */
+  openRecentEntry(entry: RecentEntry): void | Promise<void>;
   /** Open a path (if not already open) and reveal a 1-based page — the
    * cross-file search hit click (part 2). Polls for the doc to index. */
   openPathAtPage(path: string, pageNumber: number): Promise<void>;
@@ -60,7 +67,7 @@ export interface AppCommandHandlers {
   /** Open the Export Pages as Images dialog (image half). */
   openExportImages(): void;
   openExportDocument(format: 'txt' | 'xlsx' | 'pptx'): void;
-  /** Enter full-screen presentation mode on the active document (I.6). */
+  /** Enter full-screen presentation mode on the active document. */
   openPresentation(): void;
   /** Close one open file, with the unsaved-changes prompt. */
   closeFile(path: string): Promise<void>;
@@ -123,7 +130,7 @@ export interface AppCommandHandlers {
   openLicenses(): void;
   /** Open the About dialog (name/version/repo). */
   openAbout(): void;
-  /** Open the Customize Toolbar dialog (I.6 — per-item show/hide). */
+  /** Open the Customize Toolbar dialog (per-item show/hide). */
   openCustomizeToolbar(): void;
   /** Manual update check (Help ▸ Check for Updates) — surfaces the
    * available-flow / up-to-date / enterprise-disabled states on the UpdateBar. */
@@ -384,22 +391,37 @@ export interface CanvasServices {
    * workbook it is given a path for.
    */
   tableReview: {
-    /** Replace the region set from a detection result. */
+    /** Replace the region set from a detection result read from `revision` —
+     * the working copy and buffer the detector was pointed at. Refuses when
+     * that is no longer the document's live revision: a detection published
+     * onto bytes it did not read would describe tables that are not there. */
     publish(
       path: string,
       result: import('../lib/table-review').TableDetectionResult,
+      revision: { workingPath: string; buffer: object },
     ): Promise<{ shown: number; skipped: number }>;
-    /** The live set, pruned to pages that still exist. */
+    /** The live set, pruned to pages that still exist and empty once the
+     * document's bytes have moved from the revision it was read from. */
     list(): import('../lib/table-review').TableRegion[];
+    /** The revision the live set was read from, or null. */
+    session(): import('../lib/table-review').TableReviewSession | null;
+    /** Replace the region set with an edited copy of itself. Refuses a region
+     * the live set does not hold or one from another document. */
     update(next: readonly import('../lib/table-review').TableRegion[]): void;
     clear(): void;
     /** Bring a table's page into view and select its overlay. */
     focus(regionId: string): void;
-    /** Write the accepted tables to `output`. Refuses rather than writing a
-     * workbook whose tables are not the ones that were reviewed. */
+    /** Write the accepted tables to `output`, read from the reviewed
+     * revision's working copy. `request` is what the caller captured before
+     * its own awaits; without one the live set as it stands is the request.
+     * Refuses rather than writing a workbook whose tables, or whose bytes,
+     * are not the ones that were reviewed. */
     exportTo(
       output: string,
       options: { sheetPer: string; includeUntabled: boolean },
+      request?: import('../lib/table-review').TableExportRequest & {
+        assertCurrent?: () => void;
+      },
     ): Promise<import('../lib/export-targets').ExportDocumentResult>;
     subscribe(listener: () => void): () => void;
   };

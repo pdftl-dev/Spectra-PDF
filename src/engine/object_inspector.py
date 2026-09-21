@@ -54,17 +54,26 @@ from .color_spaces import build_resolver
 from .content_walk import (
     ClipTracker,
     DEFAULT_COLOR,
-    GraphicsTextState,
     IDENTITY,
     bbox_of_rect_under_matrix,
     mat_mult,
     transform_point,
 )
-from .flattener import _page_box, _placement, _text_rect, drop_dead_frames
+from .flattener import (
+    _line_width_of,
+    _page_box,
+    _placement,
+    drop_dead_frames,
+    show_rect,
+    text_paint,
+    without,
+)
 from .image_resolution import _measure
+from .pdf_tree import key_text, name_bytes, name_object, name_text, token_text
 from .redact import MAX_FORM_DEPTH, _as_matrix, _lookup_xobject, _resolve_resources
 from .separations import refuse_missing_plates
-from .text_metrics import _FontCache, _run_metrics
+from .text_metrics import _child_state, _FontCache
+from .text_runs import _resource_lookup
 from .validate import validate_pdf
 
 _CONSTRUCT = frozenset({"m", "l", "c", "v", "y", "re", "h"})
@@ -103,8 +112,27 @@ _PLATE_CACHE: dict = {}
 
 
 def _name_text(obj) -> str:
-    text = str(obj)
+    text = name_text(obj)
     return text[1:] if text.startswith("/") else text
+
+
+def _raw_name(obj) -> bytes:
+    """The bytes of a name operand or resource name: a name object, or its
+    text as the shared walker spells a UTF-8 one (solidus optional)."""
+    raw = name_bytes(obj)
+    return raw if raw is not None else _name_text(obj).encode("utf-8")
+
+
+def _resource_entry(resources, category: str, name):
+    """The `category` resource `name` selects, looked up by the name's bytes:
+    a name need not be UTF-8 (ISO 32000-2 §7.3.5), and its text is not its
+    identity."""
+    if resources is None:
+        return None
+    table = resources.get(category)
+    if table is None:
+        return None
+    return table.get(name_object(_raw_name(name)))
 
 
 _DEVICE_SPACES = {
@@ -156,13 +184,10 @@ def _space_record(cs, resources, depth: int = 0) -> dict:
             out["family"] = "Pattern"
             return out
         target = None
-        if resources is not None:
-            try:
-                table = resources.get("/ColorSpace")
-                if table is not None:
-                    target = table.get(pikepdf.Name("/" + name))
-            except (AttributeError, KeyError, TypeError, ValueError):
-                target = None
+        try:
+            target = _resource_entry(resources, "/ColorSpace", cs)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            target = None
         if target is None:
             out["unknown"] = True
             return out
@@ -216,14 +241,11 @@ def _space_record(cs, resources, depth: int = 0) -> dict:
     return out
 
 
-def _pattern_type(name: str, resources) -> int | None:
+def _pattern_type(name, resources) -> int | None:
     if resources is None or not name:
         return None
     try:
-        table = resources.get("/Pattern")
-        if table is None:
-            return None
-        entry = table.get(pikepdf.Name("/" + name))
+        entry = _resource_entry(resources, "/Pattern", name)
         if entry is None:
             return None
         return int(entry.get("/PatternType"))
@@ -293,14 +315,14 @@ def _colour_of(color_state, resources) -> dict:
     except IndexError:
         record["unknown"] = True
         return record
-    name = _name_text(selected)
-    resolved = _space_record(pikepdf.Name("/" + name), resources)
+    selected_name = name_object(_raw_name(selected))
+    resolved = _space_record(selected_name, resources)
     resolved["components"] = components
     if resolved["family"] == "Pattern":
         # An uncoloured pattern's `scn` carries its underlying components
         # BEFORE the pattern name, so the name is the last operand.
         resolved["pattern_type"] = _pattern_type(
-            _name_text(value_op[1][-1]) if value_op is not None and value_op[1] else "",
+            value_op[1][-1] if value_op is not None and value_op[1] else None,
             resources,
         )
         resolved["rgb"] = None
@@ -311,15 +333,12 @@ def _colour_of(color_state, resources) -> dict:
     resolved["rgb"] = None
     if components and not resolved["unknown"]:
         target = selected
-        if resources is not None:
-            try:
-                table = resources.get("/ColorSpace")
-                if table is not None:
-                    found = table.get(pikepdf.Name("/" + name))
-                    if found is not None:
-                        target = found
-            except (AttributeError, KeyError, TypeError, ValueError):
-                target = selected
+        try:
+            found = _resource_entry(resources, "/ColorSpace", selected_name)
+            if found is not None:
+                target = found
+        except (AttributeError, KeyError, TypeError, ValueError):
+            target = selected
         resolved["rgb"] = _swatch(target, components, resources)
     return resolved
 
@@ -429,8 +448,8 @@ class _Walk:
             None,
             None,
             "",
-            DEFAULT_COLOR,
-            DEFAULT_COLOR,
+            None,
+            1.0,
         )
 
     def _emit(self, kind: str, rect, unit, colour: dict, *, nested: bool,
@@ -453,18 +472,21 @@ class _Walk:
         })
 
     def _stream(self, instructions, resources, fallback, base_ctm, depth,
-                base_clip, root_unit, form, base_fill, base_stroke) -> None:
-        state = GraphicsTextState(
-            base_ctm, fill_color=base_fill, stroke_color=base_stroke
-        )
+                base_clip, root_unit, form, parent_state, base_line_width) -> None:
+        # A form runs in the graphics state of the Do that invokes it (ISO
+        # 32000-2 §8.10.1): the font dictionary, the text parameters, the
+        # colours and the line width all carry in.
+        lookup = _resource_lookup(resources, fallback)
+        state = _child_state(base_ctm, parent_state, lookup=lookup)
         clips = ClipTracker(base_clip)
         construct: list[int] = []
         points: list[tuple[float, float]] = []
         has_clip = False
-        line_width = 1.0
+        line_width = base_line_width
         width_stack: list[float] = []
         text_open: int | None = None
         text_rect = None
+        text_shows: list[int] = []
         text_colour: dict | None = None
         nested = depth > 0
 
@@ -477,7 +499,7 @@ class _Walk:
             return tuple(sorted(set(indices)))
 
         for idx, instruction in enumerate(instructions):
-            operator = str(instruction.operator)
+            operator = token_text(instruction.operator)
             operands = list(instruction.operands)
             clips.feed(operator, operands, state.ctm)
             if operator == "q":
@@ -489,16 +511,18 @@ class _Walk:
             # would never see either one and every text block would go
             # unlisted.
             if operator == "BT":
-                text_open, text_rect, text_colour = idx, None, None
+                text_open, text_rect, text_shows, text_colour = idx, None, [], None
             elif operator == "ET" and text_open is not None:
                 if text_rect is not None:
                     self._emit(
-                        "text", text_rect, unit_for(range(text_open, idx + 1)),
+                        "text", text_rect, unit_for(text_shows),
                         text_colour if text_colour is not None
                         else _colour_of(DEFAULT_COLOR, resources),
                         nested=nested, form=form,
                     )
-                text_open, text_rect, text_colour = None, None, None
+                text_open, text_rect, text_shows, text_colour = None, None, [], None
+            if operator == "gs" and operands:
+                line_width = _line_width_of(lookup("/ExtGState", operands[0]), line_width)
             if state.feed(operator, operands):
                 continue
             if operator == "w":
@@ -508,20 +532,16 @@ class _Walk:
                     pass
                 continue
             if operator in _SHOW_OPS:
-                if operator in ("'", '"'):
-                    state.next_line()
-                cap = self.fonts.capability(resources, fallback, state.font_name)
-                _text, raw_width = _run_metrics(operator, operands, cap, state)
-                rect = _text_rect(state, cap, raw_width)
-                text_rect = rect if text_rect is None else _union(text_rect, rect)
-                if text_colour is None:
-                    stroked = state.render_mode in _STROKE_ONLY_TEXT
-                    text_colour = _colour_of(
-                        state.stroke_color if stroked else state.fill_color, resources
-                    )
-                state.advance_after_show(
-                    raw_width, bool(cap is not None and cap.vertical)
-                )
+                rect = show_rect(state, self.fonts, operator, operands, line_width)
+                if text_open is not None:
+                    text_shows.append(idx)
+                    if text_paint(state) and rect is not None:
+                        text_rect = rect if text_rect is None else _union(text_rect, rect)
+                        if text_colour is None:
+                            stroked = state.render_mode in _STROKE_ONLY_TEXT
+                            text_colour = _colour_of(
+                                state.stroke_color if stroked else state.fill_color, resources
+                            )
                 continue
             if operator in _CONSTRUCT:
                 construct.append(idx)
@@ -540,8 +560,8 @@ class _Walk:
                 continue
             if operator == "Do" and operands:
                 self._do(
-                    idx, str(operands[0]), state, clips, resources, fallback,
-                    depth, unit_for, nested, form, root_unit,
+                    idx, key_text(operands[0]), state, clips, resources, fallback,
+                    depth, unit_for, nested, form, root_unit, line_width,
                 )
                 construct, points, has_clip = [], [], False
                 continue
@@ -582,7 +602,7 @@ class _Walk:
         )
 
     def _do(self, idx, name, state, clips, resources, fallback, depth,
-            unit_for, nested, form, root_unit) -> None:
+            unit_for, nested, form, root_unit, line_width) -> None:
         xobj = _lookup_xobject(name, resources, fallback)
         rect, subtype, reason = _placement(xobj, state.ctm)
         if reason:
@@ -637,8 +657,8 @@ class _Walk:
             clips.clip,
             unit if root_unit is None else root_unit,
             form or name,
-            state.fill_color,
-            state.stroke_color,
+            state,
+            line_width,
         )
 
     def _placement_entry(self, xobj, marked, rect, ctm, unit, resources,
@@ -718,10 +738,8 @@ class _Walk:
     def _shading(self, idx, operands, clips, resources, unit_for, nested, form) -> None:
         colour = _empty_space() | {"components": [], "rgb": None}
         if operands:
-            name = _name_text(operands[0])
             try:
-                table = resources.get("/Shading") if resources is not None else None
-                entry = table.get(pikepdf.Name("/" + name)) if table is not None else None
+                entry = _resource_entry(resources, "/Shading", operands[0])
                 if entry is not None:
                     colour = _space_record(entry.get("/ColorSpace"), resources)
                     colour["components"] = []
@@ -826,9 +844,7 @@ def _isolation_pdf(pdf, page, units, wanted, tile, dest: Path) -> None:
     height = max(tile[3] - tile[1], 1e-3)
     for unit in wanted:
         drop = everything - set(unit)
-        kept = drop_dead_frames(
-            [ins for i, ins in enumerate(instructions) if i not in drop]
-        )
+        kept = drop_dead_frames(without(instructions, drop))
         try:
             body = pikepdf.unparse_content_stream(kept)
         except Exception as exc:
@@ -934,6 +950,7 @@ def _plate_arrays(plate_dir: Path, plates: list) -> list:
             str(entry.get("name") or ""),
             str(entry.get("kind") or ""),
             (255.0 - samples) / 255.0,
+            str(entry.get("key") or ""),
         ))
     if len(_PLATE_CACHE) >= _MAX_CACHED_PLATE_SETS:
         _PLATE_CACHE.pop(next(iter(_PLATE_CACHE)))
@@ -998,10 +1015,10 @@ def _ink_at(plate_dir: str, plates: list, x: float, y: float, box,
     column, row = plate_pixel(x, y, box, rotate, width, height)
     values = []
     total = 0.0
-    for name, kind, samples in layers:
+    for name, kind, samples, key in layers:
         pct = float(samples[row, column]) * 100.0
         total += pct
-        values.append({"name": name, "kind": kind, "pct": pct})
+        values.append({"name": name, "key": key, "kind": kind, "pct": pct})
     return {
         "plates": values,
         "total": total,

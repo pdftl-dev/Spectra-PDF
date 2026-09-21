@@ -2,22 +2,34 @@
 per-file isolation, logs — plus the encrypt/decrypt in-place pins the runner
 forced (the same latent CLI bug class fixed for five other ops)."""
 
+import importlib.util
 import inspect
 import json
 import os
 import pathlib
 import re
+import zlib
 from pathlib import Path
 
 import pikepdf
 import pytest
 
+from engine import enhance_scan as enhance_scan_module
+from engine import gs_capability
 from engine.encrypt import decrypt, encrypt
 from engine.extract_text import extract_text
 from engine.guided_actions import (
+    GS_NEVER,
+    GS_OPTIONAL,
+    GS_REQUIRED,
+    GS_UNDECIDED,
     _STEPS,
+    _gs_never,
     action_log_file_name,
+    items_gs_need,
+    plan_gs,
     run_action,
+    step_gs_need,
     validate_steps,
 )
 from engine.inspect import check_encrypted
@@ -90,7 +102,7 @@ class TestValidateSteps:
                     "mrc_pdfa_safe": True,
                     "mrc_bg_div": 3,
                     "mrc_fg_div": 5,
-                    # Slice E — the quality gate is a real switch on every
+                    # The quality gate is a real switch on every
                     # surface `compress` reaches, watched folders and
                     # scheduled runs included.
                     "mrc_verify_text": True,
@@ -646,14 +658,24 @@ class TestCatalogPin:
     against the same file in `tests/guided-actions.test.ts`. A step or a
     parameter added on one side alone therefore goes red on that side rather
     than surfacing as an unknown-op refusal in front of a user (the
-    `enhance_scan` drift this test exists for).
+    `enhance_scan` drift this test exists for). What a step needs from
+    Ghostscript is not in the file: the window and the command line ask the
+    engine's own evaluator through `run_action(plan=True)`.
+    `scripts/gen-guided-step-catalog.py` writes the file.
     """
 
-    FIXTURE = json.loads(
-        (pathlib.Path(__file__).parent / "fixtures" / "guided-step-catalog.json").read_text(
-            encoding="utf-8"
+    FIXTURE_PATH = pathlib.Path(__file__).parent / "fixtures" / "guided-step-catalog.json"
+    GENERATOR = pathlib.Path(__file__).parent.parent / "scripts" / "gen-guided-step-catalog.py"
+    FIXTURE = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
+
+    def test_the_fixture_is_what_the_tracked_generator_writes(self):
+        spec = importlib.util.spec_from_file_location("gen_guided_step_catalog", self.GENERATOR)
+        generator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(generator)
+        assert generator.render() == self.FIXTURE_PATH.read_text(encoding="utf-8"), (
+            "run `.venv/Scripts/python.exe scripts/gen-guided-step-catalog.py` "
+            "and review the diff"
         )
-    )
 
     def test_the_op_names_match_the_fixture_in_both_directions(self):
         assert set(_STEPS) == set(self.FIXTURE["steps"])
@@ -663,13 +685,13 @@ class TestCatalogPin:
             assert sorted(_STEPS[op][1]) == entry["params"], op
 
     def test_every_op_is_callable_with_its_declared_tool_paths(self):
-        # The third element of a row is the tool-path set `_apply_steps`
-        # injects; a name outside the run's own vocabulary would be passed as
-        # an empty string to a keyword the callable does not take.
+        # `tools` is the tool-path set `_apply_steps` injects; a name outside
+        # the run's own vocabulary would be passed as an empty string to a
+        # keyword the callable does not take.
         known = {"gs_path", "tesseract_path", "soffice_path", "font_dir", "jbig2_path"}
-        for op, (fn, _allowed, needed) in _STEPS.items():
-            assert callable(fn), op
-            assert set(needed) <= known, op
+        for op, spec in _STEPS.items():
+            assert callable(spec.fn), op
+            assert set(spec.tools) <= known, op
 
     def test_every_op_declares_every_tool_path_its_callable_takes(self):
         # The totality the fixture cannot state: a tool-path keyword the op
@@ -678,13 +700,19 @@ class TestCatalogPin:
         # instance this pin exists for is the `font_dir` a bare non-WinAnsi
         # widget appearance needs on `compress` and `grayscale`.
         known = {"gs_path", "tesseract_path", "soffice_path", "font_dir", "jbig2_path"}
-        for op, (fn, _allowed, needed) in _STEPS.items():
-            takes = known & set(inspect.signature(fn).parameters)
-            assert takes == set(needed), op
+        for op, spec in _STEPS.items():
+            takes = known & set(inspect.signature(spec.fn).parameters)
+            assert takes == set(spec.tools), op
 
     def test_the_tool_paths_match_the_fixture_in_both_directions(self):
         for op, entry in self.FIXTURE["steps"].items():
             assert sorted(_STEPS[op][2]) == entry["tools"], op
+
+    def test_the_fixture_carries_no_ghostscript_demand(self):
+        # A demand column here would be a second copy of the evaluator's
+        # rules, and one that cannot see a step's parameters or files.
+        for op, entry in self.FIXTURE["steps"].items():
+            assert set(entry) == {"method", "params", "tools"}, op
 
     def test_every_step_method_is_registered_and_binds_the_same_callable(self):
         # The single-document runner sends the fixture's `method` as a JSON-RPC
@@ -706,6 +734,342 @@ class TestCatalogPin:
             # The symbol comparison is only sound while the handler is imported
             # under its own name.
             assert f" as {registered[method]}" not in main_py, op
+
+
+#: One page of PostScript. Create PDF distills it through Ghostscript.
+POSTSCRIPT = (
+    "%!PS-Adobe-3.0\n/Helvetica findfont 24 scalefont setfont\n"
+    "72 720 moveto (page) show\nshowpage\n"
+)
+
+#: The evaluator's test vectors, shared with the command line's own rules.
+VECTORS = json.loads(
+    (pathlib.Path(__file__).parent / "fixtures" / "gs-need-vectors.json").read_text(
+        encoding="utf-8"
+    )
+)["vectors"]
+
+
+class TestGhostscriptNeed:
+    """`step_gs_need` is the one evaluator of what a step needs from
+    Ghostscript. `tests/fixtures/gs-need-vectors.json` holds its vectors, and
+    `src-tauri/src/cli.rs` requires its own rules for the same operations to
+    answer them too."""
+
+    @pytest.mark.parametrize(
+        "vector", VECTORS, ids=[f"{v['op']}-{i}" for i, v in enumerate(VECTORS)]
+    )
+    def test_the_evaluator_answers_every_vector(self, vector):
+        need = step_gs_need(
+            vector["op"],
+            vector["params"],
+            asked=vector.get("asked", ()),
+            sources=vector.get("sources"),
+        )
+        assert need == vector["need"]
+
+    def test_the_vectors_name_every_step_and_every_need(self):
+        assert {v["op"] for v in VECTORS} == set(_STEPS)
+        assert {v["need"] for v in VECTORS} == {
+            GS_NEVER,
+            GS_OPTIONAL,
+            GS_REQUIRED,
+            GS_UNDECIDED,
+        }
+
+    def test_a_step_needs_ghostscript_only_when_it_is_handed_a_path(self):
+        for op, spec in _STEPS.items():
+            assert (spec.gs is _gs_never) == ("gs_path" not in spec.tools), op
+
+    def test_a_run_needs_what_its_rows_need(self):
+        assert items_gs_need([]) == GS_NEVER
+        assert items_gs_need([GS_NEVER, GS_NEVER]) == GS_NEVER
+        assert items_gs_need([GS_REQUIRED, GS_REQUIRED]) == GS_REQUIRED
+        assert items_gs_need([GS_NEVER, GS_REQUIRED]) == GS_OPTIONAL
+        assert items_gs_need([GS_REQUIRED, GS_UNDECIDED]) == GS_UNDECIDED
+
+
+class TestGhostscriptPlan:
+    """`run_action(plan=True)`: what a run needs, before any of it runs. The
+    window and the command line read it to hand a run its Ghostscript."""
+
+    def test_a_plan_names_the_need_of_each_step_and_of_the_run(self):
+        plan = run_action(
+            "",
+            "",
+            [{"op": "optimize"}, {"op": "search_redact", "params": {"query": "x"}}],
+            plan=True,
+        )
+        assert plan == {
+            "gs": GS_OPTIONAL,
+            "steps": [
+                {"op": "optimize", "gs": GS_NEVER},
+                {"op": "search_redact", "gs": GS_OPTIONAL},
+            ],
+        }
+        assert plan_gs([{"op": "optimize"}])["gs"] == GS_NEVER
+        assert plan_gs([])["gs"] == GS_NEVER
+        assert plan_gs([{"op": "search_redact"}, {"op": "compress"}])["gs"] == GS_REQUIRED
+
+    def test_a_value_the_run_collects_later_leaves_the_plan_undecided(self):
+        steps = [{"op": "export_document", "params": {"fmt": "pptx"}, "ask": ["fmt"]}]
+        assert plan_gs(steps)["gs"] == GS_UNDECIDED
+        steps[0]["ask"] = []
+        assert plan_gs(steps)["gs"] == GS_REQUIRED
+        # Without a folder, a source step has no files to decide from.
+        assert plan_gs([{"op": "create_pdf"}])["gs"] == GS_UNDECIDED
+        # The most demanding step decides the run.
+        assert plan_gs([{"op": "create_pdf"}, {"op": "grayscale"}])["gs"] == GS_REQUIRED
+        assert plan_gs([{"op": "create_pdf"}, {"op": "search_redact"}])["gs"] == GS_UNDECIDED
+
+    def test_a_plan_refuses_what_is_not_a_step(self):
+        for steps, message in (
+            ("compress", "no steps"),
+            ([{"op": 7}], "not a step object"),
+            ([{"op": "no_such_step"}], "unknown operation"),
+            ([{"op": "compress", "params": ["quality"]}], "params must be an object"),
+            ([{"op": "compress", "ask": "fmt"}], "not a step object"),
+        ):
+            with pytest.raises(ValueError, match=message):
+                plan_gs(steps)
+
+    def test_a_folder_plan_decides_a_source_step_from_each_file(self, tmp_path):
+        folders = {
+            "postscript": ("a.ps", "b.eps"),
+            "mixed": ("a.ps", "b.pdf"),
+            "plain": ("b.pdf",),
+        }
+        for name, files in folders.items():
+            folder = tmp_path / name
+            folder.mkdir()
+            for file in files:
+                if file.endswith(".pdf"):
+                    _pdf(folder / file)
+                else:
+                    (folder / file).write_text(POSTSCRIPT, encoding="ascii")
+        steps = [{"op": "create_pdf"}]
+        assert run_action(str(tmp_path / "postscript"), "", steps, plan=True)["gs"] == GS_REQUIRED
+        assert run_action(str(tmp_path / "mixed"), "", steps, plan=True)["gs"] == GS_OPTIONAL
+        assert run_action(str(tmp_path / "plain"), "", steps, plan=True)["gs"] == GS_NEVER
+
+    def test_a_folder_plan_groups_the_files_as_the_run_does(self, tmp_path):
+        (tmp_path / "one").mkdir()
+        (tmp_path / "two").mkdir()
+        (tmp_path / "one" / "page2.ps").write_text(POSTSCRIPT, encoding="ascii")
+        _png(tmp_path / "one" / "page1.png")
+        _png(tmp_path / "two" / "page1.png")
+        every = [{"op": "create_pdf_folders", "params": {"sources": "all"}}]
+        images = [{"op": "create_pdf_folders", "params": {"sources": "images"}}]
+        assert run_action(str(tmp_path), "", every, plan=True)["gs"] == GS_OPTIONAL
+        assert run_action(str(tmp_path), "", images, plan=True)["gs"] == GS_NEVER
+        assert run_action(str(tmp_path / "one"), "", every, plan=True)["gs"] == GS_REQUIRED
+
+    def test_a_folder_plan_validates_as_the_run_does_and_writes_nothing(self, tree, tmp_path):
+        with pytest.raises(ValueError, match="name the export format"):
+            run_action(str(tree), "", [{"op": "export_document", "params": {}}], plan=True)
+        with pytest.raises(ValueError, match="Source folder not found"):
+            run_action(str(tmp_path / "missing"), "", [{"op": "optimize"}], plan=True)
+        before = sorted(str(p) for p in tree.rglob("*"))
+        dest, logs = tmp_path / "out", tmp_path / "logs"
+        plan = run_action(
+            str(tree), str(dest), [{"op": "compress"}], log_dir=str(logs), plan=True
+        )
+        assert plan["gs"] == GS_REQUIRED
+        assert not dest.exists() and not logs.exists()
+        assert sorted(str(p) for p in tree.rglob("*")) == before
+
+
+class TestGhostscriptBeforeTheRun:
+    """A run that cannot finish without Ghostscript never starts. A step whose
+    parameters need it, or a folder whose every row needs it, refuses before
+    the first row; a row that alone needs it refuses by name."""
+
+    def test_a_step_that_always_needs_ghostscript_refuses_before_the_first_row(
+        self, tree, tmp_path, gs_absent
+    ):
+        dest = tmp_path / "out"
+        with pytest.raises(gs_capability.GsUnavailable):
+            run_action(
+                str(tree), str(dest), [{"op": "optimize"}, {"op": "grayscale"}], write_log=False
+            )
+        assert not dest.exists()
+
+    def test_a_parameter_that_needs_ghostscript_refuses_before_the_first_row(
+        self, text_tree, tmp_path, gs_absent
+    ):
+        dest = tmp_path / "out"
+        slides = [{"op": "strip_metadata"}, {"op": "export_document", "params": {"fmt": "pptx"}}]
+        with pytest.raises(gs_capability.GsUnavailable):
+            run_action(str(text_tree), str(dest), slides, write_log=False)
+        assert not dest.exists()
+        text = [{"op": "strip_metadata"}, {"op": "export_document", "params": {"fmt": "txt"}}]
+        report = run_action(str(text_tree), str(dest), text, write_log=False)
+        assert (report["ok"], report["failed"]) == (2, 0), report
+
+    def test_a_folder_whose_every_file_needs_ghostscript_refuses_before_it_starts(
+        self, tmp_path, gs_absent
+    ):
+        src = tmp_path / "in"
+        src.mkdir()
+        (src / "a.ps").write_text(POSTSCRIPT, encoding="ascii")
+        (src / "b.eps").write_text(POSTSCRIPT, encoding="ascii")
+        dest = tmp_path / "out"
+        with pytest.raises(gs_capability.GsUnavailable):
+            run_action(str(src), str(dest), [{"op": "create_pdf"}], write_log=False)
+        assert not dest.exists()
+
+    def test_a_file_that_needs_ghostscript_refuses_by_name_and_the_others_run(
+        self, tmp_path, gs_absent
+    ):
+        src = tmp_path / "in"
+        src.mkdir()
+        (src / "a.ps").write_text(POSTSCRIPT, encoding="ascii")
+        _pdf(src / "b.pdf")
+        dest = tmp_path / "out"
+        report = run_action(str(src), str(dest), [{"op": "create_pdf"}], write_log=False)
+        rows = {r["rel"]: r for r in report["results"]}
+        assert rows["b.pdf"]["status"] == "ok"
+        assert rows["a.ps"]["status"] == "error"
+        assert "Ghostscript" in rows["a.ps"]["error"]
+        assert (dest / "b.pdf").is_file()
+        assert not (dest / "a.ps.pdf").exists()
+
+    def test_a_folder_of_folders_is_decided_per_folder(self, tmp_path, gs_absent):
+        root = tmp_path / "in"
+        (root / "one").mkdir(parents=True)
+        (root / "two").mkdir()
+        (root / "one" / "page.ps").write_text(POSTSCRIPT, encoding="ascii")
+        _png(root / "two" / "page.png")
+        steps = [{"op": "create_pdf_folders", "params": {"sources": "all"}}]
+        report = run_action(str(root), str(tmp_path / "out"), steps, write_log=False)
+        rows = {r["rel"]: r for r in report["results"]}
+        assert rows["two.pdf"]["status"] == "ok"
+        assert rows["one.pdf"]["status"] == "error"
+        assert "Ghostscript" in rows["one.pdf"]["error"]
+        with pytest.raises(gs_capability.GsUnavailable):
+            run_action(str(root / "one"), str(tmp_path / "out2"), steps, write_log=False)
+        assert not (tmp_path / "out2").exists()
+
+
+class TestStepsThatRunWithoutGhostscript:
+    """A step whose content decides its need runs with no Ghostscript.
+
+    The window and the command line start such a run without one, so the
+    evaluator's `GS_OPTIONAL` is a promise about the callable. Every step that
+    makes it for its defaults carries a request here over content that needs
+    no Ghostscript, and the input whose content does need one refuses by name
+    while the rest of the run goes on.
+    """
+
+    @staticmethod
+    def _text_pdf(path: Path) -> None:
+        doc = pikepdf.new()
+        page = doc.add_blank_page(page_size=(612, 792))
+        page.Resources = pikepdf.Dictionary(
+            Font=pikepdf.Dictionary(
+                F1=doc.make_indirect(
+                    pikepdf.Dictionary(
+                        Type=pikepdf.Name.Font,
+                        Subtype=pikepdf.Name.Type1,
+                        BaseFont=pikepdf.Name("/Helvetica"),
+                        Encoding=pikepdf.Name.WinAnsiEncoding,
+                    )
+                )
+            )
+        )
+        page.Contents = doc.make_stream(
+            b"BT /F1 18 Tf 40 700 Td (Contact Jane Roe at once) Tj ET "
+            b"BT /F1 18 Tf 40 600 Td (Name: ______________________) Tj ET"
+        )
+        doc.save(path)
+        doc.close()
+
+    @staticmethod
+    def _scan_pdf(path: Path) -> None:
+        """One page covered by a greyscale image this build decodes."""
+        width, height = 850, 1100
+        rows = b"".join(b"\x00" + b"\xf0" * width for _ in range(height))
+        doc = pikepdf.new()
+        page = doc.add_blank_page(page_size=(612, 792))
+        image = doc.make_stream(
+            zlib.compress(rows),
+            Type=pikepdf.Name.XObject,
+            Subtype=pikepdf.Name.Image,
+            Width=width,
+            Height=height,
+            ColorSpace=pikepdf.Name.DeviceGray,
+            BitsPerComponent=8,
+            Filter=pikepdf.Name.FlateDecode,
+            DecodeParms=pikepdf.Dictionary(
+                Predictor=15, Colors=1, BitsPerComponent=8, Columns=width
+            ),
+        )
+        page.Resources = pikepdf.Dictionary(XObject=pikepdf.Dictionary(Im0=image))
+        page.Contents = doc.make_stream(b"q 612 0 0 792 0 0 cm /Im0 Do Q")
+        doc.save(path)
+        doc.close()
+
+    REQUESTS = {
+        "search_redact": ("_text_pdf", {"query": "Jane Roe"}),
+        "ocr_file": ("_text_pdf", {}),
+        "enhance_scan": ("_scan_pdf", {"orientation": False}),
+        "preflight": ("_text_pdf", {"profile": "digital_printing"}),
+        "prepare_forms": ("_text_pdf", {}),
+    }
+
+    def test_every_step_whose_content_decides_runs_without_ghostscript(
+        self, tmp_path, gs_absent
+    ):
+        declared = sorted(op for op in _STEPS if step_gs_need(op) == GS_OPTIONAL)
+        assert declared == sorted(self.REQUESTS)
+        for op in declared:
+            builder, params = self.REQUESTS[op]
+            src = tmp_path / op / "in"
+            src.mkdir(parents=True)
+            getattr(self, builder)(src / "a.pdf")
+            dest = tmp_path / op / "out"
+            report = run_action(
+                str(src), str(dest), [{"op": op, "params": params}], write_log=False
+            )
+            assert (report["ok"], report["failed"]) == (1, 0), (op, report)
+            assert (dest / "a.pdf").is_file(), op
+
+    def test_a_redaction_removes_the_words_without_ghostscript(self, tmp_path, gs_absent):
+        src = tmp_path / "in"
+        src.mkdir()
+        self._text_pdf(src / "a.pdf")
+        dest = tmp_path / "out"
+        steps = [{"op": "search_redact", "params": {"query": "Jane Roe"}}]
+        report = run_action(str(src), str(dest), steps, write_log=False)
+        assert (report["ok"], report["failed"]) == (1, 0), report
+        assert "Jane Roe" not in extract_text(str(dest / "a.pdf"))["text"]
+
+    def test_the_input_that_needs_ghostscript_refuses_by_name(
+        self, tmp_path, gs_absent, monkeypatch
+    ):
+        # A codestream this build cannot decode is rendered through
+        # Ghostscript instead; only the file that carries one needs it.
+        lift = enhance_scan_module._lift
+
+        def undecodable_in_b(pdf, page, candidate):
+            if Path(pdf.filename).name == "b.pdf":
+                return None, "/JPXDecode"
+            return lift(pdf, page, candidate)
+
+        monkeypatch.setattr(enhance_scan_module, "_lift", undecodable_in_b)
+        src = tmp_path / "in"
+        src.mkdir()
+        self._scan_pdf(src / "a.pdf")
+        self._scan_pdf(src / "b.pdf")
+        dest = tmp_path / "out"
+        steps = [{"op": "enhance_scan", "params": {"orientation": False}}]
+        report = run_action(str(src), str(dest), steps, write_log=False)
+        rows = {r["rel"]: r for r in report["results"]}
+        assert rows["a.pdf"]["status"] == "ok"
+        assert rows["b.pdf"]["status"] == "error"
+        assert "Ghostscript" in rows["b.pdf"]["error"]
+        assert (dest / "a.pdf").is_file()
+        assert not (dest / "b.pdf").exists()
 
 
 class TestFolderGroupingSource:

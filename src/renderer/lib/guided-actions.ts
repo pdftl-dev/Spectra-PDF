@@ -5,7 +5,7 @@
 //
 // An action is a named, ordered list of steps; every step is an EXISTING
 // gated engine op with a compact param form. The runner (the panel) drives
-// each step through the standard snapshot → call → reload shape, so a run is
+// each step through private staging and validated publication, so a run is
 // undoable step-by-step and stops on the first failure. Deliberately NO new
 // engine surface: the catalog is a curation over ops that already ship.
 
@@ -24,7 +24,7 @@ import { pagesParam } from './page-scope';
 // on a non-text source means or about a horizontal stamp sending no key.
 import { writingParams, type WatermarkSource } from './watermark-writing';
 
-// Slice 2 grew the catalog: OCR (the batch pipeline's single-file arm),
+// The catalog includes OCR (the batch pipeline's single-file arm),
 // header/footer (one positioned text per step — several positions compose as
 // several steps), and ENCRYPT as a TERMINAL step that writes a NEW picked
 // file (an in-place encrypt would make the open working copy unreadable,
@@ -95,8 +95,6 @@ export interface StepDef {
    * step ids to `run_action`, whose `_STEPS` table binds the callables
    * itself. Absent means the step id IS the method name. */
   engineMethod?: string;
-  /** The step's engine call takes gs_path (the panel resolves it once per run). */
-  needsGs?: boolean;
   /** The step's engine call takes font_dir (Unicode text faces). */
   needsFontDir?: boolean;
   /** The step's engine call takes tesseract_path (OCR). */
@@ -134,7 +132,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
   {
     op: 'compress',
     title: 'Compress',
-    needsGs: true,
     needsFontDir: true,
     // The MRC arm an imported action file can select routes through this same
     // op and verifies its text with the recognizer. The folder tier hands the
@@ -204,14 +201,12 @@ export const STEP_CATALOG: readonly StepDef[] = [
   {
     op: 'grayscale',
     title: 'Convert to Grayscale',
-    needsGs: true,
     needsFontDir: true,
     params: [],
   },
   {
     op: 'convert_pdfa',
     title: 'Convert to PDF/A',
-    needsGs: true,
     params: [
       {
         key: 'level',
@@ -237,7 +232,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     title: 'Bring Up to a Print Profile',
     // `preflight` as a method is the CHECK, which takes no `output`.
     engineMethod: 'apply_preflight_fixups',
-    needsGs: true,
     needsFontDir: true,
     needsTesseract: true,
     params: [
@@ -462,7 +456,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     op: 'prepare_forms',
     title: 'Prepare Forms (detect fields)',
     engineMethod: 'prepare_form_fields',
-    needsGs: true,
     needsTesseract: true,
     needsFontDir: true,
     params: [
@@ -605,7 +598,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
   {
     op: 'ocr_file',
     title: 'Make Searchable (OCR)',
-    needsGs: true,
     needsTesseract: true,
     // The MRC tail prepares its source the way the Ghostscript-backed ops
     // prepare theirs, so an /AP-less field is not left to the producer.
@@ -628,7 +620,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     // to look at a measurement first.
     op: 'enhance_scan',
     title: 'Enhance Scans',
-    needsGs: true,
     needsTesseract: true,
     params: [
       {
@@ -810,7 +801,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     op: 'export_document',
     title: 'Export to a document format',
     terminalOutput: true,
-    needsGs: true,
     needsSoffice: true,
     params: [
       {
@@ -903,7 +893,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     op: 'export_images',
     title: 'Export the pages as images',
     terminalOutput: true,
-    needsGs: true,
     params: [
       {
         key: 'fmt',
@@ -958,7 +947,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     op: 'create_pdf',
     title: 'Create PDF from any file',
     sourceStep: true,
-    needsGs: true,
     needsSoffice: true,
     params: [
       {
@@ -1024,7 +1012,6 @@ export const STEP_CATALOG: readonly StepDef[] = [
     op: 'create_pdf_folders',
     title: 'Create one PDF per folder',
     sourceStep: true,
-    needsGs: true,
     needsSoffice: true,
     params: [
       {
@@ -1350,33 +1337,97 @@ export function openDocumentBlocker(action: GuidedAction): string | null {
 }
 
 /**
- * The steps in this action that need Ghostscript — the PLAN-time answer.
- *
- * A saved action is a promise about a whole sequence, so a run that dies at
- * step four because the fourth step needed an interpreter has already
- * rewritten the document three times. The registry's own `needsGs` flags are
- * the roster, so a new gs-bearing step cannot ship without an answer here.
+ * What a step, or a whole run, needs from Ghostscript. The engine's one
+ * evaluator (`engine/guided_actions.py::step_gs_need`) answers it through
+ * `run_action(plan=True)`, and the command line asks the same plan, so no
+ * rule about which step needs Ghostscript is written here.
  */
-export function gsBlockedSteps(action: GuidedAction): GuidedStepOp[] {
+export type GsNeed = 'never' | 'optional' | 'required' | 'undecided';
+
+/** The engine's plan: the run's need and each step's, in step order. */
+export interface GsPlan {
+  gs: GsNeed;
+  steps: { op: GuidedStepOp; gs: GsNeed }[];
+}
+
+/** The collected ask-at-run values, by step index. */
+export type StepValues = Record<number, Record<string, string | number>>;
+
+/** Sends one `run_action` request to the engine and returns its answer. */
+export type PlanRequest = (params: Record<string, unknown>) => Promise<unknown>;
+
+/**
+ * The steps a plan is asked about. Before a run collects its values, the keys
+ * it will ask travel as `ask`, and a need they decide stays undecided; with
+ * the collected `values`, every value is known.
+ */
+export function planSteps(action: GuidedAction, values?: StepValues): Record<string, unknown>[] {
+  return action.steps.map((step, i) =>
+    values === undefined
+      ? { op: step.op, params: buildStepParams(step), ask: askedParamKeys(step) }
+      : { op: step.op, params: buildStepParams(step, values[i]) },
+  );
+}
+
+/**
+ * The engine's plan for a run of `action`. Over a picked `source` folder the
+ * engine walks it, so a step that converts files is decided from the files.
+ */
+export async function planAction(
+  request: PlanRequest,
+  action: GuidedAction,
+  values?: StepValues,
+  source = '',
+): Promise<GsPlan> {
+  const plan = await request({ source, dest: '', steps: planSteps(action, values), plan: true });
+  return plan as GsPlan;
+}
+
+/** The steps a plan says cannot run without Ghostscript, once each, in order. */
+export function gsRequiredSteps(plan: GsPlan): GuidedStepOp[] {
   const blocked: GuidedStepOp[] = [];
-  for (const step of action.steps) {
-    if (stepDefFor(step.op).needsGs && !blocked.includes(step.op)) blocked.push(step.op);
+  for (const step of plan.steps) {
+    if (step.gs === 'required' && !blocked.includes(step.op)) blocked.push(step.op);
   }
   return blocked;
 }
 
-/** Why this action cannot run without a Ghostscript, or null when it can.
+/**
+ * Why a planned run cannot start without Ghostscript, or null when it can.
+ *
+ * A saved action is a promise about a whole sequence, so a run that dies at
+ * step four because the fourth step needed an interpreter has already
+ * rewritten the document three times: the answer is taken from the plan.
  * `available` is the capability answer; the caller holds it so this stays
- * synchronous and testable. */
-export function gsBlocker(action: GuidedAction, available: boolean): string | null {
-  if (available) return null;
-  const blocked = gsBlockedSteps(action);
-  if (blocked.length === 0) return null;
+ * synchronous and testable. A plan not answered yet blocks nothing here; the
+ * run asks again before it starts.
+ */
+export function gsBlocker(plan: GsPlan | null, available: boolean): string | null {
+  if (available || plan === null || plan.gs !== 'required') return null;
+  const blocked = gsRequiredSteps(plan);
   const steps = blocked.map((op) => tStepTitle(op, stepDefFor(op).title)).join(', ');
   return tChrome(
     blocked.length === 1 ? 'refusal.action.needsGhostscriptOne' : 'refusal.action.needsGhostscript',
     { steps },
   );
+}
+
+/** How a run finds Ghostscript: the refusing lookup and the one that
+ * answers '' when none is configured. */
+export interface GsLookup {
+  require: () => Promise<string>;
+  ifAvailable: () => Promise<string>;
+}
+
+/**
+ * The gs_path a planned need hands the engine, or undefined for work that
+ * never reaches Ghostscript. A required need takes the refusing lookup; any
+ * other takes what is usable, and the engine refuses by name the one input
+ * whose content needs a Ghostscript it was not given.
+ */
+export async function gsPathFor(need: GsNeed, lookup: GsLookup): Promise<string | undefined> {
+  if (need === 'never') return undefined;
+  return need === 'required' ? lookup.require() : lookup.ifAvailable();
 }
 
 /** Why this action cannot REPLACE the originals, or null. Mirrors the

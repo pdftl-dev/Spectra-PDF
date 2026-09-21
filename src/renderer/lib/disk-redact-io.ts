@@ -8,10 +8,11 @@
 // persisted record the canvas band and the Search & Redact panel already
 // share, so a code chosen on either of them is on the folder run too.
 import { batch } from './tauri-bridge';
+import { gsPathIfAvailable } from './gs-capability';
 import { loadRedactionProperties, propertiesPayload } from './redaction-properties';
 import type { DiskRedactIo, RedactRegion } from './disk-redact';
 import type { SearchRequest } from './search-redact';
-import type { SignaturePolicy } from './signatures';
+import { parseSignaturePolicy } from './signatures';
 
 export function createDiskRedactIo(
   callRaw: (method: string, params: Record<string, unknown>) => Promise<unknown>,
@@ -33,7 +34,7 @@ export function createDiskRedactIo(
       })) as Awaited<ReturnType<DiskRedactIo['search']>>;
     },
     async signaturePolicy(abs) {
-      return (await callRaw('signature_policy', { path: abs })) as SignaturePolicy;
+      return parseSignaturePolicy(await callRaw('signature_policy', { path: abs }));
     },
     async write(abs, output, regions: RedactRegion[], marksOnly) {
       const properties = propertiesPayload(loadRedactionProperties());
@@ -44,8 +45,16 @@ export function createDiskRedactIo(
       }
       // The font-measured redactor is the only apply path, and the font
       // directory is what lets a non-Latin-1 overlay embed rather than draw
-      // question marks over a redaction code.
-      await callRaw('redact', { file: abs, output, regions: payload, font_dir: fontDir });
+      // question marks over a redaction code. Ghostscript decodes a JBIG2
+      // scan the mark covers only part of; without one, that file refuses by
+      // name and the rest of the run goes on.
+      await callRaw('redact', {
+        file: abs,
+        output,
+        regions: payload,
+        font_dir: fontDir,
+        gs_path: await gsPathIfAvailable(),
+      });
     },
     copyFile: (src, dest) => batch.copyFile(src, dest),
     ensureParentDirs: (path) => batch.ensureParentDirs(path),

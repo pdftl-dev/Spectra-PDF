@@ -436,7 +436,7 @@ def test_no_leftover_temporaries_beside_the_output(tmp_dir):
 
 
 # --------------------------------------------------------------------------
-# Slice C — the door.
+# The door.
 # --------------------------------------------------------------------------
 
 PS_BODY = (
@@ -627,7 +627,7 @@ class TestPerMemberPageRanges:
 
 class TestFormsSurviveTheAssembly:
     def test_a_form_member_keeps_its_fields_through_a_mixed_build(self, tmp_dir):
-        # The risk the brief names for this slice: assembly MUST route through
+        # The risk: assembly MUST route through
         # the shipped merge machinery. A bare `pages.extend` imports the widget
         # objects but not their field registration, silently killing the form.
         form = FIXTURES / "form-pdflib.pdf"

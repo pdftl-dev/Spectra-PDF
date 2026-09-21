@@ -69,6 +69,7 @@ from engine.text_match import (
 )
 from engine.text_metrics import (
     _FontCache,
+    ink_span,
     measurable,
     show_items_from_segments,
     wide_width_from_segments,
@@ -180,6 +181,7 @@ def _collect_runs(pdf, page) -> tuple[list[_Run], list[dict]]:
             font_size=style["size"],
             h_scale=style["h_scale"],
             font_name=style["font_name"],
+            font=det["font"],
         )
         state.char_spacing = style["char_spacing"]
         state.word_spacing = style["word_spacing"]
@@ -189,21 +191,20 @@ def _collect_runs(pdf, page) -> tuple[list[_Run], list[dict]]:
         items = (
             show_items_from_segments(det["segments"], cap, state) if measured else []
         )
-        # `writes_vertical`, not the listing's `vertical`: a REFUSED
-        # Identity-V font still draws its column downward, and a refused font
-        # is precisely the unmeasurable case. Slice A's rule, one module over.
+        # `writes_vertical`: a REFUSED Identity-V font still draws its column
+        # downward, and a refused font is precisely the unmeasurable case.
         vertical = bool(cap is not None and cap.writes_vertical)
-        ink = fonts.ink_extent(det["resources"], det["fallback"], style["font_name"])
+        ink = fonts.ink_extent_of(det["font"])
         combined = det["combined"]
         raw_width = (
             det["raw_width"]
             if measured
             else wide_width_from_segments(det["segments"], cap, state)
         )
-        full_rect = [
-            float(v)
-            for v in _span_bbox(combined, 0.0, max(raw_width, 0.01), vertical, state, ink)
-        ]
+        # The glyphs' own span: a TJ number can move the pen back over glyphs
+        # already drawn, past which the net advance ends.
+        lo, hi = ink_span(items) if measured else (0.0, raw_width)
+        full_rect = [float(v) for v in _span_bbox(combined, lo, hi, vertical, state, ink)]
         dx, dy = _unit_vector(combined, vertical)
         _a, _b, _c, _d, e, f = combined
         along0 = e * dx + f * dy
@@ -454,15 +455,16 @@ def _rects_for_span(
 
 
 def _slice_rect(run: _Run, first: int, last: int) -> list[float]:
-    """The device rect of codes [first…last] of a run — the per-code advance
-    slice, given the font's own ink extent above and below the baseline."""
+    """The device rect of codes [first…last] of a run — each code's own
+    advance box, `Tc` and `Tw` left out, given the font's own ink extent above
+    and below the baseline."""
     xs: list[float] = []
     for index in range(first, min(last, len(run.items) - 1) + 1):
         item = run.items[index]
         if item.kern:
             continue
         xs.append(item.x)
-        xs.append(item.x + item.advance)
+        xs.append(item.x + item.width)
     if not xs:
         return list(run.full_rect)
     x0, x1 = min(xs), max(xs)

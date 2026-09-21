@@ -62,6 +62,7 @@ from engine import printer_marks as printer_marks_mod
 from engine import pubkey_crypt as pubkey_crypt_mod
 from engine import redact as redact_mod
 from engine import redact_marks as redact_marks_mod
+from engine import reversion as reversion_mod
 from engine import rotate as rotate_mod
 from engine import pdfa as pdfa_mod
 from engine import search_redact as search_redact_mod
@@ -1065,6 +1066,14 @@ def _transplant_onto_the_original(src: str, out: str) -> dict:
 
 
 CASES = (
+    Case(
+        "reversion",
+        reversion_mod,
+        _blank,
+        lambda src, out: reversion_mod.set_pdf_version(src, out, "2.0"),
+        lambda path: reversion_mod.get_pdf_version(path)["version"],
+        doors=("set_pdf_version",),
+    ),
     Case(
         "ocr_layer",
         ocr_layer_mod,
@@ -2102,6 +2111,11 @@ from inplace_doors import registered_doors, same_path_capable  # noqa: E402
 #: Doors whose output is genuinely never the document they were handed. Each
 #: says why in its own terms; "no case yet" is never one of these.
 EXCLUDED_DOORS = {
+    "split": (
+        "refuses exact and filesystem-alias source destinations in every "
+        "publication mode; tests/test_split_publication.py pins unchanged "
+        "source bytes for exact paths and hardlinks"
+    ),
     "create_pdf": (
         "builds a NEW document out of non-PDF sources, so no argument of it "
         "names a document the output could overwrite"
@@ -2155,7 +2169,7 @@ WALK_DOORS = {
 
 #: Doors that DO accept writing over their input and have no case here yet —
 #: a recorded gap, not a disposition. Each would say what a case for it
-#: needs, so the next lane could pick one up; the guard fails if one is added
+#: needs; the guard fails if one is added
 #: and left uncased, or if one is cased and left behind. It is empty: every
 #: door the engine stages for is cased here, cased in the `finish_staged`
 #: family, walked (above), or excluded (below).
@@ -2287,6 +2301,7 @@ class TestTheGuardWouldHaveCaughtIt:
     @pytest.mark.parametrize(
         "case_name, door",
         [
+            ("reversion", "set_pdf_version"),
             ("struct_fix", "set_table_headers"),
             ("portfolio_make", "make_portfolio"),
             ("portfolio_update_member", "update_portfolio_member"),

@@ -20,7 +20,7 @@ import {
 // https://example.com/spec and editor@example.org.
 const FIXTURE = resolve(__dirname, '..', 'fixtures', 'derived-nav.pdf');
 
-// P29 — navigation DERIVED from the document's own content, end to end
+// Navigation DERIVED from the document's own content, end to end
 // through the real binary: bookmarks from the structure tree, links from the
 // addresses in the text, and an article thread authored and persisted.
 
@@ -52,7 +52,12 @@ describe('derived navigation', () => {
     // The document starts with no bookmarks at all.
     expect(await getOutlineOrder()).toEqual([]);
 
-    await $('[data-testid="bookmarks-from-structure"]').click();
+    const deriveButton = $('[data-testid="bookmarks-from-structure"]');
+    await browser.waitUntil(() => deriveButton.isEnabled(), {
+      timeout: 20_000,
+      timeoutMsg: 'bookmark editing did not become ready',
+    });
+    await deriveButton.click();
     const state = await $('[data-testid="bookmarks-derive-state"]');
     await state.waitForDisplayed({ timeoutMsg: 'the structure preview did not appear' });
     // Counted BEFORE anything is written — the hairlines contract.

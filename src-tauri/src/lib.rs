@@ -6,6 +6,12 @@ mod print_to_pdf;
 mod scheduler;
 mod send_to;
 mod snapshot;
+mod page_commit;
+mod file_publication;
+mod folder_claims;
+mod process_job;
+mod scratch;
+mod staging;
 mod watchers;
 mod web_capture;
 pub mod engine;
@@ -13,6 +19,7 @@ pub mod health_engine;
 pub mod net;
 pub mod gs;
 mod printers;
+pub mod scan_host;
 pub mod scanner;
 pub mod scantest;
 pub mod app_windows;
@@ -111,8 +118,10 @@ pub fn run() {
         .manage(tabdrag::StripRegistry::new())
         .manage(session::SessionState::new())
         .manage(session::QuitAcks::new())
+        .manage(page_commit::PageCommitState::default())
         .manage(scanner::ScannerSessions::new())
         .manage(commands::StartupEntryNotice::new())
+        .manage(commands::UnreadableRecords::new())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -184,6 +193,9 @@ pub fn run() {
 
             commands::create_working_copy,
             commands::snapshot,
+            page_commit::publish_page_commit,
+            page_commit::abort_page_commit,
+            page_commit::acknowledge_page_commit,
             commands::restore_snapshot,
             commands::save_as,
             commands::get_gs_path,
@@ -203,10 +215,9 @@ pub fn run() {
             scanner::scan_cancel,
             scanner::scan_discard,
             commands::canonicalize_paths,
+            commands::classify_recent_paths,
             commands::portfolio_member_dir,
             commands::open_portfolio_member_file,
-            commands::get_bundled_gs_info,
-            commands::detect_external_gs,
             commands::gs_capability,
             commands::refresh_gs_capability,
             commands::get_app_version,
@@ -246,6 +257,7 @@ pub fn run() {
             commands::get_startup_enabled,
             commands::set_startup_enabled,
             commands::startup_entry_notice,
+            commands::take_unreadable_records,
             commands::set_start_minimized,
             commands::set_restore_windows_on_launch,
             commands::confirm_close,
@@ -258,8 +270,8 @@ pub fn run() {
             app_windows::open_new_window,
             app_windows::claim_document,
             app_windows::release_document,
-            app_windows::claim_output_root,
-            app_windows::release_output_root,
+            app_windows::claim_output_roots,
+            app_windows::release_output_roots,
             app_windows::focus_app_window,
             app_windows::take_pending_opens,
             app_windows::register_web_origin,
@@ -284,6 +296,10 @@ pub fn run() {
             portable::record_icc_assent,
         ])
         .setup(move |app| {
+            // Off the main thread: the tree can hold thousands of folders,
+            // and nothing here waits on the pass.
+            std::thread::spawn(scratch::reclaim_at_startup);
+
             // The battery's fallback spec launches with
             // SPECTRAPDF_E2E_FORCE_OPAQUE=1 so the opaque presentation runs
             // live on a machine where Mica would compose (spec 94; the RDP/
@@ -296,18 +312,18 @@ pub fn run() {
             commands::refresh_startup_entry_at_launch(&app.handle().clone());
 
             let args: Vec<String> = std::env::args().collect();
+            let startup = commands::load_startup_config(app.handle());
             // Under end-to-end control the window is force-shown below, so the
             // preference must not decide anything about visibility here.
-            let start_minimized = !e2e
-                && (args.iter().any(|a| a == "--minimized")
-                    || commands::read_start_minimized(&*app));
+            let start_minimized =
+                !e2e && (args.iter().any(|a| a == "--minimized") || startup.start_minimized);
 
             // The main window's geometry comes back on every launch — it
             // belongs to the window, not to the session — while the documents
             // and the second window wait on the preference.
             session::apply_launch(
                 &app.handle().clone(),
-                commands::read_restore_windows_on_launch(&*app),
+                startup.restore_windows_on_launch,
                 e2e,
                 !start_minimized,
             );
@@ -471,6 +487,9 @@ pub fn run() {
                 tauri::async_runtime::block_on(async move {
                     health_engine::kill(&app).await;
                 });
+                // The scanner host holds device locks, so it is ended here
+                // rather than left to the job object that backstops a crash.
+                scan_host::shutdown();
             }
         });
 }
@@ -478,6 +497,46 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{backdrop_supported, wants_backdrop};
+
+    /// The setup cannot run without a window system, so the call is pinned in
+    /// the setup's source: removing it leaves every killed session's working
+    /// copies and network scratch in the temp tree for good.
+    #[test]
+    fn every_launch_reclaims_the_temp_tree_off_the_main_thread() {
+        let source = include_str!("lib.rs");
+        let start = source.find(".setup(move |app| {").expect("the setup");
+        let length = source[start..]
+            .find(".on_window_event(")
+            .expect("the window events");
+        let setup = &source[start..start + length];
+        assert!(setup.contains("std::thread::spawn(scratch::reclaim_at_startup);"));
+    }
+
+    /// An unregistered command fails only in the renderer, and the launch read
+    /// there swallows the failure: the unreadable-record notice never shows.
+    /// An unmanaged state panics the setup that reads the records.
+    #[test]
+    fn the_run_claim_and_unreadable_record_commands_are_wired() {
+        let source = include_str!("lib.rs");
+        let start = source.find("generate_handler![").expect("the handler list");
+        let length = source[start..]
+            .find("])")
+            .expect("the end of the handler list");
+        let handlers = &source[start..start + length];
+        for command in [
+            "commands::take_unreadable_records,",
+            "app_windows::claim_output_roots,",
+            "app_windows::release_output_roots,",
+        ] {
+            assert!(handlers.contains(command), "{command} is not registered");
+        }
+        let start = source
+            .find("let mut builder = tauri::Builder::default()")
+            .expect("the builder");
+        let length = source[start..].find(".plugin(").expect("the first plugin");
+        let builder = &source[start..start + length];
+        assert!(builder.contains(".manage(commands::UnreadableRecords::new())"));
+    }
 
     #[test]
     fn backdrop_gate_is_the_win11_floor() {

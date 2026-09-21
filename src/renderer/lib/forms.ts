@@ -10,6 +10,7 @@
 import type { EngineCall } from './engine-call';
 import { narrowActions, type ActionTrigger, type WidgetAction } from './field-actions';
 import type { FieldLock } from './signatures';
+import { tChrome } from '../i18n';
 
 export type FormFieldType =
   | 'text'
@@ -116,7 +117,7 @@ export interface FormReadResult {
   hasXFA: boolean;
   xfa: XFAKind;
   /** The XML template authors its own calculations, which are not run here. */
-  xfaCalculations: boolean;
+  xfaCalculations: boolean | null;
   /** The document's declared calculation order, as fully-qualified names.
    * Empty means calculations do not run at all — the format puts the order
    * here, and inventing one would compute a number no other viewer computes. */
@@ -178,7 +179,7 @@ function lockOfEngineField(raw: EngineField['lock']): FieldLock | null {
 interface EngineReadResult {
   has_xfa?: boolean;
   xfa?: string;
-  xfa_calculations?: boolean;
+  xfa_calculations?: boolean | null;
   fields?: EngineField[];
   calculation_order?: string[];
 }
@@ -272,8 +273,9 @@ export function mapEngineField(ef: EngineField): FormField | null {
 // WORKING copy, whose bytes always equal the in-memory buffer the canvas
 // renders from (page-tier edits touch neither until commit), so fields read
 // here stay consistent with geometry resolved from that buffer's pdf.js proxy.
-export async function readFormFields(call: EngineCall, path: string): Promise<FormReadResult> {
+export async function readFormFields(call: EngineCall, path: string, requireComplete = false): Promise<FormReadResult> {
   const res = (await call('read_form_fields', { file: path })) as unknown as EngineReadResult;
+  if (requireComplete && !completeFillRead(res)) throw new Error(tChrome('panel.forms.fillUnverified'));
   const xfa: XFAKind =
     res.xfa === 'static' || res.xfa === 'dynamic' ? res.xfa : 'none';
   const fields: FormField[] = [];
@@ -291,7 +293,29 @@ export async function readFormFields(call: EngineCall, path: string): Promise<Fo
     fields,
     hasXFA: Boolean(res.has_xfa),
     xfa,
-    xfaCalculations: Boolean(res.xfa_calculations),
+    xfaCalculations: res.xfa_calculations === null ? null : res.xfa_calculations === true,
     calculationOrder: (res.calculation_order ?? []).map((n) => String(n)),
   };
+}
+
+// Passive displays retain their tolerant mapping. A mutation's fingerprints
+// and calculation consent cannot be derived from a partial/malformed reply.
+function completeFillRead(value: unknown): boolean {
+  const record = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
+  const strings = (v: unknown): v is string[] => Array.isArray(v) && v.every(x => typeof x === 'string');
+  if (!record(value) || !Array.isArray(value.fields) || value.count !== value.fields.length
+      || !strings(value.calculation_order) || typeof value.has_xfa !== 'boolean'
+      || !['none', 'static', 'dynamic'].includes(value.xfa as string)
+      || (value.xfa_calculations !== null && typeof value.xfa_calculations !== 'boolean')) return false;
+  const names = new Set<string>();
+  return value.fields.every(f => {
+    if (!record(f) || typeof f.name !== 'string' || names.has(f.name) || typeof f.type !== 'string'
+        || typeof f.read_only !== 'boolean' || typeof f.required !== 'boolean' || !Array.isArray(f.widgets)
+        || f.options !== undefined && !strings(f.options)
+        || f.multiline !== undefined && typeof f.multiline !== 'boolean'
+        || f.actions !== undefined && (!record(f.actions) || Object.values(f.actions).some(x => typeof x !== 'string'))) return false;
+    names.add(f.name);
+    return f.widgets.every(w => record(w) && (w.page === null || Number.isSafeInteger(w.page) && (w.page as number) >= 0)
+      && Array.isArray(w.rect) && w.rect.length === 4 && w.rect.every(n => typeof n === 'number' && Number.isFinite(n)));
+  });
 }

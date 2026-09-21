@@ -1,22 +1,24 @@
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import { PDFDocument, PDFName, PDFString } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFNull, PDFNumber, PDFString } from 'pdf-lib';
 import * as pdfjs from 'pdfjs-dist/legacy/build/pdf.mjs';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import {
   planCommit,
   buildCommitBytes,
   commitPageEdits,
+  committedDocuments,
   carriesLiveSignature,
 } from '../src/renderer/lib/workspace-commit';
 import { rotateAnnotationRect } from '../src/renderer/state/reducer';
+import type { PageCommitEntry } from '../src/renderer/lib/page-commit-transaction';
 import { readManifest } from '../src/renderer/lib/pdfx-format';
 import { carriesManifest } from '../src/renderer/lib/doc-names';
 import { readRawAnnotationStyles } from '../src/renderer/lib/annotation-raw-style';
 import { importPageAnnotations } from '../src/renderer/lib/annotation-import';
 import { legendText } from '../src/renderer/lib/count-marks';
-import type { AppAction, OpenDocument, OpenFile, PageRef, Workspace } from '../src/renderer/state/types';
+import type { AppAction, OpenDocument, OpenFile, PageEditSnapshot, PageRef, Workspace } from '../src/renderer/state/types';
 
 const require = createRequire(import.meta.url);
 pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(
@@ -53,6 +55,21 @@ async function withLiveSignature(bytes: Uint8Array, filled = true): Promise<Uint
   });
   const acro = ctx.obj({ Fields: [ctx.register(field)], SigFlags: 3 });
   doc.catalog.set(PDFName.of('AcroForm'), ctx.register(acro));
+  return doc.save();
+}
+
+// An outline root whose only item carries no /Title — a tree the catalog
+// carry cannot prove, so this file's rebuild refuses.
+async function withUnprovableOutline(bytes: Uint8Array): Promise<Uint8Array> {
+  const doc = await PDFDocument.load(bytes);
+  const ctx = doc.context;
+  const root = ctx.obj({ Type: 'Outlines' });
+  const rootRef = ctx.register(root);
+  const itemRef = ctx.register(ctx.obj({ Parent: rootRef }));
+  root.set(PDFName.of('First'), itemRef);
+  root.set(PDFName.of('Last'), itemRef);
+  root.set(PDFName.of('Count'), PDFNumber.of(1));
+  doc.catalog.set(PDFName.of('Outlines'), rootRef);
   return doc.save();
 }
 
@@ -177,6 +194,106 @@ describe('planCommit', () => {
       documents: [makeDoc('a#0', a, 'a', [pageRef('a.pdf', 0)])],
     };
     expect(planCommit(workspace, files, [])).toEqual([]);
+  });
+});
+
+describe('committedDocuments', () => {
+  it('reads every page from the new bytes at its written position, across partitions', async () => {
+    const { files } = await setup();
+    const a = files.get('a.pdf')!;
+    const docs = [
+      makeDoc('a#0', a, 'Front', [pageRef('a.pdf', 2), { ...pageRef('b.pdf', 1), width: 30, height: 40 }]),
+      makeDoc('a#1', a, 'Back', [{ ...pageRef('a.pdf', 0, 270), width: 10, height: 20 }]),
+    ];
+    const buffer = new Uint8Array([9]);
+    const committed = committedDocuments(docs, buffer);
+    expect(committed.map((d) => [d.id, d.name, d.path, d.buffer, d.pageCount, d.provisional])).toEqual([
+      ['a#0', 'Front', 'a.pdf', buffer, 2, true],
+      ['a#1', 'Back', 'a.pdf', buffer, 1, true],
+    ]);
+    expect(committed.flatMap((d) => d.pages)).toEqual([
+      { id: 'a.pdf#p2', sourceDocId: 'a.pdf', sourcePageIndex: 0, rotation: 0, width: 0, height: 0 },
+      // A page moved in from another file is this file's page now.
+      { id: 'b.pdf#p1', sourceDocId: 'a.pdf', sourcePageIndex: 1, rotation: 0, width: 30, height: 40 },
+      // The written quarter turn swaps the viewport size.
+      { id: 'a.pdf#p0', sourceDocId: 'a.pdf', sourcePageIndex: 2, rotation: 0, width: 20, height: 10 },
+    ]);
+  });
+
+  it('keeps the size for a half turn', async () => {
+    const { files } = await setup();
+    const a = files.get('a.pdf')!;
+    const [doc] = committedDocuments(
+      [makeDoc('a#0', a, 'a', [{ ...pageRef('a.pdf', 0, 180), width: 10, height: 20 }])],
+      new Uint8Array([9]),
+    );
+    expect([doc.pages[0].width, doc.pages[0].height]).toEqual([10, 20]);
+  });
+
+  it('bakes every annotation and drops the fingerprints of the originals the commit replaced', async () => {
+    const { files } = await setup();
+    const a = files.get('a.pdf')!;
+    const fingerprint = { subtype: 'Square' as const, rect: [1, 2, 3, 4] as [number, number, number, number], color: '#ff0000', hasAppearance: true };
+    const page = {
+      ...pageRef('a.pdf', 0),
+      annotations: [
+        { id: 'new', kind: 'note' as const, x: 0.1, y: 0.1, w: 0.1, h: 0.1, color: '#ffd54a', note: 'n' },
+        { id: 'old', kind: 'shape' as const, shapeType: 'rect' as const, x: 0.2, y: 0.2, w: 0.1, h: 0.1, color: '#ff0000',
+          importedOriginal: fingerprint, geometryDiverged: true },
+      ],
+      removedImportedOriginals: [fingerprint],
+    };
+    const [doc] = committedDocuments([makeDoc('a#0', a, 'a', [page])], new Uint8Array([9]));
+    expect(doc.pages[0].removedImportedOriginals).toBeUndefined();
+    expect(doc.pages[0].annotations).toEqual([
+      { id: 'new', kind: 'note', x: 0.1, y: 0.1, w: 0.1, h: 0.1, color: '#ffd54a', note: 'n', baked: true },
+      { id: 'old', kind: 'shape', shapeType: 'rect', x: 0.2, y: 0.2, w: 0.1, h: 0.1, color: '#ff0000', baked: true },
+    ]);
+    // The planned documents are not touched.
+    expect(page.annotations[1].importedOriginal).toBe(fingerprint);
+  });
+});
+
+describe('a baked annotation', () => {
+  it('is not authored again: the copied page carries it', async () => {
+    const { files } = await setup();
+    const a = files.get('a.pdf')!;
+    const note = { id: 'n1', kind: 'highlight' as const, x: 0.1, y: 0.2, w: 0.3, h: 0.15, color: '#ffd54a', note: 'once' };
+    const first = { documents: [makeDoc('a#0', a, 'a', [{ ...pageRef('a.pdf', 0), annotations: [note] }])] };
+    const [plan] = planCommit(first, files, ['a.pdf']);
+    const bytes = await buildCommitBytes(plan);
+    // A second commit from the documents the first one composed, one more
+    // annotation added, the page turned.
+    const composed = committedDocuments(first.documents, bytes);
+    const added = { ...note, id: 'n2', note: 'twice' };
+    const second = {
+      documents: [{
+        ...composed[0],
+        pages: [{ ...composed[0].pages[0], rotation: 90 as const, annotations: [...composed[0].pages[0].annotations!, added] }],
+      }],
+    };
+    const nextFiles = new Map(files).set('a.pdf', { ...a, buffer: bytes, pageCount: 1 });
+    const [again] = planCommit(second, nextFiles, ['a.pdf']);
+    expect(again.documents[0].pages[0].annotations?.map((x) => x.note)).toEqual(['twice']);
+    const pdf = await loadPdf(await buildCommitBytes(again));
+    const annots = (await (await pdf.getPage(1)).getAnnotations()) as { subtype: string; contentsObj?: { str: string } }[];
+    expect(annots.map((x) => [x.subtype, x.contentsObj?.str])).toEqual([
+      ['Highlight', 'once'],
+      ['Highlight', 'twice'],
+    ]);
+    await pdf.loadingTask.destroy();
+  });
+
+  it('leaves a page with only baked annotations with nothing to author', async () => {
+    const { files } = await setup();
+    const a = files.get('a.pdf')!;
+    const baked = { id: 'n1', kind: 'note' as const, x: 0.1, y: 0.1, w: 0.1, h: 0.1, color: '#ffd54a', baked: true as const };
+    const [plan] = planCommit(
+      { documents: [makeDoc('a#0', a, 'a', [{ ...pageRef('a.pdf', 0), annotations: [baked] }])] },
+      files,
+      ['a.pdf'],
+    );
+    expect(plan.documents[0].pages[0].annotations).toBeUndefined();
   });
 });
 
@@ -470,23 +587,37 @@ describe('commitPageEdits (transactional)', () => {
 
   function makeDeps(fs: FakeFs, opts: { failWriteAt?: number } = {}) {
     let writeCount = 0;
+    const originals = new Map<string, Uint8Array | undefined>();
+    const planned = { pageUndoStack: [], pageRedoStack: [] };
     return {
+      tier: { planned, current: () => planned },
       dispatch: (action: AppAction) => fs.dispatched.push(action),
-      snapshot: async (workingPath: string) => {
-        fs.snapshots.push(workingPath);
-        return `${workingPath}.snap`;
+      transaction: {
+        publish: async (_id: string, entries: PageCommitEntry[]) => {
+          for (const entry of entries) {
+            fs.snapshots.push(entry.workingPath);
+            originals.set(entry.workingPath, fs.contents.get(entry.workingPath));
+          }
+          for (const entry of entries) {
+            fs.renames.push([entry.stagedPath, entry.workingPath]);
+            fs.contents.set(entry.workingPath, fs.contents.get(entry.stagedPath)!);
+            fs.contents.delete(entry.stagedPath);
+          }
+          return { status: 'committed', snapshots: entries.map(e => `${e.workingPath}.snap`), detail: '' };
+        },
+        abort: async () => {
+          for (const [path, bytes] of originals) {
+            if (bytes) fs.contents.set(path, bytes); else fs.contents.delete(path);
+          }
+          return { status: 'rolledBack', snapshots: [], detail: '' };
+        },
+        acknowledge: async () => {},
       },
       writeBuffer: async (filePath: string, bytes: Uint8Array) => {
         writeCount++;
         if (opts.failWriteAt === writeCount) throw new Error('disk full');
         fs.writes.push(filePath);
         fs.contents.set(filePath, bytes);
-      },
-      rename: async (fromPath: string, toPath: string) => {
-        fs.renames.push([fromPath, toPath]);
-        const bytes = fs.contents.get(fromPath);
-        if (bytes) fs.contents.set(toPath, bytes);
-        fs.contents.delete(fromPath);
       },
       remove: async (filePath: string) => {
         fs.removed.push(filePath);
@@ -526,20 +657,20 @@ describe('commitPageEdits (transactional)', () => {
     };
   }
 
-  const TMP = /\.commit-tmp-\d+$/;
+  const TMP = /\.commit-tmp-[\da-f-]{36}$/;
 
   it('stages all temps, then snapshots+renames, then dispatches one atomic update', async () => {
     const { files, workspace, dirtyPaths } = await crossFileState();
     const fs = emptyFs();
     await commitPageEdits({ workspace, files, dirtyPaths, ...makeDeps(fs) });
     expect(fs.writes).toHaveLength(2);
-    expect(fs.writes[0]).toMatch(/^a\.pdf\.working\.commit-tmp-\d+$/);
-    expect(fs.writes[1]).toMatch(/^b\.pdf\.working\.commit-tmp-\d+$/);
+    expect(fs.writes[0]).toMatch(/^a\.pdf\.working\.commit-tmp-[\da-f-]{36}$/);
+    expect(fs.writes[1]).toMatch(/^b\.pdf\.working\.commit-tmp-[\da-f-]{36}$/);
     expect(fs.renames).toEqual([
       [fs.writes[0], 'a.pdf.working'],
       [fs.writes[1], 'b.pdf.working'],
     ]);
-    expect(fs.removed).toEqual([]);
+    expect(fs.removed).toEqual(fs.writes); // successful publication also retires its private stages
     expect(fs.dispatched).toHaveLength(1);
     const action = fs.dispatched[0];
     expect(action.type).toBe('COMMIT_PAGE_EDITS');
@@ -549,6 +680,13 @@ describe('commitPageEdits (transactional)', () => {
         ['b.pdf', 3],
       ]);
       expect(action.updates.every((u) => u.snapshotPath.endsWith('.snap'))).toBe(true);
+      // Each update carries the documents its own bytes hold.
+      for (const u of action.updates) {
+        expect(u.documents).toEqual(
+          committedDocuments(workspace.documents.filter((d) => d.path === u.path), u.buffer),
+        );
+        expect(u.documents.every((d) => d.buffer === u.buffer)).toBe(true);
+      }
     }
   });
 
@@ -562,7 +700,7 @@ describe('commitPageEdits (transactional)', () => {
     expect(fs.renames).toEqual([]);
     expect(fs.snapshots).toEqual([]);
     expect(fs.dispatched).toEqual([]);
-    expect(fs.removed).toHaveLength(1);
+    expect(fs.removed).toHaveLength(2); // includes a possibly partial failed write
     expect(fs.removed[0]).toMatch(TMP);
 
     // Retry from the same (unchanged) state: byte-identical plans succeed.
@@ -580,6 +718,35 @@ describe('commitPageEdits (transactional)', () => {
     }
   });
 
+  it('names the file whose build refused, and stages nothing', async () => {
+    const aBytes = await makeSourcePdf(2, 100);
+    const bBytes = await withUnprovableOutline(await makeSourcePdf(2, 200));
+    const aPath = 'docs/reports/a.pdf';
+    const bPath = 'docs\\reports\\b.pdf';
+    const files = new Map<string, OpenFile>([
+      [aPath, makeFile(aPath, 'a.pdf', aBytes, 2)],
+      [bPath, makeFile(bPath, 'b.pdf', bBytes, 2)],
+    ]);
+    const workspace: Workspace = {
+      documents: [
+        makeDoc('a#0', files.get(aPath)!, 'a', [pageRef(aPath, 1), pageRef(aPath, 0)]),
+        makeDoc('b#0', files.get(bPath)!, 'b', [pageRef(bPath, 1)]),
+      ],
+    };
+    const fs = emptyFs();
+    // The whole dirty set builds together: the refusal has to say which
+    // document refused, or the user is told a save failed and nothing else.
+    await expect(
+      commitPageEdits({ workspace, files, dirtyPaths: [aPath, bPath], ...makeDeps(fs) }),
+    ).rejects.toThrow(/^b\.pdf: .+/);
+    expect(fs.writes).toEqual([]);
+    expect(fs.renames).toEqual([]);
+    expect(fs.snapshots).toEqual([]);
+    expect(fs.removed).toEqual([]);
+    expect(fs.dispatched).toEqual([]);
+    expect(fs.contents.size).toBe(0);
+  });
+
   it('uses distinct temp names across runs so leftovers can never be renamed in', async () => {
     const { files, workspace, dirtyPaths } = await crossFileState();
     const first = emptyFs();
@@ -587,6 +754,46 @@ describe('commitPageEdits (transactional)', () => {
     await commitPageEdits({ workspace, files, dirtyPaths, ...makeDeps(first) });
     await commitPageEdits({ workspace, files, dirtyPaths, ...makeDeps(second) });
     expect(first.writes[0]).not.toBe(second.writes[0]);
+  });
+
+  // The landing replays edits made during the build onto the committed
+  // composition; it can only do that while the live stacks still show which
+  // entries the plan held.
+  describe('edits made while the commit is built and published', () => {
+    const entry = (): PageEditSnapshot => ({
+      documents: [], dirtyPaths: [], action: { type: 'REMOVE_DOC', docId: 'x' },
+    });
+
+    it('publishes, naming the planned stacks, when the live stacks only grew', async () => {
+      const { files, workspace, dirtyPaths } = await crossFileState();
+      const fs = emptyFs();
+      const planned = { pageUndoStack: [entry()], pageRedoStack: [] };
+      await commitPageEdits({
+        workspace, files, dirtyPaths, ...makeDeps(fs),
+        tier: {
+          planned,
+          current: () => ({ pageUndoStack: [...planned.pageUndoStack, entry()], pageRedoStack: [] }),
+        },
+      });
+      expect(fs.dispatched).toHaveLength(1);
+      const action = fs.dispatched[0];
+      expect(action.type === 'COMMIT_PAGE_EDITS' && action.planned).toBe(planned);
+    });
+
+    it('refuses publication, rolling the files back, when the stacks no longer show what the plan held', async () => {
+      const { files, workspace, dirtyPaths } = await crossFileState();
+      const fs = emptyFs();
+      fs.contents.set('a.pdf.working', new Uint8Array([1]));
+      fs.contents.set('b.pdf.working', new Uint8Array([2]));
+      const planned = { pageUndoStack: [entry()], pageRedoStack: [] };
+      await expect(commitPageEdits({
+        workspace, files, dirtyPaths, ...makeDeps(fs),
+        tier: { planned, current: () => ({ pageUndoStack: [], pageRedoStack: [entry()] }) },
+      })).rejects.toThrow('The document or history changed. Try again.');
+      expect(fs.dispatched).toEqual([]);
+      expect(fs.contents.get('a.pdf.working')).toEqual(new Uint8Array([1]));
+      expect(fs.contents.get('b.pdf.working')).toEqual(new Uint8Array([2]));
+    });
   });
 
   it('rejects concurrent entry loudly instead of corrupting the staged files', async () => {
@@ -705,26 +912,40 @@ describe('commitPageEdits (transactional)', () => {
 
     const TRANSPLANTED = new Uint8Array([9, 9, 9, 9]);
 
-    it('an engine exception on a SIGNED file is reported, not swallowed', async () => {
+    it.each([
+      { applied: false, blocked: true, reason: 'signature-policy-unreadable' },
+      { applied: false, reason: 'signature-policy-unreadable' },
+      { applied: true, blocked: true },
+      { applied: 'false', reason: 'not-signed' },
+      { applied: false },
+    ])('never publishes an unreadable or malformed preservation result %#', async (result) => {
       const { files, workspace, dirtyPaths } = await signedState();
       const fs = emptyFs();
-      const outcome = await commitPageEdits({
+      let reads = 0;
+      await expect(commitPageEdits({
+        workspace, files, dirtyPaths, ...makeDeps(fs),
+        preserveSignatures: async () => result as never,
+        readBack: async () => { reads++; return TRANSPLANTED; },
+      })).rejects.toThrow('signature policy could not be read');
+      expect(reads).toBe(0);
+      expect(fs.renames).toHaveLength(0);
+      expect(fs.dispatched).toHaveLength(0);
+      expect(fs.removed).toEqual(fs.writes);
+    });
+
+    it('an engine exception cannot authorize rewriting a SIGNED file', async () => {
+      const { files, workspace, dirtyPaths } = await signedState();
+      const fs = emptyFs();
+      await expect(commitPageEdits({
         workspace, files, dirtyPaths, ...makeDeps(fs),
         // a.pdf carries a live signature; b.pdf does not.
         preserveSignatures: async () => {
           throw new Error('engine unavailable');
         },
         readBack: async () => TRANSPLANTED,
-      });
-      expect(outcome.signatureRefusals).toEqual([
-        {
-          path: 'a.pdf',
-          reason: { key: 'app.preserve.unrecognized', detail: 'engine unavailable' },
-        },
-      ]);
-      // …and the rewrite still landed, which is what the notice reports on.
-      expect(fs.dispatched).toHaveLength(1);
-      expectBufferMatchesDisk(fs);
+      })).rejects.toThrow('signature policy could not be read');
+      expect(fs.renames).toHaveLength(0);
+      expect(fs.dispatched).toHaveLength(0);
     });
 
     it('an engine exception on an unsigned file reports no lost signature', async () => {
@@ -745,11 +966,11 @@ describe('commitPageEdits (transactional)', () => {
     // answer, so the transplanted file is what the rename publishes — a
     // commit that dispatched the rewrite bytes would leave the state buffer
     // describing a file that no longer exists.
-    it('a transplant that landed but could not be answered for does not desync the buffer', async () => {
+    it('a lost transplant response leaves the working files and state untouched', async () => {
       const { files, workspace, dirtyPaths } = await signedState();
       const fs = emptyFs();
       const deps = makeDeps(fs);
-      const outcome = await commitPageEdits({
+      await expect(commitPageEdits({
         workspace, files, dirtyPaths, ...deps,
         preserveSignatures: async (_workingPath, stagedPath) => {
           // the engine's own stage-and-swap: the temp already holds the
@@ -758,14 +979,9 @@ describe('commitPageEdits (transactional)', () => {
           throw new Error('engine exited');
         },
         readBack: async (filePath: string) => fs.contents.get(filePath)!,
-      });
-      expectBufferMatchesDisk(fs);
-      expect(outcome.signatureRefusals).toEqual([
-        {
-          path: 'a.pdf',
-          reason: { key: 'app.preserve.unrecognized', detail: 'engine exited' },
-        },
-      ]);
+      })).rejects.toThrow('signature policy could not be read');
+      expect(fs.renames).toHaveLength(0);
+      expect(fs.dispatched).toHaveLength(0);
     });
 
     // The read-back failure: the transplant APPLIED, so the temp holds the
@@ -829,13 +1045,13 @@ describe('commitPageEdits (transactional)', () => {
     // The identity channel is a property of the PLAN, not of how the bytes
     // landed: the append path rewrites the staged temp in place, so the
     // old→new mapping dispatched with COMMIT_PAGE_EDITS is the same one the
-    // rewrite publishes whether the transplant applied, refused, or threw.
+    // rewrite publishes whether the transplant applied or mechanically refused.
+    // An unassessed signed-file policy now aborts instead of publishing.
     // A mapping published on only one of those paths would leave a
     // page-tree edit that landed incrementally with stale positional ids.
     it.each([
       ['applied', async () => ({ applied: true as const })],
       ['refused', async () => ({ applied: false as const, reason: 'catalog-changed' })],
-      ['threw', async () => { throw new Error('engine unavailable'); }],
     ])('publishes the authored mapping when the transplant %s', async (_label, preserveSignatures) => {
       const { files, workspace, dirtyPaths } = await signedState();
       const plans = planCommit(workspace, files, dirtyPaths);
@@ -935,6 +1151,47 @@ describe('commitPageEdits (transactional)', () => {
 });
 
 describe('carriesLiveSignature', () => {
+  it.each(['unknown-type', 'missing-type', 'empty-kids', 'bad-kids', 'bad-field', 'bad-acro', 'perms'])(
+    'does not prove unsignedness from malformed or uncertified policy structure: %s', async (shape) => {
+    const doc = await PDFDocument.load(await makeSourcePdf(1, 100));
+    const ctx = doc.context;
+    const field = ctx.obj({ FT: 'Sig' });
+    if (shape === 'unknown-type') field.set(PDFName.of('FT'), PDFName.of('Unknown'));
+    if (shape === 'missing-type' || shape === 'empty-kids') field.delete(PDFName.of('FT'));
+    if (shape === 'empty-kids') field.set(PDFName.of('Kids'), ctx.obj([]));
+    if (shape === 'bad-kids') field.set(PDFName.of('Kids'), ctx.obj(42));
+    const acro = ctx.obj({ Fields: [shape === 'bad-field' ? ctx.obj(42) : ctx.register(field)] });
+    doc.catalog.set(PDFName.of('AcroForm'), shape === 'bad-acro' ? ctx.obj(42) : ctx.register(acro));
+    if (shape === 'perms') doc.catalog.set(PDFName.of('Perms'), ctx.obj({}));
+    expect(await carriesLiveSignature(await doc.save())).toBe(true);
+  });
+
+  it.each([1, 2])('finds a signed terminal field owning %i separate widgets', async (count) => {
+    const doc = await PDFDocument.load(await makeSourcePdf(1, 100));
+    const ctx = doc.context;
+    const field = ctx.obj({
+      T: PDFString.of('approval'), V: ctx.register(ctx.obj({ Type: 'Sig' })),
+    });
+    const fieldRef = ctx.register(field);
+    const widgets = Array.from({ length: count }, () => ctx.register(ctx.obj({
+      Type: 'Annot', Subtype: 'Widget', Parent: fieldRef, Rect: [0, 0, 50, 20],
+    })));
+    field.set(PDFName.of('Kids'), ctx.obj(widgets));
+    // The inherited type is itself indirect; the dictionary reader must
+    // resolve it before classifying the value-owning field.
+    const root = ctx.obj({ FT: ctx.register(PDFName.of('Sig')), Kids: [fieldRef] });
+    doc.catalog.set(PDFName.of('AcroForm'), ctx.register(ctx.obj({ Fields: [ctx.register(root)] })));
+    expect(await carriesLiveSignature(await doc.save())).toBe(true);
+  });
+
+  it('does not mistake a null signature value plus widgets for a signed field', async () => {
+    const doc = await PDFDocument.load(await makeSourcePdf(1, 100));
+    const ctx = doc.context;
+    const field = ctx.obj({ FT: 'Sig', V: PDFNull, Kids: [ctx.register(ctx.obj({ Subtype: 'Widget' }))] });
+    doc.catalog.set(PDFName.of('AcroForm'), ctx.register(ctx.obj({ Fields: [ctx.register(field)] })));
+    expect(await carriesLiveSignature(await doc.save())).toBe(false);
+  });
+
   it('is false for a document with no form at all', async () => {
     expect(await carriesLiveSignature(await makeSourcePdf(1, 100))).toBe(false);
   });

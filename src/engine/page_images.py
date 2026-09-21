@@ -1,4 +1,4 @@
-"""Page-image editing (the first Edit slice).
+"""Page-image editing.
 
 Lists, deletes, replaces, and extracts IMAGE XObject placements on a page.
 A "placement" is one `Do` draw of an image — the unit the user clicks. Ids
@@ -16,8 +16,8 @@ Edit semantics are strictly PER-PLACEMENT:
   - replace registers the new image under a NEW name and renames only that
     `Do` — other placements of the original keep the original. The
     placement CTM is preserved exactly: the new image draws into the old
-    box (a different aspect ratio stretches; that is the documented v1
-    behavior, matching the phase doc's "reuse the original placement CTM").
+    box (a different aspect ratio stretches: the replacement reuses the
+    original placement CTM).
   - a placement INSIDE a Form XObject is edited on a COPY of that form
     (registered under a fresh name, only that draw's `Do` rewritten) — the
     `_redact_form` copy-on-edit pattern — so a form stamped on ten pages
@@ -41,10 +41,8 @@ the unit square under the live CTM. REPLACE and EXTRACT refuse inline
 targets with named reasons (delete + add covers the workflow; the bytes
 live in the stream, so a deleted inline draw needs no GC).
 
-Text-run editing will consolidate this walker and redact.py's into
-one shared interpreter; for this slice the graphics-state tracking is
-deliberately duplicated (~40 lines, helpers imported) rather than churning
-the security-critical redactor.
+The graphics-state tracking here duplicates redact.py's (~40 lines,
+helpers imported) rather than sharing the security-critical redactor's walk.
 """
 
 import os
@@ -70,6 +68,7 @@ from engine.redact import (
     _mat_mult,
     _resolve_resources,
 )
+from engine.pdf_tree import key_text, token_text
 
 # ── listing ───────────────────────────────────────────────────────────────
 
@@ -96,10 +95,10 @@ def _recognized_frames(instructions, t, enclosing):
     frames = []
     lo, hi = t, t  # input-index span of the current inner unit
     for a in reversed(enclosing):
-        prefix = tuple(str(instructions[k].operator) for k in range(a + 1, lo))
+        prefix = tuple(token_text(instructions[k].operator) for k in range(a + 1, lo))
         kind = _WRAP_SHAPES.get(prefix)
         b = hi + 1
-        if kind is None or b >= len(instructions) or str(instructions[b].operator) != "Q":
+        if kind is None or b >= len(instructions) or token_text(instructions[b].operator) != "Q":
             break
         frame = {"kind": kind, "open": a, "close": b}
         if kind == "crop":
@@ -159,16 +158,16 @@ def _image_facts(obj) -> dict:
         declared = obj.get("/Filter")
         if declared is not None:
             entries = declared if isinstance(declared, pikepdf.Array) else [declared]
-            filters = [str(entry) for entry in entries]
+            filters = [token_text(entry) for entry in entries]
     except Exception:
         filters = []
     family = ""
     try:
         cs = obj.get("/ColorSpace")
         if isinstance(cs, (pikepdf.Name, str)):
-            family = str(cs).lstrip("/")
+            family = token_text(cs).lstrip("/")
         elif isinstance(cs, pikepdf.Array) and len(cs) > 0:
-            family = str(cs[0]).lstrip("/")
+            family = token_text(cs[0]).lstrip("/")
     except Exception:
         family = ""
     return {"bpc": bpc, "filters": filters, "colour_family": family}
@@ -213,7 +212,7 @@ def _walk_placements(
     gs_stack: list[tuple[float, str, dict | None]] = []
     q_open: list[int] = []
     for idx, instruction in enumerate(instructions):
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         operands = list(instruction.operands)
         # Fed with the CURRENT ctm BEFORE state.feed (which consumes q/Q/cm).
         clips.feed(operator, operands, state.ctm)
@@ -227,15 +226,15 @@ def _walk_placements(
             if q_open:
                 q_open.pop()
         elif operator == "gs" and operands:
-            gs_name = str(operands[0])
+            gs_name = key_text(operands[0])
             for res in (resources, fallback_resources):
                 if res is None:
                     continue
                 try:
                     egs = res.get("/ExtGState")
-                    if egs is None or Name(gs_name) not in egs:
+                    if egs is None or gs_name not in egs:
                         continue
-                    entry = egs[Name(gs_name)]
+                    entry = egs[gs_name]
                     ca = entry.get("/ca")
                     if ca is not None:
                         alpha = max(0.0, min(1.0, float(ca)))
@@ -244,7 +243,7 @@ def _walk_placements(
                         # /BM may be a name or an array of names (first wins).
                         try:
                             bm_name = (
-                                str(bm[0]) if isinstance(bm, pikepdf.Array) else str(bm)
+                                token_text(bm[0]) if isinstance(bm, pikepdf.Array) else token_text(bm)
                             )
                         except (IndexError, TypeError):
                             bm_name = ""
@@ -298,9 +297,9 @@ def _walk_placements(
             )
             continue
         if operator == "Do":
-            name = str(operands[0]) if operands else None
+            name = key_text(operands[0]) if operands else None
             xobj = _lookup_xobject(name, resources, fallback_resources)
-            subtype = str(xobj.get("/Subtype", "")) if xobj is not None else ""
+            subtype = token_text(xobj.get("/Subtype", "")) if xobj is not None else ""
             vector_marker = (
                 xobj.get("/SpectraVector") if xobj is not None and subtype == "/Form" else None
             )
@@ -832,7 +831,7 @@ def _collapse_opacity_frames(kept, instructions, t, open_q, skip_q, resources, f
         if frame["kind"] != "opacity":
             continue
         try:
-            name = str(instructions[frame["open"] + 1].operands[0])
+            name = key_text(instructions[frame["open"] + 1].operands[0])
         except (IndexError, TypeError):
             break
         gs_state = _tool_gs_state(name, resources, fallback_resources)
@@ -873,7 +872,7 @@ def _rewrite(pdf, instructions, resources, depth, fallback_resources, state, nam
     open_q: list[tuple[int, int]] = []  # (input index, kept index) of open q's
     skip_q: set[int] = set()  # input indices of dropped crop frames' closing Q's
     for i, instruction in enumerate(instructions):
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         if operator == "q":
             kept.append(instruction)
             open_q.append((i, len(kept) - 1))
@@ -933,9 +932,9 @@ def _rewrite(pdf, instructions, resources, depth, fallback_resources, state, nam
         if operator != "Do" or state.done:
             kept.append(instruction)
             continue
-        name = str(operands[0]) if operands else None
+        name = key_text(operands[0]) if operands else None
         xobj = _lookup_xobject(name, resources, fallback_resources)
-        subtype = str(xobj.get("/Subtype", "")) if xobj is not None else ""
+        subtype = token_text(xobj.get("/Subtype", "")) if xobj is not None else ""
         # Marked vector-graphic forms are LEAF placements — they
         # occupy a counted ordinal slot exactly as the lister counts them
         # (walker agreement), take every wrap-family edit, and are never
@@ -1140,8 +1139,8 @@ def _sweep_orphan_edit_gs(content_source, resources) -> None:
     def collect_stream(obj):
         try:
             for ins in pikepdf.parse_content_stream(obj):
-                if str(ins.operator) == "gs" and ins.operands:
-                    used.add(str(ins.operands[0]))
+                if token_text(ins.operator) == "gs" and ins.operands:
+                    used.add(key_text(ins.operands[0]))
         except Exception:
             pass
 
@@ -1179,7 +1178,7 @@ def _sweep_orphan_edit_gs(content_source, resources) -> None:
         return
     for k in [str(k) for k in egs.keys()]:
         if k.startswith("/EditGS") and k not in used:
-            del egs[Name(k)]
+            del egs[k]
 
 
 def _fresh_gs_name(resources, fallback_resources, reserved: set) -> str:
@@ -1233,8 +1232,8 @@ def _register_xobject(pdf, resources, name: str, obj) -> None:
 def _names_drawn(instructions) -> set:
     names = set()
     for instruction in instructions:
-        if str(instruction.operator) == "Do" and instruction.operands:
-            names.add(str(instruction.operands[0]))
+        if token_text(instruction.operator) == "Do" and instruction.operands:
+            names.add(key_text(instruction.operands[0]))
     return names
 
 
@@ -1292,8 +1291,8 @@ def delete_page_images(file: str, output: str, page: int, indexes: list) -> dict
         if not (1 <= int(page) <= total):
             raise ValueError(f"page {page} is out of range (1-{total})")
         p = pdf.pages[int(page) - 1]
-        # Copy-on-write a page-LOCAL /Resources (the review fix, applied to
-        # every page-level image op): qpdf flattens inherited /Resources onto
+        # Copy-on-write a page-LOCAL /Resources (every page-level image op
+        # does): qpdf flattens inherited /Resources onto
         # each page's own dict BY REFERENCE, so registering an edit's new
         # XObject / form copies on the resolved dict would leak them into every
         # sibling page sharing it. `_copy_resources_for_write` gives a fresh
@@ -1371,8 +1370,8 @@ def transform_page_images(file: str, output: str, page: int, targets: list) -> d
         p = pdf.pages[int(page) - 1]
         # Copy-on-write a page-LOCAL /Resources — nested-placement transforms
         # register a form COPY, which on a shared (qpdf-flattened) /Resources
-        # would leak into sibling pages (the review fix, uniform across the
-        # page-level image ops).
+        # would leak into sibling pages (uniform across the page-level image
+        # ops).
         resources = _copy_resources_for_write(pdf, _resolve_resources(p))
         p.obj["/Resources"] = resources
         placements = _walk_placements(
@@ -1772,8 +1771,8 @@ def replace_page_image(
         if not (1 <= int(page) <= total):
             raise ValueError(f"page {page} is out of range (1-{total})")
         p = pdf.pages[int(page) - 1]
-        # Copy-on-write a page-LOCAL /Resources (the review fix, applied to
-        # every page-level image op): qpdf flattens inherited /Resources onto
+        # Copy-on-write a page-LOCAL /Resources (every page-level image op
+        # does): qpdf flattens inherited /Resources onto
         # each page's own dict BY REFERENCE, so registering an edit's new
         # XObject / form copies on the resolved dict would leak them into every
         # sibling page sharing it. `_copy_resources_for_write` gives a fresh
@@ -2147,14 +2146,14 @@ def extract_page_image(file: str, page: int, index: int, output_prefix: str) -> 
 
         def _collect(instructions, res, depth, fallback):
             for instruction in instructions:
-                if str(instruction.operator) == "INLINE IMAGE":
+                if token_text(instruction.operator) == "INLINE IMAGE":
                     holder.append(instruction.iimage)
                     continue
-                if str(instruction.operator) != "Do" or not instruction.operands:
+                if token_text(instruction.operator) != "Do" or not instruction.operands:
                     continue
-                nm = str(instruction.operands[0])
+                nm = key_text(instruction.operands[0])
                 xobj = _lookup_xobject(nm, res, fallback)
-                st = str(xobj.get("/Subtype", "")) if xobj is not None else ""
+                st = token_text(xobj.get("/Subtype", "")) if xobj is not None else ""
                 if xobj is not None and st == "/Image":
                     holder.append(xobj)
                 elif xobj is not None and st == "/Form":

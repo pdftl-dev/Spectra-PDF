@@ -89,7 +89,7 @@ describe('the tool strip separates the lock from the armed tool', () => {
   });
 
   it('gives every strip button a box, armed or not', () => {
-    // X6: only the active item used to carry a pill, so the other eight were
+    // Only the active item used to carry a pill, so the other eight were
     // bare text and the strip read as a breadcrumb trail. The border is on the
     // RESTING state, which is also what keeps arming a tool from resizing it.
     const body = ruleBody(CSS, ['.secondary-tool']);
@@ -99,7 +99,7 @@ describe('the tool strip separates the lock from the armed tool', () => {
   });
 
   it('pins the strip height so arming a tool cannot move the page', () => {
-    // X21: Takeoff's count-group buttons made the strip 40px against 28px
+    // Takeoff's count-group buttons made the strip 40px against 28px
     // everywhere else, so the document jumped 13px entering and leaving that
     // tool. `inline-flex` above keeps a glyph beside its label rather than
     // over it; the floor keeps the box constant regardless.
@@ -202,7 +202,7 @@ describe('contrast, computed from the tokens themselves', () => {
 
 describe('one idiom per kind of action', () => {
   it('draws destructive actions as a button in the danger token', () => {
-    // X12: Delete and Remove were bare text beside bordered buttons on four
+    // Delete and Remove were bare text beside bordered buttons on four
     // surfaces — the irreversible action quieter than its reversible peers.
     const body = ruleBody(CSS, ['.danger-action']);
     expect(body, 'the destructive idiom is gone').not.toBeNull();
@@ -212,7 +212,7 @@ describe('one idiom per kind of action', () => {
   });
 
   it('keeps the underline for links and gives in-place actions a box', () => {
-    // X13: five surfaces spelled one class of action three ways. A link
+    // Five surfaces spelled one class of action three ways. A link
     // navigates; a `.quiet-action` acts on what is already on screen.
     expect(ruleBody(CSS, ['.link-action'])).toMatch(/text-decoration:\s*underline/);
     const quiet = ruleBody(CSS, ['.quiet-action']);
@@ -222,7 +222,7 @@ describe('one idiom per kind of action', () => {
   });
 
   it('gives disabled controls one legible treatment at element level', () => {
-    // X14: the dimming ran 0.3–0.55 across the product, and the strip's own
+    // The dimming ran 0.3–0.55 across the product, and the strip's own
     // buttons declared none at all, so eight inapplicable image actions
     // rendered at full contrast. A control at 0.35 reads as absent, not as
     // unavailable.
@@ -233,14 +233,14 @@ describe('one idiom per kind of action', () => {
   });
 
   it('makes a placeholder unmistakable for a value', () => {
-    // A11: an em-dash placeholder in near-white read as a typed em-dash.
+    // An em-dash placeholder in near-white read as a typed em-dash.
     expect(ruleBody(CSS, ['input::placeholder', 'textarea::placeholder'])).toMatch(
       /color:\s*var\(--text-dim\)/,
     );
   });
 
   it('ellipsises an overlong input value rather than slicing a glyph', () => {
-    // A10: "Northwind Instru" and "Page {page} of {p" read as stored values.
+    // "Northwind Instru" and "Page {page} of {p" read as stored values.
     expect(
       ruleBody(CSS, ['input[type="text"]', 'input[type="search"]', 'input:not([type])']),
     ).toMatch(/text-overflow:\s*ellipsis/);
@@ -249,7 +249,7 @@ describe('one idiom per kind of action', () => {
 
 describe('colour-swatch pickers speak one language', () => {
   it('rings the selected swatch in the accent, outside the swatch', () => {
-    // X19: three pickers, two selection behaviours, and one with none at all.
+    // Three pickers, two selection behaviours, and one with none at all.
     // The ring is offset OUTSIDE because a swatch's whole surface is its
     // value — an inset ring reports a colour the picker would then apply.
     const base = ruleBody(CSS, ['.color-swatch']);
@@ -264,7 +264,7 @@ describe('colour-swatch pickers speak one language', () => {
   });
 
   it('clears the 3:1 boundary floor for a swatch on every ground it lands on', () => {
-    // N3: the palette black measured 1.10:1 with a 1.88:1 ring, and the Black
+    // The palette black measured 1.10:1 with a 1.88:1 ring, and the Black
     // ink chip 1.01:1 with a 2.09:1 border — both read as an EMPTY swatch,
     // which in an ink list is a different claim from "black". The FILL is the
     // value and cannot carry a floor, so the BOUNDARY carries it, and it does
@@ -319,7 +319,7 @@ describe('colour-swatch pickers speak one language', () => {
 
 describe('the select layer positions its own chevron', () => {
   it('places the chevron physically, because background-position has no logical keywords', () => {
-    // N1, ten of thirty-six screenshots: `center end 7px` parses as nothing,
+    // `center end 7px` parses as nothing,
     // the declaration is dropped, and the chevron falls back to `0% 0%` — top
     // left, clipped by the control's own top border, on EVERY select.
     const body = ruleBody(CSS, ['select']);
@@ -335,7 +335,8 @@ describe('the select layer positions its own chevron', () => {
   });
 
   it('ellipsises an overlong select value rather than slicing a glyph', () => {
-    // N2: "Over conten" and "Keep each source's own s" read as stored values.
+    // Sliced values ("Over conten", "Keep each source's own s") read as
+    // stored values.
     const body = ruleBody(CSS, ['select']) ?? '';
     expect(body).toMatch(/text-overflow:\s*ellipsis/);
     expect(body).toMatch(/overflow:\s*hidden/);
@@ -366,7 +367,7 @@ describe('the select layer positions its own chevron', () => {
 
 describe('informational text on the signature card', () => {
   it('takes the product muted token rather than a private outlier', () => {
-    // N8: #6b7280 measured 3.53:1 on #1c1c1c at ~10px, on three lines of real
+    // #6b7280 measures 3.53:1 on #1c1c1c at ~10px, on three lines of real
     // information (integrity, field name, claimed time), while the same class
     // of text everywhere else runs 6.94:1.
     const body = ruleBody(CSS, ['.signature-nav-detail']) ?? '';
@@ -377,7 +378,7 @@ describe('informational text on the signature card', () => {
 
 describe('a measurement drawn on the page carries its own contrast', () => {
   it('gives the committed dimension label a legible ground and the casing a floor', () => {
-    // N8: a 1px amber hairline on white measured 1.79:1, under the 3:1 a
+    // A 1px amber hairline on white measures 1.79:1, under the 3:1 a
     // graphical object that carries information owes, with no label, no ticks
     // and no endpoints. Drawn ON the page, so the colours are literals.
     const body = ruleBody(CSS, ['.measure-annot-label']);
@@ -412,7 +413,7 @@ describe('a measurement drawn on the page carries its own contrast', () => {
 
 describe('the tab lane has no phantom scrollbar', () => {
   it('zeroes BOTH scrollbar axes on the doc-tab lane', () => {
-    // X8: `overflow-x: auto` makes the block axis compute to `auto` too, so
+    // `overflow-x: auto` makes the block axis compute to `auto` too, so
     // the lane grew a VERTICAL scrollbar. Zeroing only `height` left its
     // `width` at the platform default — the unlabelled ~6×25px pill hard
     // against the last tab in the hero shot.

@@ -51,7 +51,7 @@ export const CHROME_STRINGS = {
   'chrome.status.snapOptions': 'Snap options',
   'chrome.status.snapTypes': 'Snap to',
   'chrome.status.snapRadius': 'Radius',
-  // Slice B: the angle increment and the grid live in the same popover, so
+  // The angle increment and the grid live in the same popover, so
   // the whole drafting-aid set is configured in one place. Unit SYMBOLS (in,
   // ft, °) stay notation and carry no keys; the grid's unit is a <select>
   // over those symbols, and its label is what localizes.
@@ -94,6 +94,7 @@ export const CHROME_STRINGS = {
   'chrome.recent.open': 'Open',
   'chrome.recent.reveal': 'Show in folder',
   'chrome.recent.copyPath': 'Copy full path',
+  'chrome.recent.remove': 'Remove from list',
   'chrome.recent.revealFailed': 'That file could not be shown — it may have been moved or deleted.',
   // A recent entry that came from a web address shows where it came from in
   // place of a folder — its local copy is a temporary path that tells the user

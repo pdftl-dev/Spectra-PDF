@@ -15,7 +15,6 @@
 //! display scaling.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -25,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow};
 
 use crate::app_windows::{self, ClaimState, WindowRegistry, MAIN_LABEL};
+use crate::commands::{LaunchRecord, UnreadableRecord, UnreadableRecords};
 
 const SESSION_FILE: &str = "session.json";
 
@@ -768,46 +768,61 @@ fn session_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 pub fn load(app: &AppHandle) -> Session {
-    let Some(path) = session_path(app) else {
-        return Session::default();
-    };
-    let Ok(contents) = std::fs::read_to_string(&path) else {
-        return Session::default();
-    };
-    serde_json::from_str(&contents).unwrap_or_default()
+    session_path(app)
+        .map(|path| {
+            load_from(
+                &path,
+                std::process::id(),
+                crate::staging::process_running,
+                &app.state::<UnreadableRecords>(),
+            )
+        })
+        .unwrap_or_default()
 }
 
-/// Where a write stages its bytes: beside the file, so landing them is a
-/// directory-entry swap on one volume rather than a copy. Per process, because
-/// two processes writing the same record must not share a staging name.
-fn staging_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(SESSION_FILE);
-    path.with_file_name(format!("{}.{}.tmp", name, std::process::id()))
-}
-
-/// Replace the record in one step.
+/// Read the record, first removing the stages that killed writers left beside
+/// it.
 ///
-/// A write straight over the file has a window in which the file is neither
-/// the old session nor the new one, and a death inside it loses both. The bytes
-/// go to a staging name, are flushed, and take the file's name by rename — so
-/// the file is only ever one whole record or the other. A failure takes the
-/// staged bytes with it rather than leaving them beside the record.
-fn write_staged(path: &Path, json: &str) -> std::io::Result<()> {
-    let staged = staging_path(path);
-    let landed = (|| {
-        let mut file = std::fs::File::create(&staged)?;
-        file.write_all(json.as_bytes())?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&staged, path)
-    })();
-    if landed.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    landed
+/// A record that exists but cannot be read or parsed is set aside. Every write
+/// that follows replaces the file whole, so a launch that cannot restore from
+/// those bytes would otherwise also destroy them.
+fn load_from(
+    path: &Path,
+    own: u32,
+    running: impl Fn(u32) -> bool,
+    unreadable: &UnreadableRecords,
+) -> Session {
+    crate::staging::reclaim_record_stages(path, own, running);
+    let failure = match crate::staging::read_record(path) {
+        Ok(None) => return Session::default(),
+        Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+            Ok(session) => return session,
+            Err(e) => e.to_string(),
+        },
+        Err(e) => e.to_string(),
+    };
+    let kept_as = match crate::staging::set_aside(path) {
+        Ok(aside) => {
+            eprintln!(
+                "session: {} is unreadable ({failure}); kept as {}",
+                path.display(),
+                aside.display()
+            );
+            Some(aside.to_string_lossy().into_owned())
+        }
+        Err(e) => {
+            eprintln!(
+                "session: {} is unreadable ({failure}) and could not be set aside: {e}",
+                path.display()
+            );
+            None
+        }
+    };
+    unreadable.push(UnreadableRecord {
+        record: LaunchRecord::Session,
+        kept_as,
+    });
+    Session::default()
 }
 
 fn write(app: &AppHandle, session: &Session) -> std::io::Result<()> {
@@ -817,9 +832,13 @@ fn write(app: &AppHandle, session: &Session) -> std::io::Result<()> {
             "no app data directory",
         ));
     };
+    write_at(&path, session)
+}
+
+fn write_at(path: &Path, session: &Session) -> std::io::Result<()> {
     let json = serde_json::to_string(session)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_staged(&path, &json)
+    crate::staging::write_record(path, json.as_bytes())
 }
 
 fn write_now(app: &AppHandle, gone: Option<&str>) -> WriteOutcome {
@@ -2010,16 +2029,20 @@ mod tests {
 
     // ── The file itself ───────────────────────────────────────────────────
 
+    fn staging_path(path: &Path) -> PathBuf {
+        crate::staging::stage_path(path, std::process::id())
+    }
+
     #[test]
     fn a_record_replaces_the_one_before_it_whole() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_FILE);
 
-        write_staged(&path, "{\"version\":1}").unwrap();
+        crate::staging::write_record(&path, b"{\"version\":1}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\":1}");
         // A second write lands over the first: the swap replaces an existing
         // destination rather than refusing it.
-        write_staged(&path, "{\"version\":2}").unwrap();
+        crate::staging::write_record(&path, b"{\"version\":2}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\":2}");
         // And nothing is left beside the record.
         assert!(!staging_path(&path).exists());
@@ -2029,13 +2052,202 @@ mod tests {
     fn a_write_that_fails_leaves_the_previous_record_readable() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(SESSION_FILE);
-        write_staged(&path, "{\"version\":1}").unwrap();
+        crate::staging::write_record(&path, b"{\"version\":1}").unwrap();
 
         // Staging cannot be created. A write straight over the record would
         // have truncated it first and left neither session on disk.
         std::fs::create_dir(staging_path(&path)).unwrap();
-        assert!(write_staged(&path, "{\"version\":2}").is_err());
+        assert!(crate::staging::write_record(&path, b"{\"version\":2}").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\":1}");
+    }
+
+    /// The session lands through the staged writer, which is also what
+    /// reclaims the stage a writer killed mid-write left beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_session_write_lands_whole_through_the_staged_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE);
+        let mut writer = std::process::Command::new("cmd")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        writer.wait().unwrap();
+        let orphan = crate::staging::stage_path(&path, writer.id());
+        std::fs::write(&orphan, "{\"version\":1,\"win").unwrap();
+
+        write_at(&path, &saved_session()).unwrap();
+
+        assert!(!orphan.exists());
+        let unreadable = UnreadableRecords::new();
+        assert_eq!(
+            load_from(&path, std::process::id(), |_| false, &unreadable),
+            saved_session()
+        );
+        assert!(unreadable.take().is_empty());
+    }
+
+    #[test]
+    fn a_launch_sets_an_unreadable_record_aside_rather_than_losing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE);
+        let torn = b"{\"version\":1,\"windows\":[{\"labelKi";
+        std::fs::write(&path, torn).unwrap();
+        let unreadable = UnreadableRecords::new();
+
+        assert_eq!(
+            load_from(&path, 4100, |_| false, &unreadable),
+            Session::default()
+        );
+
+        // The next write lands on a free name; the unread bytes survive it.
+        assert!(!path.exists());
+        let aside = dir.path().join(format!("{SESSION_FILE}.unreadable"));
+        assert_eq!(std::fs::read(&aside).unwrap(), torn);
+        assert_eq!(
+            unreadable.take(),
+            vec![UnreadableRecord {
+                record: LaunchRecord::Session,
+                kept_as: Some(aside.to_string_lossy().into_owned()),
+            }]
+        );
+
+        // No record at all is a first run: nothing is set aside, and nothing is
+        // reported, so the next launch says nothing about the last one.
+        assert_eq!(
+            load_from(&path, 4100, |_| false, &unreadable),
+            Session::default()
+        );
+        assert!(unreadable.take().is_empty());
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            left,
+            std::collections::BTreeSet::from([format!("{SESSION_FILE}.unreadable")])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_session_record_that_cannot_be_read_is_set_aside_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let unreadable = UnreadableRecords::new();
+
+        assert_eq!(
+            load_from(&path, 4100, |_| false, &unreadable),
+            Session::default()
+        );
+
+        let aside = dir.path().join(format!("{SESSION_FILE}.unreadable"));
+        assert!(aside.is_dir());
+        assert_eq!(
+            unreadable.take(),
+            vec![UnreadableRecord {
+                record: LaunchRecord::Session,
+                kept_as: Some(aside.to_string_lossy().into_owned()),
+            }]
+        );
+    }
+
+    /// A holder that shares reading but not deletion lets the record be read
+    /// and refuses the rename that would set it aside.
+    #[cfg(windows)]
+    #[test]
+    fn a_session_record_that_cannot_be_set_aside_is_reported_where_it_stands() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE);
+        let torn = b"{\"version\":1,\"win";
+        std::fs::write(&path, torn).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ
+            .open(&path)
+            .unwrap();
+        let unreadable = UnreadableRecords::new();
+
+        assert_eq!(
+            load_from(&path, 4100, |_| false, &unreadable),
+            Session::default()
+        );
+
+        drop(holder);
+        assert_eq!(std::fs::read(&path).unwrap(), torn);
+        assert_eq!(
+            unreadable.take(),
+            vec![UnreadableRecord {
+                record: LaunchRecord::Session,
+                kept_as: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_launch_reclaims_only_the_staging_a_stopped_process_left() {
+        const OWN: u32 = 4100;
+        const LIVE: u32 = 4200;
+        const DEAD: u32 = 4300;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SESSION_FILE);
+        let record = serde_json::to_string(&saved_session()).unwrap();
+        std::fs::write(&path, &record).unwrap();
+        let beside = [
+            "session.json.bak".to_string(),
+            "session.json.abc.tmp".to_string(),
+            format!("session.json.{OWN}.tmp"),
+            format!("session.json.{LIVE}.tmp"),
+            format!("session.json.{DEAD}.tmp"),
+        ];
+        for name in &beside {
+            std::fs::write(dir.path().join(name), "{\"version\":9}").unwrap();
+        }
+
+        let unreadable = UnreadableRecords::new();
+        let session = load_from(&path, OWN, |pid| pid == LIVE, &unreadable);
+
+        // The record reads as written: reclaiming never touches it.
+        assert_eq!(session, saved_session());
+        assert!(unreadable.take().is_empty());
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let mut kept: std::collections::BTreeSet<String> = beside.into_iter().collect();
+        kept.insert(SESSION_FILE.to_string());
+        kept.remove(&format!("session.json.{DEAD}.tmp"));
+        assert_eq!(left, kept);
+    }
+
+    #[test]
+    fn the_reclaim_recognises_exactly_the_names_the_writer_stages() {
+        let path = Path::new("C:\\data").join(SESSION_FILE);
+        let staged = staging_path(&path);
+        let name = staged.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            crate::staging::stage_owner(SESSION_FILE, name),
+            Some(std::process::id())
+        );
+        for other in [
+            SESSION_FILE,
+            "session.json.bak",
+            "session.json.tmp",
+            "session.json..tmp",
+            "session.json.abc.tmp",
+            "session.json.04300.tmp",
+            "session.json.4300.tmp.bak",
+            "session.json4300.tmp",
+            "other.json.4300.tmp",
+        ] {
+            assert_eq!(
+                crate::staging::stage_owner(SESSION_FILE, other),
+                None,
+                "{other}"
+            );
+        }
     }
 
     // ── The quit gate ─────────────────────────────────────────────────────

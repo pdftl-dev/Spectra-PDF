@@ -71,7 +71,7 @@ from pyhanko.sign.validation import validate_pdf_signature
 from engine import eutl, msctl, os_trust, stamp_appearance, wincert
 from engine.acroform import form_field_forest
 from engine.docmdp import LEVEL_BY_VALUE, VALUE_BY_LEVEL, certification_of_file
-from engine.docmdp_policy import DIFF_POLICY, LockedFieldModification
+from engine.docmdp_policy import DIFF_POLICY, LockedFieldModification, UnjudgeableModification
 from engine.inplace import is_same_file
 from engine.signature_size import raw_signature_size
 from engine.fieldmdp import (
@@ -83,6 +83,9 @@ from pyhanko import stamp
 from pyhanko.keys import load_certs_from_pemder_data, load_private_key_from_pemder_data
 from pyhanko_certvalidator import ValidationContext
 from pyhanko_certvalidator.registry import SimpleCertificateStore
+from engine.pdf_tree import exact_pyhanko_names
+
+exact_pyhanko_names()
 
 
 # An explicit, empty, offline trust context. Empty trust_roots (NOT None) means
@@ -473,6 +476,8 @@ def _policy_report(status, certification: dict) -> dict:
 
     A verdict that CANNOT be made is reported as unmade — never as a pass and
     never as a failure."""
+    if isinstance(getattr(status, "diff_result", None), UnjudgeableModification):
+        return {**_unjudged(None), "error": str(status.diff_result)}
     level = status.modification_level
     modification_level = level.name if level is not None else None
     if not certification["certified"]:
@@ -780,9 +785,8 @@ def _load_signer_from_pem(key_path: str, cert_path: str, password: str) -> "sign
     RAISING primitives (load_private_key_from_pemder_data /
     load_certs_from_pemder_data over bytes we read ourselves) with a directly
     constructed SimpleSigner — SimpleSigner.load has the SAME
-    swallow-and-log-return-None behavior load_pkcs12 had (confirmed in
-    source), which the slice-2 follow-up established as a stderr leak plus
-    dead error handling.
+    swallow-and-log-return-None behavior load_pkcs12 has (confirmed in
+    source): a stderr leak plus dead error handling.
 
     The signing certificate is the one whose public key MATCHES the private
     key — never positional. A PEM bundle has no structural key↔cert pairing
@@ -999,6 +1003,10 @@ def _certification_refusals(file: str, certify: bool, certify_level: str | None)
             "Choose none, form-fill, or annotate."
         )
     existing = certification_of_file(file)
+    from engine.incremental import signature_policy
+    from engine.docmdp import refuse_unreadable_policy
+    if existing.get("error") or signature_policy(file).get("error"):
+        refuse_unreadable_policy()
     if certify and existing["certified"]:
         existing_level = existing["level"] or "an unrecognized level"
         raise ValueError(

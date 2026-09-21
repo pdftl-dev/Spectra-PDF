@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { appReducer, initialState, rotateAnnotationRect } from '../src/renderer/state/reducer';
+import { committedDocuments } from '../src/renderer/lib/workspace-commit';
 import type { AppState, OpenDocument, OpenFile, PageAnnotation, PageRef } from '../src/renderer/state/types';
+import { documentsRead } from './helpers/published-bytes';
 
 function makeFile(path: string, pageCount: number, name?: string): OpenFile {
   return {
@@ -39,6 +41,14 @@ function stateWith(files: OpenFile[], documents: OpenDocument[]): AppState {
 }
 
 const pageIds = (doc: OpenDocument): string[] => doc.pages.map((p) => p.id);
+
+/** The workspace and the page tier untouched, and one more notice owed. */
+function expectRefused(next: AppState, state: AppState): void {
+  expect(next.workspace).toBe(state.workspace);
+  expect(next.pageUndoStack).toBe(state.pageUndoStack);
+  expect(next.pageDirtyPaths).toBe(state.pageDirtyPaths);
+  expect(next.pageEditRefusals).toBe(state.pageEditRefusals + 1);
+}
 
 describe('SET_WORKSPACE_DOCUMENTS', () => {
   it('appends documents for a newly indexed file', () => {
@@ -158,7 +168,7 @@ describe('MOVE_PAGE', () => {
     expect(next.workspace.documents[0].pageCount).toBe(3);
   });
 
-  it('is a no-op when the page is not in the source document', () => {
+  it('is refused with a notice when the page is not in the source document', () => {
     const a = makeFile('a.pdf', 2);
     const doc = makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2));
     const state = stateWith([a], [doc]);
@@ -169,7 +179,7 @@ describe('MOVE_PAGE', () => {
       pageId: 'missing',
       toIndex: 0,
     });
-    expect(next).toBe(state);
+    expectRefused(next, state);
   });
 });
 
@@ -495,36 +505,44 @@ describe('UPDATE_FILE with a non-empty page tier (bypassed-gate hardening)', () 
     });
   };
 
-  it('resets the tier and drops the dirty paths\' documents for reindexing', () => {
+  it('resets the tier, drops the other dirty paths\' documents for reindexing, and places the updated path\'s', () => {
     const edited = editedState();
+    const buffer = [9, 9, 9];
+    const read = documentsRead(edited.files.get('a.pdf')!, buffer, 2);
     const next = appReducer(edited, {
       type: 'UPDATE_FILE',
       path: 'a.pdf',
       pageCount: 2,
-      buffer: [9, 9, 9],
+      buffer,
       snapshotPath: 'snap1',
+      documents: read,
     });
     expect(next.pageUndoStack).toEqual([]);
     expect(next.pageRedoStack).toEqual([]);
     expect(next.pageDirtyPaths).toEqual([]);
-    // Entangled (dirty) paths' docs dropped; untouched clean file keeps its docs.
-    expect(next.workspace.documents.map((d) => d.id)).toEqual(['c.pdf#0']);
+    // The other entangled (dirty) path's docs dropped; the updated path shows
+    // its new bytes; the untouched clean file keeps its docs.
+    expect(next.workspace.documents.map((d) => d.id)).toEqual([read[0].id, 'c.pdf#0']);
     // The file update itself still lands on the snapshot chain.
     expect(next.files.get('a.pdf')?.undoStack).toEqual(['snap1']);
     expect(next.files.get('a.pdf')?.pageCount).toBe(2);
   });
 
-  it('leaves the workspace alone when the tier is empty', () => {
+  it('places the documents read from the new bytes in the same step when the tier is empty', () => {
     const a = makeFile('a.pdf', 3);
     const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3))]);
+    const buffer = [9];
+    const read = documentsRead(a, buffer, 2);
     const next = appReducer(state, {
       type: 'UPDATE_FILE',
       path: 'a.pdf',
       pageCount: 2,
-      buffer: [9],
+      buffer,
       snapshotPath: 'snap1',
+      documents: read,
     });
-    expect(next.workspace.documents.map((d) => d.id)).toEqual(['a.pdf#0']);
+    expect(next.workspace.documents).toEqual(read);
+    expect(next.workspace.documents[0].buffer).toBe(next.files.get('a.pdf')!.buffer);
     expect(next.files.get('a.pdf')?.undoStack).toEqual(['snap1']);
   });
 });
@@ -544,36 +562,53 @@ describe('COMMIT_PAGE_EDITS', () => {
       pageId: 'a.pdf#p1',
       toIndex: 0,
     });
+    const bufferA = [1];
+    const bufferB = [2];
+    const planned = (path: string) => edited.workspace.documents.filter((d) => d.path === path);
     const next = appReducer(edited, {
       type: 'COMMIT_PAGE_EDITS',
       updates: [
         {
-          path: 'a.pdf', pageCount: 2, buffer: [1], snapshotPath: 'snapA',
+          path: 'a.pdf', pageCount: 2, buffer: bufferA, snapshotPath: 'snapA',
           authored: { pages: ['a#pA', 'a#pB'], documents: [{ id: 'a#0', name: 'a' }] },
+          documents: committedDocuments(planned('a.pdf'), bufferA),
         },
         {
-          path: 'b.pdf', pageCount: 3, buffer: [2], snapshotPath: 'snapB',
+          path: 'b.pdf', pageCount: 3, buffer: bufferB, snapshotPath: 'snapB',
           authored: { pages: ['b#p0', 'b#p1', 'a#p1'], documents: [{ id: 'b#0', name: 'b' }] },
+          documents: committedDocuments(planned('b.pdf'), bufferB),
         },
       ],
+      planned: { pageUndoStack: edited.pageUndoStack, pageRedoStack: edited.pageRedoStack },
     });
     expect(next.files.get('a.pdf')).toMatchObject({ pageCount: 2, dirty: true, undoStack: ['snapA'] });
     expect(next.files.get('b.pdf')).toMatchObject({ pageCount: 3, dirty: true, undoStack: ['snapB'] });
     // Identity channel: the record lands keyed to THE committed buffer
     // object (adoption checks identity, not equality).
     const recA = next.files.get('a.pdf')!.authoredIdentity!;
-    expect(recA.pages).toEqual(['a#pA', 'a#pB']);
+      expect(recA.pages).toEqual(['a#pA', 'a#pB']);
+      expect(recA.sourceBuffer).toBe(state.files.get('a.pdf')!.buffer);
     expect(recA.buffer).toBe(next.files.get('a.pdf')!.buffer);
     // A later NON-authored update (engine op) drops the record.
     const afterOp = appReducer(next, {
-      type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 2, buffer: [7], snapshotPath: 'snapC',
+      type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 2, buffer: [7], snapshotPath: 'snapC', documents: [],
     });
     expect(afterOp.files.get('a.pdf')!.authoredIdentity).toBeUndefined();
     expect(next.pageUndoStack).toEqual([]);
     expect(next.pageRedoStack).toEqual([]);
     expect(next.pageDirtyPaths).toEqual([]);
-    // Workspace untouched — the indexer re-derives from the new buffers.
-    expect(next.workspace.documents).toBe(edited.workspace.documents);
+    // The workspace holds what the new bytes hold, in the same step: every
+    // page reads from its own file's new buffer at its written position, and
+    // the moved page belongs to b.pdf now.
+    expect(next.workspace.documents.map((d) => [d.id, d.buffer, d.provisional])).toEqual([
+      ['a.pdf#0', bufferA, true],
+      ['b.pdf#0', bufferB, true],
+    ]);
+    expect(next.workspace.documents[1].pages.map((p) => [p.id, p.sourceDocId, p.sourcePageIndex])).toEqual([
+      ['a.pdf#p1', 'b.pdf', 0],
+      ['b.pdf#p0', 'b.pdf', 1],
+      ['b.pdf#p1', 'b.pdf', 2],
+    ]);
   });
 });
 
@@ -837,8 +872,8 @@ describe('snapshot undo/redo history (multi-level)', () => {
     const a = makeFile('a.pdf', 5);
     let state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 5))]);
     // Two whole-file ops → two undo entries.
-    state = appReducer(state, { type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 4, buffer: [2], snapshotPath: 'snap1' });
-    state = appReducer(state, { type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 3, buffer: [3], snapshotPath: 'snap2' });
+    state = appReducer(state, { type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 4, buffer: [2], snapshotPath: 'snap1', documents: [] });
+    state = appReducer(state, { type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 3, buffer: [3], snapshotPath: 'snap2', documents: [] });
     return state;
   };
 
@@ -846,17 +881,20 @@ describe('snapshot undo/redo history (multi-level)', () => {
     let state = withHistory();
     expect(state.files.get('a.pdf')?.undoStack).toEqual(['snap1', 'snap2']);
 
-    state = appReducer(state, { type: 'UNDO', path: 'a.pdf', redoSnapshot: 'redo2' });
+    state = appReducer(state, { type: 'RESTORE_HISTORY', direction: 'undo', path: 'a.pdf',
+      expected: state, snapshotPath: 'snap2', counterpart: 'redo2', buffer: [2], pageCount: 4, documents: [] });
     expect(state.files.get('a.pdf')?.undoStack).toEqual(['snap1']); // second undo still possible
     expect(state.files.get('a.pdf')?.redoStack).toEqual(['redo2']);
     expect(state.files.get('a.pdf')?.dirty).toBe(true);
 
-    state = appReducer(state, { type: 'UNDO', path: 'a.pdf', redoSnapshot: 'redo1' });
+    state = appReducer(state, { type: 'RESTORE_HISTORY', direction: 'undo', path: 'a.pdf',
+      expected: state, snapshotPath: 'snap1', counterpart: 'redo1', buffer: [1], pageCount: 5, documents: [] });
     expect(state.files.get('a.pdf')?.undoStack).toEqual([]);
     expect(state.files.get('a.pdf')?.redoStack).toEqual(['redo2', 'redo1']);
     expect(state.files.get('a.pdf')?.dirty).toBe(false);
 
-    state = appReducer(state, { type: 'REDO', path: 'a.pdf', undoSnapshot: 'snap1' });
+    state = appReducer(state, { type: 'RESTORE_HISTORY', direction: 'redo', path: 'a.pdf',
+      expected: state, snapshotPath: 'redo1', counterpart: 'snap1', buffer: [2], pageCount: 4, documents: [] });
     expect(state.files.get('a.pdf')?.undoStack).toEqual(['snap1']);
     expect(state.files.get('a.pdf')?.redoStack).toEqual(['redo2']);
     expect(state.files.get('a.pdf')?.dirty).toBe(true);
@@ -864,7 +902,7 @@ describe('snapshot undo/redo history (multi-level)', () => {
 
   it('REFRESH_BUFFER swaps bytes without touching history', () => {
     let state = withHistory();
-    state = appReducer(state, { type: 'REFRESH_BUFFER', path: 'a.pdf', pageCount: 4, buffer: [9] });
+    state = appReducer(state, { type: 'REFRESH_BUFFER', path: 'a.pdf', pageCount: 4, buffer: [9], documents: [] });
     const f = state.files.get('a.pdf')!;
     expect(f.pageCount).toBe(4);
     expect(f.buffer).toEqual([9]);
@@ -992,7 +1030,7 @@ describe('MOVE_PAGES (batched multi-select move)', () => {
     expect(next).toBe(state);
   });
 
-  it('rejects the whole batch if any id is not found', () => {
+  it('refuses the whole batch with a notice if any id is not found', () => {
     const a = makeFile('a.pdf', 3);
     const doc = makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3));
     const state = stateWith([a], [doc]);
@@ -1002,7 +1040,7 @@ describe('MOVE_PAGES (batched multi-select move)', () => {
       toDocId: 'a.pdf#0',
       toIndex: 0,
     });
-    expect(next).toBe(state);
+    expectRefused(next, state);
   });
 
   it('rejects a move that would empty a source file, and prunes emptied partitions otherwise', () => {
@@ -1144,20 +1182,18 @@ describe('DELETE_PAGE_REFS (batched delete)', () => {
     expect(next.workspace.documents.map((d) => d.id)).toEqual(['a.pdf#0']);
   });
 
-  it('ignores an all-unknown batch', () => {
+  it('refuses an all-unknown batch with a notice', () => {
     const a = makeFile('a.pdf', 2);
     const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
-    expect(appReducer(state, { type: 'DELETE_PAGE_REFS', pageIds: ['ghost'] })).toBe(state);
+    expectRefused(appReducer(state, { type: 'DELETE_PAGE_REFS', pageIds: ['ghost'] }), state);
   });
 
-  it('rejects the whole batch atomically when ANY id is unknown (no partial delete)', () => {
+  it('refuses the whole batch atomically, with a notice, when ANY id is unknown (no partial delete)', () => {
     // A partially-stale selection (e.g. one id left over from before a reindex)
     // must not delete the subset that happens to still match.
     const a = makeFile('a.pdf', 3);
     const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3))]);
-    expect(
-      appReducer(state, { type: 'DELETE_PAGE_REFS', pageIds: ['a.pdf#p0', 'ghost'] }),
-    ).toBe(state);
+    expectRefused(appReducer(state, { type: 'DELETE_PAGE_REFS', pageIds: ['a.pdf#p0', 'ghost'] }), state);
   });
 });
 
@@ -1211,19 +1247,20 @@ describe('ROTATE_PAGE_REFS (batched rotate by delta)', () => {
     });
   });
 
-  it('is a no-op for an empty selection or a zero-normalized delta', () => {
+  it('is a no-op for an empty selection, and refuses an unknown page with a notice', () => {
     const a = makeFile('a.pdf', 2);
     const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
     expect(appReducer(state, { type: 'ROTATE_PAGE_REFS', pageIds: [], delta: 90 })).toBe(state);
-    expect(appReducer(state, { type: 'ROTATE_PAGE_REFS', pageIds: ['ghost'], delta: 90 })).toBe(state);
+    expectRefused(appReducer(state, { type: 'ROTATE_PAGE_REFS', pageIds: ['ghost'], delta: 90 }), state);
   });
 
-  it('rejects the whole batch atomically when ANY id is unknown (no partial rotate)', () => {
+  it('refuses the whole batch atomically, with a notice, when ANY id is unknown (no partial rotate)', () => {
     const a = makeFile('a.pdf', 2);
     const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
-    expect(
+    expectRefused(
       appReducer(state, { type: 'ROTATE_PAGE_REFS', pageIds: ['a.pdf#p0', 'ghost'], delta: 90 }),
-    ).toBe(state);
+      state,
+    );
   });
 });
 
@@ -1262,15 +1299,22 @@ describe('REGISTER_IMPORT_SOURCE (byte-only import source)', () => {
 });
 
 describe('IMPORT_PAGES (import-into-doc)', () => {
+  const byteSource = (path: string, pages: number): OpenFile => ({
+    ...makeFile(path, pages),
+    importOnly: true,
+  });
+
   it('splices foreign-sourced page refs into the target at the index, one undo step', () => {
     const a = makeFile('a.pdf', 2);
+    const x = byteSource('x.pdf', 2);
     const doc = makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2));
     const imported = makePages('x.pdf', 2); // sourceDocId = x.pdf (a byte-only source)
-    const next = appReducer(stateWith([a], [doc]), {
+    const next = appReducer(stateWith([a, x], [doc]), {
       type: 'IMPORT_PAGES',
       toDocId: 'a.pdf#0',
       toIndex: 1,
       pages: imported,
+      sources: [{ path: 'x.pdf', buffer: x.buffer! }],
     });
     expect(pageIds(next.workspace.documents[0])).toEqual([
       'a.pdf#p0',
@@ -1284,21 +1328,53 @@ describe('IMPORT_PAGES (import-into-doc)', () => {
     expect(next.pageUndoStack).toHaveLength(1);
   });
 
-  it('clamps the insertion index and rejects empty pages / unknown target', () => {
+  it('clamps the insertion index, ignores empty pages, and refuses an unknown target with a notice', () => {
     const a = makeFile('a.pdf', 2);
-    const state = stateWith([a], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
-    expect(appReducer(state, { type: 'IMPORT_PAGES', toDocId: 'a.pdf#0', toIndex: 0, pages: [] })).toBe(state);
+    const x = byteSource('x.pdf', 1);
+    const sources = [{ path: 'x.pdf', buffer: x.buffer! }];
+    const state = stateWith([a, x], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
     expect(
-      appReducer(state, { type: 'IMPORT_PAGES', toDocId: 'nope', toIndex: 0, pages: makePages('x.pdf', 1) }),
+      appReducer(state, { type: 'IMPORT_PAGES', toDocId: 'a.pdf#0', toIndex: 0, pages: [], sources }),
     ).toBe(state);
+    expectRefused(
+      appReducer(state, {
+        type: 'IMPORT_PAGES', toDocId: 'nope', toIndex: 0, pages: makePages('x.pdf', 1), sources,
+      }),
+      state,
+    );
     // toIndex past the end clamps to append.
     const appended = appReducer(state, {
       type: 'IMPORT_PAGES',
       toDocId: 'a.pdf#0',
       toIndex: 99,
       pages: makePages('x.pdf', 1),
+      sources,
     });
     expect(pageIds(appended.workspace.documents[0])).toEqual(['a.pdf#p0', 'a.pdf#p1', 'x.pdf#p0']);
+  });
+
+  // A page index names a page only in the buffer it was read from; the
+  // commit resolves it against whatever buffer the source holds then.
+  it('refuses, and counts, pages whose indexes were read from a buffer the source no longer holds', () => {
+    const a = makeFile('a.pdf', 2);
+    const x = byteSource('x.pdf', 1);
+    const state = stateWith([a, x], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 2))]);
+    const stale = appReducer(state, {
+      type: 'IMPORT_PAGES',
+      toDocId: 'a.pdf#0',
+      toIndex: 0,
+      pages: makePages('x.pdf', 1),
+      sources: [{ path: 'x.pdf', buffer: [4, 5, 6] }],
+    });
+    expect(stale.workspace).toBe(state.workspace);
+    expect(stale.pageUndoStack).toBe(state.pageUndoStack);
+    expect(stale.pageEditRefusals).toBe(state.pageEditRefusals + 1);
+    // A page whose source is not named at all is refused the same way.
+    const unnamed = appReducer(state, {
+      type: 'IMPORT_PAGES', toDocId: 'a.pdf#0', toIndex: 0, pages: makePages('x.pdf', 1), sources: [],
+    });
+    expect(unnamed.workspace).toBe(state.workspace);
+    expect(unnamed.pageEditRefusals).toBe(state.pageEditRefusals + 1);
   });
 });
 
@@ -1339,15 +1415,24 @@ describe('import-source eviction on reindex', () => {
 
   it('keeps an import source while the page tier is non-empty (undoable/redoable import)', () => {
     const a = makeFile('a.pdf', 3);
-    const state = {
-      ...stateWith([a, importSource('x.pdf', 2)], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3))]),
-      pageUndoStack: [{ documents: [], dirtyPaths: [] }],
-    };
-    const next = appReducer(state, {
+    const x = importSource('x.pdf', 2);
+    const imported = appReducer(
+      stateWith([a, x], [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3))]),
+      {
+        type: 'IMPORT_PAGES',
+        toDocId: 'a.pdf#0',
+        toIndex: 3,
+        pages: makePages('x.pdf', 1),
+        sources: [{ path: 'x.pdf', buffer: x.buffer! }],
+      },
+    );
+    const undone = appReducer(imported, { type: 'UNDO_PAGE_OP' });
+    const next = appReducer(undone, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
       documents: [makeDoc(a, 'a.pdf#0', makePages('a.pdf', 3))],
     });
+    expect(next.pageRedoStack).toHaveLength(1); // the import is still redoable
     expect(next.files.has('x.pdf')).toBe(true); // pending edit could still need it
   });
 });

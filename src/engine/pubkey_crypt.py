@@ -35,6 +35,9 @@ from pyhanko.pdf_utils.reader import PdfFileReader
 from pyhanko.pdf_utils.writer import copy_into_new_writer
 
 from engine.inplace import staged_write
+from engine.pdf_tree import exact_pyhanko_names
+
+exact_pyhanko_names()
 
 
 def _load_cert(path: str) -> asn1_x509.Certificate:
@@ -116,7 +119,7 @@ def classify_encryption(file: str) -> str:
         with open(file, "rb") as f:
             reader = PdfFileReader(f)
             # INDEXING resolves indirect references; .get() hands back the
-            # raw IndirectObject wrapper (probe-caught).
+            # raw IndirectObject wrapper.
             enc = reader.trailer_view["/Encrypt"]
             if str(enc["/Filter"]) == "/Adobe.PubSec":
                 return "pubkey"

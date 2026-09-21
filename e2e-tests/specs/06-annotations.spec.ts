@@ -37,13 +37,9 @@ async function loadPdf(path: string) {
 describe('annotations survive the commit round trip', () => {
   let tmp: string;
   let dest: string;
-  // Two distinct SOURCE paths, not just two destinations: OPEN_FILE resets
-  // state.files for a path but does NOT clear state.workspace.documents for
-  // it (that's the async indexer's job, via SET_WORKSPACE_DOCUMENTS) — so
-  // reopening the SAME path mid-session can briefly serve the stale,
-  // already-annotated workspace document instead of a fresh one from disk.
-  // Real gap, but out of scope for this slice; sidestepped here by giving
-  // each test its own source file so there's nothing stale to reuse.
+  // Two distinct SOURCE paths, not just two destinations: each test opens a
+  // file no earlier test has opened or annotated, so what it reads back can
+  // only be its own annotation.
   let samplePdfA: string;
   let samplePdfB: string;
   let samplePdfC: string;
@@ -63,7 +59,7 @@ describe('annotations survive the commit round trip', () => {
     if (tmp && existsSync(tmp)) rmSync(tmp, { recursive: true, force: true });
   });
 
-  it('a highlight added via the reducer path bakes into the saved file as /Square', async () => {
+  it('a highlight added via the reducer path bakes into the saved file as /Highlight', async () => {
     await waitForHarness();
     await openByPaths([samplePdfA]);
     await setView('canvas');
@@ -91,7 +87,7 @@ describe('annotations survive the commit round trip', () => {
       contentsObj?: { str: string };
     }[];
     expect(annots).toHaveLength(1);
-    expect(annots[0].subtype).toBe('Square');
+    expect(annots[0].subtype).toBe('Highlight');
     expect(annots[0].contentsObj?.str).toBe('e2e highlight');
     await pdf.loadingTask.destroy();
   });
@@ -147,7 +143,7 @@ describe('annotations survive the commit round trip', () => {
     const page = await pdf.getPage(1);
     const annots = (await page.getAnnotations()) as { subtype: string; color: number[] }[];
     expect(annots).toHaveLength(1);
-    expect(annots[0].subtype).toBe('Square');
+    expect(annots[0].subtype).toBe('Highlight');
     // pdf.js reports annotation color as a typed array of 0..255 RGB;
     // #2f6fed = (47, 111, 237). Array.from avoids a typed-array-vs-plain-array
     // toEqual mismatch.

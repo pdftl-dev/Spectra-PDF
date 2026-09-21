@@ -136,13 +136,20 @@ jobs:
       # never invokes a sign command it has no configuration for.
       - name: Install the Artifact Signing client tools
         if: steps.signing-regime.outputs.signed == 'true'
+        # This switch already exists in the tag's script: no product overlay.
+        # A stalled download must not consume the entire release job.
+        timeout-minutes: 5
         shell: pwsh
-        run: powershell -ExecutionPolicy Bypass -File scripts/install-signing-tools.ps1
+        run: powershell -ExecutionPolicy Bypass -File scripts/install-signing-tools.ps1 -SkipWinget
 
+      # A toolchain, not product bytes: the Node major is the one pin the
+      # workflow's revision carries. verifier/ is a sparse cone checkout, and a
+      # cone checkout always carries the repository's root files.
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version-file: verifier/.node-version
+          check-latest: true
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -182,7 +189,7 @@ jobs:
           path: .lo-msi-cache
           key: ${{ runner.os }}-libreoffice-msi-${{ hashFiles('scripts/bundle-libreoffice.ps1') }}
 
-      - name: Vendor LibreOffice (O1 export runtime, MPL-2.0)
+      - name: Vendor LibreOffice (Office export runtime, MPL-2.0)
         run: powershell -ExecutionPolicy Bypass -File scripts/bundle-libreoffice.ps1
         env:
           SPECTRAPDF_LO_MSI_CACHE: .lo-msi-cache

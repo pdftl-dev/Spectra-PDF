@@ -12,7 +12,9 @@ with the codec it actually suits —
   * a small **foreground** carrying the ink COLOUR, drawn through the
     stencil as a `/Mask`;
   * a small **background** carrying the paper, inpainted so the text leaves
-    no ghost behind it.
+    no ghost behind it, and coded at FIXED quality
+    (`mrc_codecs.encode_layer_jpx`) so that a partial redaction keeps every
+    background pixel beyond the wavelet's reach around the mark.
 
 The scan image's `Do` is replaced
 in the page's own content stream by two `Do`s (`page_images.
@@ -78,6 +80,7 @@ from .page_images import _walk_placements, replace_placement_with_layers
 from .redact import IDENTITY, _lookup_xobject, _resolve_resources
 from .validate import validate_pdf
 from engine.pdf_save import save_pdf
+from .pdf_tree import key_text, token_text
 
 # --------------------------------------------------------------------------
 # Presets
@@ -92,8 +95,8 @@ from engine.pdf_save import save_pdf
 #:
 #: `verify_threshold` is the floor `mrc_verify_text` reverts below,
 #: and it is set to catch a SEGMENTATION FAILURE, not an OCR wobble. Measured
-#: over the matrix (`mrc-matrix.local.py`, six sources × three presets × three
-#: codecs): the WORST good page any preset produced scored 0.9781 (the
+#: over six sources × three presets × three codecs: the WORST good page any
+#: preset produced scored 0.9781 (the
 #: greyscale scan under archival), while the failure this gate exists for — a
 #: page thresholded for type that is not there — returns near-nothing, which
 #: is why a misjudged page scores in the low hundredths. The floors sit
@@ -102,6 +105,13 @@ from engine.pdf_save import save_pdf
 #: greyscale page, handing the user back the original they asked to shrink —
 #: a false revert is its own silent degradation, and setting the floor at the
 #: measured best case is how you build one.
+#:
+#: `bg_step` and `bg_levels` are the background's fixed quantizer step and
+#: wavelet depth (`mrc_codecs.encode_layer_jpx`). A larger step is a smaller
+#: file; every subband's step is rounded to a power of two, so two steps
+#: closer than a half-octave can write the same bytes. A partial redaction
+#: destroys the mark plus `5 * 2**bg_levels - 4` background pixels around it,
+#: and each level fewer quadruples the coefficients coded exactly.
 PRESETS: dict[str, dict] = {
     "archival": {
         "mask_codec": JBIG2_GENERIC,  # no symbol may stand in for another
@@ -112,7 +122,8 @@ PRESETS: dict[str, dict] = {
         # "Invalid value for threshold" (matrix-caught).
         "symbol_threshold": 0.97,
         "bg_div": 2,
-        "bg_rate": 40,
+        "bg_step": 2**3.5,
+        "bg_levels": 3,
         "fg_div": 3,
         "fg_quality": 65,
         "sauvola_k": 0.10,
@@ -122,7 +133,8 @@ PRESETS: dict[str, dict] = {
         "mask_codec": JBIG2_SYMBOL,
         "symbol_threshold": 0.92,  # jbig2enc's own default
         "bg_div": 3,
-        "bg_rate": 60,
+        "bg_step": 2**4,
+        "bg_levels": 3,
         "fg_div": 4,
         "fg_quality": 45,
         "sauvola_k": 0.20,
@@ -132,7 +144,8 @@ PRESETS: dict[str, dict] = {
         "mask_codec": JBIG2_SYMBOL,
         "symbol_threshold": 0.85,
         "bg_div": 4,
-        "bg_rate": 120,
+        "bg_step": 2**4.5,
+        "bg_levels": 4,
         "fg_div": 6,
         "fg_quality": 35,
         "sauvola_k": 0.30,
@@ -175,7 +188,7 @@ FLAT_INK_CHROMA_VARIANCE = 8.0
 # its scanned pages and byte-identical output on the rest.
 DECISION_MRC = "mrc"
 DECISION_UNTOUCHED = "untouched"
-#: Slice E. The page WAS a scan, its layers WERE built, and the text check
+#: The page WAS a scan, its layers WERE built, and the text check
 #: rejected them — a distinct decision from "untouched" because the two mean
 #: different things to whoever reads the report: one page had nothing to
 #: separate, the other had its separation refused.
@@ -206,19 +219,22 @@ def _page_box(page) -> tuple[float, float, float, float]:
     return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
 
 
-def _has_other_visible_content(pdf, instructions, resources, fallback, depth=0) -> bool:
+def _has_other_visible_content(pdf, instructions, resources, fallback, depth=0,
+                               parent=None) -> bool:
     """True when the page draws anything besides the one image.
 
     Invisible text (`Tr 3` — an OCR layer) does not count, and annotations are
     not page content at all. Everything else — a signature stamp's vector art,
     a header the scanner's software drew, a second image — means the page is
-    not a plain scan and MRC has no business rewriting it.
+    not a plain scan and MRC has no business rewriting it. A form runs in the
+    state of the Do that draws it (ISO 32000-2 §8.10.1), so text a form draws
+    under the invoker's `3 Tr` is invisible too.
     """
-    from .content_walk import GraphicsTextState
+    from .text_metrics import _child_state
 
-    state = GraphicsTextState(IDENTITY)
+    state = _child_state(IDENTITY, parent)
     for instruction in list(instructions):
-        op = str(instruction.operator)
+        op = token_text(instruction.operator)
         operands = list(instruction.operands)
         if state.feed(op, operands):
             continue
@@ -231,11 +247,11 @@ def _has_other_visible_content(pdf, instructions, resources, fallback, depth=0) 
         if op == "INLINE IMAGE":
             return True
         if op == "Do":
-            name = str(operands[0]) if operands else None
+            name = key_text(operands[0]) if operands else None
             xobj = _lookup_xobject(name, resources, fallback)
             if xobj is None:
                 continue
-            subtype = str(xobj.get("/Subtype", ""))
+            subtype = token_text(xobj.get("/Subtype", ""))
             if subtype == "/Image":
                 continue  # counted as a placement by the caller
             if subtype == "/Form":
@@ -248,6 +264,7 @@ def _has_other_visible_content(pdf, instructions, resources, fallback, depth=0) 
                     form_res if form_res is not None else resources,
                     resources,
                     depth + 1,
+                    parent=state,
                 ):
                     return True
                 continue
@@ -269,7 +286,7 @@ def _image_refusal(xobj) -> str | None:
         # Not a failure: a 1-bit page has no background to separate.
         return "the page image is already 1-bit"
     cs = xobj.get("/ColorSpace")
-    if cs is not None and isinstance(cs, pikepdf.Array) and len(cs) and str(cs[0]) == "/Indexed":
+    if cs is not None and isinstance(cs, pikepdf.Array) and len(cs) and token_text(cs[0]) == "/Indexed":
         return "the page image uses an indexed colour space"
     return None
 
@@ -1126,7 +1143,11 @@ def mrc_compress(
                 bg_bytes = encode_layer_jpeg(background, quality=75)
                 bg_filter = "/DCTDecode"
             else:
-                bg_bytes = encode_layer_jpx(background, rate=int(settings["bg_rate"]))
+                bg_bytes = encode_layer_jpx(
+                    background,
+                    step=float(settings["bg_step"]),
+                    levels=int(settings["bg_levels"]),
+                )
                 bg_filter = "/JPXDecode"
 
             if ink.any():
@@ -1158,7 +1179,7 @@ def mrc_compress(
 
             similarity: float | None = None
             if verify_text:
-                # Slice E. Reconstruct what a viewer will draw from the bytes
+                # Reconstruct what a viewer will draw from the bytes
                 # about to be embedded, recognise both rasters, and REFUSE the
                 # page if the words did not survive. This runs BEFORE any
                 # object is created or any content stream is touched, so a

@@ -50,10 +50,22 @@ from .redact import (
     _copy_resources_for_write,
     _lookup_xobject,
     _resolve_resources,
+    _span_bbox,
+    _state_only_instructions,
 )
-from .text_metrics import _FontCache, _run_metrics
+from .text_metrics import (
+    _FontCache,
+    _run_metrics,
+    ink_span,
+    measurable,
+    show_bytes,
+    show_items,
+    wide_width,
+)
+from .text_runs import _resource_lookup
 from .validate import validate_pdf
 from engine.pdf_save import save_pdf
+from .pdf_tree import key_text, token_text
 
 # Path grammar, the same one the vector listing uses: a maximal run of
 # construction operators terminated by an operator that DRAWS it.
@@ -228,14 +240,14 @@ class _AlphaState:
         if blend is not None:
             if isinstance(blend, pikepdf.Array) and len(blend) > 0:
                 blend = blend[0]
-            self.blend = str(blend)
+            self.blend = token_text(blend)
         try:
             smask = ext_gstate.get("/SMask")
         except Exception:
             self.unknown = True
             return _UNKNOWN_GSTATE
         if smask is not None:
-            self.smask = str(smask) != "/None"
+            self.smask = token_text(smask) != "/None"
         return ""
 
     def transparent_for(self, kind: str) -> bool:
@@ -265,7 +277,7 @@ def _ext_gstate(resources, name: str):
     if table is None:
         return None, ""
     try:
-        return table.get(pikepdf.Name(name)), ""
+        return (table[name] if name in table else None), ""
     except Exception:
         return None, _UNKNOWN_GSTATE
 
@@ -279,7 +291,7 @@ def _form_is_group(xobj) -> str:
     if group is None:
         return NO
     try:
-        return YES if str(group.get("/S")) == "/Transparency" else NO
+        return YES if token_text(group.get("/S")) == "/Transparency" else NO
     except Exception:
         return UNKNOWN
 
@@ -310,7 +322,7 @@ def _placement(xobj, ctm):
     if xobj is None:
         return None, "", _UNKNOWN_READ
     try:
-        subtype = str(xobj.get("/Subtype", ""))
+        subtype = token_text(xobj.get("/Subtype", ""))
     except Exception:
         return None, "", _UNKNOWN_READ
     if subtype == "/Image":
@@ -404,7 +416,7 @@ def _form_transparency(xobj, depth: int = 0) -> tuple[str, str]:
         for key in names:
             try:
                 child = xobjects[key]
-                subtype = str(child.get("/Subtype", ""))
+                subtype = token_text(child.get("/Subtype", ""))
             except Exception:
                 return UNKNOWN, _UNKNOWN_READ
             if subtype == "/Image":
@@ -466,23 +478,87 @@ def _unknown_message(page: int, reason: str) -> str:
     return ""
 
 
-def _text_rect(state, cap, raw_width: float) -> list[float]:
-    combined = mat_mult(state.tm, state.ctm)
-    return list(bbox_of_rect_under_matrix(
-        combined,
-        max(raw_width * state.h_scale, 0.01),
-        max(state.font_size, 0.01),
-    ))
+#: Text render modes that paint a glyph, and what each one paints with. 3
+#: paints nothing and 7 only adds to the clip.
+_TEXT_PAINTS = {0: "fill", 1: "stroke", 2: "fillstroke", 4: "fill", 5: "stroke", 6: "fillstroke"}
+
+
+def show_rect(state, fonts: _FontCache, operator: str, operands: list,
+              line_width: float) -> list[float] | None:
+    """The device box of one show operator's ink, with the state advanced
+    past it; None when a measured show draws no glyph (a TJ of numbers only).
+
+    Measured with the font dictionary the text state holds, reaching the
+    font's own ascent and descent. A run whose widths the font does not declare
+    takes the wide estimate, so the box stays a superset of what it draws. A
+    render mode that strokes paints half the line width outside each glyph.
+    """
+    if operator in ("'", '"'):
+        state.next_line()
+        if operator == '"' and len(operands) >= 2:
+            try:
+                state.word_spacing = float(operands[0])
+                state.char_spacing = float(operands[1])
+            except (TypeError, ValueError):
+                pass
+    cap = fonts.capability_of(state.font)
+    vertical = bool(cap is not None and cap.writes_vertical)
+    glyphs = True
+    if measurable(cap, show_bytes(operator, operands)):
+        _text, raw_width = _run_metrics(operator, operands, cap, state)
+        items = show_items(operator, operands, cap, state)
+        glyphs = any(not item.kern for item in items)
+        lo, hi = ink_span(items)
+    else:
+        raw_width = wide_width(operator, operands, cap, state)
+        lo, hi = 0.0, raw_width
+    rect = None
+    if glyphs:
+        box = _span_bbox(
+            mat_mult(state.tm, state.ctm), lo, hi, vertical, state, fonts.ink_extent_of(state.font)
+        )
+        if text_paint(state) in ("stroke", "fillstroke"):
+            ctm = state.ctm
+            half = max(0.0, line_width) / 2.0 * math.sqrt(abs(ctm[0] * ctm[3] - ctm[1] * ctm[2]))
+            box = (box[0] - half, box[1] - half, box[2] + half, box[3] + half)
+        rect = list(box)
+    state.advance_after_show(raw_width, vertical)
+    return rect
+
+
+def text_paint(state) -> str:
+    """What the current render mode paints a glyph with, or "" for none."""
+    return _TEXT_PAINTS.get(state.render_mode, "")
+
+
+def without(instructions: list, drop: set) -> list:
+    """`instructions` with the `drop` indices removed. A removed show operator
+    leaves its state effects in place: `'` and `"` move to the next line and
+    `"` sets the spacing, and the text drawn after it depends on both."""
+    kept: list = []
+    for index, instruction in enumerate(instructions):
+        if index not in drop:
+            kept.append(instruction)
+            continue
+        operator = str(instruction.operator)
+        if operator in _SHOW_OPS:
+            kept.extend(_state_only_instructions(operator, list(instruction.operands)))
+    return kept
 
 
 def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
     """`(objects, unknown reasons)` for everything the PAGE stream paints.
 
-    One entry per painted path, per BT…ET text block, per placed XObject or
-    inline image, and per shading, in encounter (paint) order. Each carries
-    its device `rect`, the exact page-level instruction indices that draw it
-    (`drop_idxs`), whether it participates in transparency, whether it paints
-    through a pattern, and whether the walk could judge it at all.
+    One entry per painted path, per BT…ET text block that paints a glyph, per
+    placed XObject or inline image, and per shading, in encounter (paint)
+    order. Each carries its device `rect`, the exact page-level instruction
+    indices that draw it (`drop_idxs`), whether it participates in
+    transparency, whether it paints through a pattern, and whether the walk
+    could judge it at all.
+
+    A text block's `drop_idxs` are its show operators and nothing else: the
+    font, spacing and colour it sets outlive its ET, and the text after it
+    draws in them. `without` removes a show and keeps its state effects.
 
     The second half is the page's UNKNOWN reasons, deduplicated in encounter
     order. A page that carries one cannot be flattened honestly: the flatten
@@ -494,7 +570,7 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
     """
     instructions = list(pikepdf.parse_content_stream(page))
     resources = _resolve_resources(page)
-    state = GraphicsTextState(IDENTITY)
+    state = GraphicsTextState(IDENTITY, lookup=_resource_lookup(resources, None))
     alpha = _AlphaState()
     clips = ClipTracker(None)
     fonts = _FontCache()
@@ -509,15 +585,14 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
     width_stack: list[float] = []
     fill_is_pattern = False
     pattern_stack: list[bool] = []
-    text_open: int | None = None
-    text_rect: list[float] | None = None
+    text: dict | None = None
 
     def note(reason: str) -> None:
         if reason and reason not in unknowns:
             unknowns.append(reason)
 
     def emit(kind: str, rect, drop_idxs, transparent: bool, pattern: bool,
-             unknown: bool = False) -> None:
+             unknown: bool) -> None:
         if rect is None:
             rect = list(box)
         out.append({
@@ -528,11 +603,11 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
             "transparent": bool(transparent),
             "pattern": bool(pattern),
             "clipped": bool(clips.clips_away(tuple(rect))),
-            "unknown": bool(unknown or alpha.unknown),
+            "unknown": bool(unknown),
         })
 
     for idx, instruction in enumerate(instructions):
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         operands = list(instruction.operands)
         clips.feed(operator, operands, state.ctm)
         if operator == "q":
@@ -546,29 +621,33 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
                 fill_is_pattern = pattern_stack.pop()
             alpha.pop()
         if operator == "cs" and operands:
-            fill_is_pattern = str(operands[0]) == "/Pattern"
+            fill_is_pattern = key_text(operands[0]) == "/Pattern"
         elif operator in ("g", "rg", "k"):
             # A device fill colour leaves the pattern space, so the next fill
             # is not a pattern fill. Without this the flag survives the whole
             # stream and every later fill claims to expand a pattern.
             fill_is_pattern = False
         if operator == "gs" and operands:
-            ext_gstate, reason = _ext_gstate(resources, str(operands[0]))
+            ext_gstate, reason = _ext_gstate(resources, key_text(operands[0]))
             if reason:
                 alpha.unknown = True
                 note(reason)
             else:
                 note(alpha.apply(ext_gstate))
+                line_width = _line_width_of(ext_gstate, line_width)
+            state.feed(operator, operands)
             continue
         # BT/ET are text-state operators the state machine consumes, so the
         # block's extent is recorded BEFORE it is fed — a check after `feed`
         # never sees either one and every text block goes unlisted.
         if operator == "BT":
-            text_open, text_rect = idx, None
-        elif operator == "ET" and text_open is not None:
-            emit("text", text_rect, range(text_open, idx + 1),
-                 alpha.transparent_for("fill"), False)
-            text_open, text_rect = None, None
+            text = {"rect": None, "shows": [], "transparent": False,
+                    "pattern": False, "unknown": False}
+        elif operator == "ET" and text is not None:
+            if text["rect"] is not None:
+                emit("text", text["rect"], text["shows"], text["transparent"],
+                     text["pattern"], text["unknown"])
+            text = None
         if state.feed(operator, operands):
             continue
         if operator == "w":
@@ -578,13 +657,15 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
                 pass
             continue
         if operator in _SHOW_OPS:
-            if operator in ("'", '"'):
-                state.next_line()
-            cap = fonts.capability(resources, resources, state.font_name)
-            _text, raw_width = _run_metrics(operator, operands, cap, state)
-            rect = _text_rect(state, cap, raw_width)
-            text_rect = rect if text_rect is None else _union(text_rect, rect)
-            state.advance_after_show(raw_width, bool(cap is not None and cap.vertical))
+            rect = show_rect(state, fonts, operator, operands, line_width)
+            paint = text_paint(state)
+            if text is not None:
+                text["shows"].append(idx)
+                if paint and rect is not None:
+                    text["rect"] = rect if text["rect"] is None else _union(text["rect"], rect)
+                    text["transparent"] = text["transparent"] or alpha.transparent_for(paint)
+                    text["pattern"] = text["pattern"] or (fill_is_pattern and paint != "stroke")
+                    text["unknown"] = text["unknown"] or alpha.unknown
             continue
         if operator in _CONSTRUCT:
             construct.append(idx)
@@ -613,11 +694,12 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
                     construct + [idx],
                     alpha.transparent_for(kind),
                     fill_is_pattern and operator not in _PAINT_STROKE,
+                    alpha.unknown,
                 )
             construct, points, has_clip = [], [], False
             continue
         if operator == "Do" and operands:
-            name = str(operands[0])
+            name = key_text(operands[0])
             xobj = _lookup_xobject(name, resources, resources)
             rect, subtype, reason = _placement(xobj, state.ctm)
             if reason:
@@ -626,35 +708,45 @@ def page_objects(pdf, page) -> tuple[list[dict], list[str]]:
                 # placement could not be measured is somewhere on this page,
                 # and saying nothing is the failure this branch exists to end.
                 emit("form" if subtype == "/Form" else "image", rect, [idx],
-                     alpha.transparent_for("fill"), False, unknown=True)
+                     alpha.transparent_for("fill"), False, True)
             elif rect is not None:
                 if subtype == "/Form":
                     inner, inner_reason = _form_transparency(xobj)
                     note(inner_reason)
                     emit("form", rect, [idx],
                          alpha.transparent_for("fill") or inner == YES, False,
-                         unknown=inner == UNKNOWN)
+                         inner == UNKNOWN or alpha.unknown)
                 else:
                     masked = _image_is_masked(xobj)
                     if masked == UNKNOWN:
                         note(_UNKNOWN_READ)
                     emit("image", rect, [idx],
                          alpha.transparent_for("fill") or masked == YES, False,
-                         unknown=masked == UNKNOWN)
+                         masked == UNKNOWN or alpha.unknown)
             construct, points, has_clip = [], [], False
             continue
         if operator == "INLINE IMAGE":
             emit("image", list(bbox_of_rect_under_matrix(state.ctm, 1.0, 1.0)), [idx],
-                 alpha.transparent_for("fill"), False)
+                 alpha.transparent_for("fill"), False, alpha.unknown)
             construct, points, has_clip = [], [], False
             continue
         if operator == "sh":
             rect = list(clips.clip) if clips.clip is not None else list(box)
-            emit("shading", rect, [idx], alpha.transparent_for("fill"), False)
+            emit("shading", rect, [idx], alpha.transparent_for("fill"), False, alpha.unknown)
             construct, points, has_clip = [], [], False
             continue
         construct, points, has_clip = [], [], False
     return out, unknowns
+
+
+def _line_width_of(ext_gstate, current: float) -> float:
+    """The line width after one `/ExtGState`: its /LW when it carries a
+    readable one (ISO 32000-2 Table 57), else the width already in force."""
+    try:
+        value = ext_gstate.get("/LW") if ext_gstate is not None else None
+        return current if value is None else float(value)
+    except (TypeError, ValueError, AttributeError):
+        return current
 
 
 def _path_points(operator: str, operands: list, ctm) -> list[tuple[float, float]]:
@@ -974,7 +1066,7 @@ def drop_dead_frames(instructions: list) -> list:
         painted: list[bool] = []
         dead: set[int] = set()
         for index, instruction in enumerate(current):
-            operator = str(instruction.operator)
+            operator = token_text(instruction.operator)
             if operator == "q":
                 opens.append(index)
                 painted.append(False)
@@ -1014,18 +1106,18 @@ def _prune_resources(pdf, page, kept: list, extra_names: set) -> None:
         "/Shading": set(), "/Pattern": set(),
     }
     for instruction in kept:
-        operator = str(instruction.operator)
+        operator = token_text(instruction.operator)
         operands = instruction.operands
         if not operands:
             continue
         if operator == "gs":
-            used["/ExtGState"].add(str(operands[0]))
+            used["/ExtGState"].add(key_text(operands[0]))
         elif operator == "Do":
-            used["/XObject"].add(str(operands[0]))
+            used["/XObject"].add(key_text(operands[0]))
         elif operator == "sh":
-            used["/Shading"].add(str(operands[0]))
+            used["/Shading"].add(key_text(operands[0]))
         elif operator in ("scn", "SCN"):
-            name = str(operands[-1])
+            name = key_text(operands[-1])
             if name.startswith("/"):
                 used["/Pattern"].add(name)
     for key, live in used.items():
@@ -1154,9 +1246,7 @@ def flatten_transparency(
                 for group in plan["members"]:
                     for index in group:
                         drop.update(objects[index]["drop_idxs"])
-                kept = drop_dead_frames(
-                    [ins for i, ins in enumerate(instructions) if i not in drop]
-                )
+                kept = drop_dead_frames(without(instructions, drop))
                 rasters: list[tuple[str, object]] = []
                 for ordinal, region in enumerate(regions):
                     source = _region_source(pdf, number, region, work, ordinal)

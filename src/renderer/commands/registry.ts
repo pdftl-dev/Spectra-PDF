@@ -14,6 +14,7 @@ import { OPERATIONS, OPERATION_TITLES, type Operation } from './operations';
 import { openFindWhenCanvasReady } from './find-intent';
 import { focusOmniSearch, omniSearchAvailable } from './omnisearch-focus';
 import { gsBlocked } from '../lib/gs-capability';
+import { clearRecentStorageSafely } from '../lib/recent-files';
 import {
   toggleGrid,
   toggleGuides,
@@ -29,9 +30,10 @@ import {
  *
  * Partial consumers are deliberately absent: Compare's text mode, Create PDF's
  * image and Office sources, Preflight's structural checks, the flattener's
- * listing, trap-preset authoring and vector form detection all work with no
- * interpreter at all, so their menu entries stay enabled and the surfaces gate
- * the one leg that needs one.
+ * listing, trap-preset authoring, vector form detection and the enhancement of
+ * a scan whose codestream this build decodes all work with no interpreter at
+ * all, so their menu entries stay enabled and the surfaces gate the one leg
+ * that needs one.
  */
 export const GS_ONLY_OPERATIONS: ReadonlySet<Operation> = new Set<Operation>([
   'compress',
@@ -41,7 +43,6 @@ export const GS_ONLY_OPERATIONS: ReadonlySet<Operation> = new Set<Operation>([
   'rebuild',
   'outputpreview',
   'inkmanager',
-  'scanenhance',
 ]);
 
 /** Whether a gs-only surface may be reached right now. Pending is permitted:
@@ -366,8 +367,7 @@ function openThenSeat(ctx: CommandContext, op: Operation): Promise<void> {
  * answer is "nothing" — rather than silently getting an empty one.
  *
  * Modes are NOT listed here: they come from `canvasTools`, which already
- * declares them. Listing them again would be a second copy to keep in step,
- * and this milestone has spent enough on those.
+ * declares them. Listing them again would be a second copy to keep in step.
  *
  * Deliberately absent: the pending-state buttons ("Fill 3 fields", "Redact 2
  * regions"). They aren't tool options — they report queued work, and the canvas
@@ -782,7 +782,7 @@ export const COMMANDS: Record<CommandId, Command> = {
     when: (ctx) => ctx.app !== null && hasActiveFile(ctx.state),
     run: (ctx) => ctx.app!.openPresentation(),
   },
-  // Reading mode (I.6): collapse the chrome around the document. Doc tabs
+  // Reading mode: collapse the chrome around the document. Doc tabs
   // only — Home/Tools NEED their chrome, and leaving the doc tab clears it.
   'view.readingMode': {
     title: 'Reading Mode',
@@ -859,14 +859,14 @@ export const COMMANDS: Record<CommandId, Command> = {
     when: (ctx) => inCanvas(ctx) && ctx.canvas !== null,
     run: (ctx) => ctx.canvas!.clearGuides(),
   },
-  // Toolbar customization (I.6): per-item show/hide over the catalog. The
+  // Toolbar customization: per-item show/hide over the catalog. The
   // toolbar exists on every tab, so no canvas gate.
   'view.customizeToolbar': {
     title: 'Customize Toolbar…',
     when: (ctx) => ctx.app !== null,
     run: (ctx) => ctx.app!.openCustomizeToolbar(),
   },
-  // Page Display (I.6): single-page column vs two-up facing spreads, and the
+  // Page Display: single-page column vs two-up facing spreads, and the
   // cover convention. Layout is a reading-view property, so they gate on the
   // canvas exactly like Rotate View does.
   'view.singlePage': {
@@ -1076,7 +1076,14 @@ export const COMMANDS: Record<CommandId, Command> = {
   'file.clearRecent': {
     title: 'Clear Recent',
     when: (ctx) => ctx.state.ui.recentFiles.length > 0,
-    run: ({ dispatch }) => dispatch({ type: 'UI_SET_RECENT_FILES', files: [] }),
+    // The one place a real Clear Recent originates, so the one place that may
+    // wipe the shared key. The dispatch alone cannot say so: every other
+    // recentFiles change dispatches the same action, and a per-path removal
+    // that empties this window's list is indistinguishable from it downstream.
+    run: async ({ dispatch }) => {
+      const files = await clearRecentStorageSafely();
+      dispatch({ type: 'UI_SET_RECENT_FILES', files });
+    },
   },
   ...(Object.fromEntries(
     CANVAS_TOOLS.map((t) => [`tools.${t}`, toolCommand(t)]),

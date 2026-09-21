@@ -41,7 +41,7 @@ from engine.acroform import calculation_order_names
 from engine.afscript import recognize
 from engine.content_walk import IDENTITY, as_matrix, bbox_of_corners_under_matrix
 from engine.document_js import decode_js
-from engine.fieldmdp import lock_of_field_dict
+from engine.fieldmdp import lock_of_field_dict, locked_fields
 from engine.inplace import is_same_file, staged_write
 from engine.pdf_metrics import (
     GLYPH_HEIGHT_EM,
@@ -50,6 +50,7 @@ from engine.pdf_metrics import (
     text_width_em,
 )
 from engine.pdf_save import save_pdf
+from engine.pdf_tree import key_name, key_text, name_label, token_text
 
 # Field flags (1-based bit positions per the PDF spec, expressed as masks).
 FF_READ_ONLY = 1 << 0
@@ -114,10 +115,10 @@ def _xfa_value_for(field: "_Field", ftype: str, text: str):
     than being coerced by a general truthiness rule.
     """
     if ftype == "checkbox":
-        on = _checkbox_export(field) or "Yes"
-        return text == on
+        on = _checkbox_export(field)
+        return text == (_state_label(on) if on else "Yes")
     if ftype == "radio":
-        return text if text in _radio_on_states(field) else ""
+        return text if text in {_state_label(s) for s in _radio_on_states(field) if s} else ""
     if ftype == "optionlist":
         return [text] if text else []
     return text
@@ -134,12 +135,13 @@ def _xfa_text_for(field: "_Field", ftype: str, value, current: str | None):
     if value is _CLEAR:
         return ""
     if ftype == "checkbox":
+        export = _checkbox_export(field)
+        on = _state_label(export) if export else "Yes"
         if value:
-            return _checkbox_export(field) or "Yes"
-        on = _checkbox_export(field) or "Yes"
+            return on
         return current if (current and current != on) else ""
     if ftype == "radio":
-        return str(value)
+        return _state_label(str(value))
     if ftype == "optionlist":
         if isinstance(value, list):
             return [str(export) for export, _index in value]
@@ -245,7 +247,7 @@ class _Field:
     @property
     def ft(self) -> str:
         v = self.attr("/FT")
-        return str(v) if v is not None else ""
+        return token_text(v) if v is not None else ""
 
     @property
     def flags(self) -> int:
@@ -284,7 +286,7 @@ def _walk_fields(node, prefix: str, inherited: dict, depth: int, out: list) -> N
         return
     name = prefix
     if t is not None:
-        part = str(t)
+        part = token_text(t)
         name = f"{prefix}.{part}" if prefix else part
 
     merged = dict(inherited)
@@ -413,9 +415,18 @@ def _option_export_index(field: _Field, wanted: str) -> tuple[str, int] | None:
     return None
 
 
+def _state_label(spelling: str) -> str:
+    """The text an appearance-state name is shown as, from its `keys()`
+    spelling (solidus optional): `pdf_tree.name_label` of its bytes."""
+    raw = spelling.encode("utf-8", "surrogateescape")
+    return name_label(raw[1:] if raw.startswith(b"/") else raw)
+
+
 def _radio_on_states(field: _Field) -> list[str]:
     """The non-/Off appearance-state names across the field's widgets, in
-    widget order (the names /V must take to select each option)."""
+    widget order (the names /V must take to select each option), each as its
+    `keys()` spelling: a state name need not be UTF-8 (ISO 32000-2 §7.3.5),
+    and that spelling is the one that indexes the appearance dictionary."""
     states = []
     for widget in field.widgets:
         name = _widget_on_state(widget)
@@ -436,13 +447,13 @@ def _radio_display_options(field: _Field) -> list[str]:
             except Exception:
                 out.append("")
         return out
-    return [s for s in _radio_on_states(field) if s]
+    return [_state_label(s) for s in _radio_on_states(field) if s]
 
 
 def _radio_state_for(field: _Field, wanted: str) -> str | None:
     """The on-state name /V must take to select `wanted`, accepting either a
-    display string (mapped through /Opt to its index) or a raw state name.
-    None when nothing matches."""
+    display string (mapped through /Opt to its index), a state name as the
+    listing shows it, or a raw state spelling. None when nothing matches."""
     states = _radio_on_states(field)
     opt = field.attr("/Opt")
     if opt is not None:
@@ -455,11 +466,14 @@ def _radio_state_for(field: _Field, wanted: str) -> str | None:
                 return str(i)
     if wanted in states:
         return wanted
+    for state in states:
+        if state and _state_label(state) == wanted:
+            return state
     return None
 
 
 def _radio_display_value(field: _Field, state: str) -> str:
-    """The display string for a raw on-state name (inverse of the above)."""
+    """The display string for a raw on-state spelling (inverse of the above)."""
     opt = field.attr("/Opt")
     if opt is not None:
         try:
@@ -468,7 +482,7 @@ def _radio_display_value(field: _Field, state: str) -> str:
                 return str(opt[index])
         except (TypeError, ValueError):
             pass
-    return state
+    return _state_label(state)
 
 
 def _widget_on_state(widget) -> str | None:
@@ -516,21 +530,21 @@ def _field_description(field: _Field) -> str:
 def _field_value(field: _Field, ftype: str):
     v = field.attr("/V")
     if ftype == "checkbox":
-        return v is not None and str(v) != "/Off"
+        return v is not None and token_text(v) != "/Off"
     if ftype == "radio":
-        if v is None or str(v) == "/Off":
+        if v is None or token_text(v) == "/Off":
             return ""
-        return _radio_display_value(field, str(v).lstrip("/"))
+        return _radio_display_value(field, key_text(v).lstrip("/"))
     if ftype in ("text", "dropdown"):
-        return str(v) if v is not None else ""
+        return token_text(v) if v is not None else ""
     if ftype == "optionlist":
         if v is None:
             return ""
         if isinstance(v, pikepdf.Array):
             # A multi-select list box reports its FULL selection as a list
             # (was silently truncated to the first item).
-            return [str(x) for x in v]
-        return str(v)
+            return [token_text(x) for x in v]
+        return token_text(v)
     return None
 
 
@@ -785,7 +799,7 @@ def read_form_fields(file: str) -> dict:
             if ftype == "checkbox":
                 export = _checkbox_export(field)
                 if export:
-                    entry["export_value"] = export
+                    entry["export_value"] = _state_label(export)
             if ftype in ("radio", "dropdown", "optionlist"):
                 entry["options"] = options
             if ftype == "signature":
@@ -814,6 +828,12 @@ def read_form_fields(file: str) -> dict:
             if field.name in calculated:
                 entry["calculated"] = True
             fields.append(entry)
+        try:
+            authored_logic = xfa.has_authored_logic(pdf)
+        except xfa.AuthoredLogicUnreadable:
+            # Unknown is not evidence that the template has no calculations.
+            # Keep the readable AcroForm fields and report this separate fact.
+            authored_logic = None
         result = {
             "has_xfa": _has_xfa(pdf),
             # `none` / `static` / `dynamic` — ISO 32000-2 Table 29 plus the
@@ -827,7 +847,7 @@ def read_form_fields(file: str) -> dict:
             # JavaScript, which this engine does not execute — reported so the
             # refusal is by name rather than a value that quietly never
             # updates.
-            "xfa_calculations": kind != xfa.NONE and xfa.has_authored_logic(pdf),
+            "xfa_calculations": authored_logic,
             "fields": fields,
             "count": len(fields),
             # The declared calculation order. Empty means calculations do not
@@ -1033,7 +1053,7 @@ def _da_writes_vertically(pdf: pikepdf.Pdf, da: str | None) -> bool:
             return int(encoding.get("/WMode", 0)) == 1
         except (TypeError, ValueError):
             return False
-    return str(encoding).endswith("-V")
+    return token_text(encoding).endswith("-V")
 
 
 def _vertical_field_face(font_dir: str, da: str | None, value: str) -> str | None:
@@ -1851,9 +1871,9 @@ def _selected_indices(field: _Field) -> set:
         return set()
     wanted = []
     if isinstance(value, pikepdf.Array):
-        wanted = [str(v) for v in value]
+        wanted = [token_text(v) for v in value]
     else:
-        wanted = [str(value)]
+        wanted = [token_text(value)]
     out = set()
     for want in wanted:
         pair = _option_export_index(field, want)
@@ -1987,7 +2007,7 @@ def _field_da(field, acro) -> str | None:
     da = field.attr("/DA")
     if da is None and acro is not None:
         da = acro.get("/DA")
-    return str(da) if da is not None else None
+    return token_text(da) if da is not None else None
 
 
 def _text_value_problem(
@@ -2322,10 +2342,10 @@ def reset_form_fields(
                 if ftype == "text":
                     values[f.name] = str(dv) if dv is not None else ""
                 elif ftype == "checkbox":
-                    values[f.name] = dv is not None and str(dv) != "/Off"
+                    values[f.name] = dv is not None and token_text(dv) != "/Off"
                 elif ftype == "radio":
                     values[f.name] = (
-                        str(dv)[1:] if isinstance(dv, pikepdf.Name) and str(dv) != "/Off" else ""
+                        key_text(dv)[1:] if isinstance(dv, pikepdf.Name) and token_text(dv) != "/Off" else ""
                     )
                 elif ftype == "optionlist":
                     if isinstance(dv, pikepdf.Array):
@@ -2613,6 +2633,20 @@ def fill_form_fields(
         if problems:
             raise ValueError("; ".join(problems))
 
+        # FieldMDP is a write constraint, not just a renderer precheck. A
+        # calculation can change a locked field the caller never named, and
+        # flattening removes every field. Apply the same read-only refusal as
+        # /Ff before mutating values, datasets or the output file.
+        affected = list(fields) if flatten else [field.name for field, _, _ in [*plan, *derived]]
+        from engine.incremental import signature_policy_of_pdf
+        from engine.docmdp import refuse_unreadable_policy
+        policy = signature_policy_of_pdf(pdf)
+        if policy.get("error"):
+            refuse_unreadable_policy()
+        locked = locked_fields(policy["locks"], affected)
+        if locked:
+            raise ValueError("; ".join(f"field is read-only: {name}" for name in locked))
+
         # ISO 32000-2 Annex K: a PDF field object shall exist for each field
         # the XFA resource specifies, and the XFA field values SHALL be
         # consistent with the corresponding /V entries. A fill that wrote /V
@@ -2649,7 +2683,7 @@ def fill_form_fields(
                 for widget in field.widgets:
                     on = on or _widget_on_state(widget)
                 on = on or "Yes"
-                field.obj["/V"] = Name("/" + on) if value else Name("/Off")
+                field.obj["/V"] = key_name(on) if value else Name("/Off")
                 for widget in field.widgets:
                     if value:
                         # Each widget lights via ITS OWN on-state name —
@@ -2658,7 +2692,7 @@ def fill_form_fields(
                         # field. Gating on one cached name leaves sibling
                         # widgets visually unchecked.
                         widget_on = _widget_on_state(widget) or on
-                        widget["/AS"] = Name("/" + widget_on)
+                        widget["/AS"] = key_name(widget_on)
                     else:
                         widget["/AS"] = Name("/Off")
             elif ftype == "radio":
@@ -2667,10 +2701,10 @@ def fill_form_fields(
                     for widget in field.widgets:
                         widget["/AS"] = Name("/Off")
                 else:
-                    field.obj["/V"] = Name("/" + str(value))
+                    field.obj["/V"] = key_name(str(value))
                     for widget in field.widgets:
                         widget["/AS"] = (
-                            Name("/" + str(value))
+                            key_name(str(value))
                             if _widget_on_state(widget) == str(value)
                             else Name("/Off")
                         )
@@ -2761,16 +2795,12 @@ def fill_form_fields(
             flattened = True
             xfa_stripped = xfa_kind != xfa.NONE and not _has_xfa(pdf)
 
-        if same_file:
-            # The preservation reads the input at its own path, so it runs
-            # against the staged bytes before the swap.
-            with staged_write(output_path) as staged:
-                save_pdf(pdf, str(staged))
-                pdf.close()
-                preserved = finalize_preserving_signatures(str(input_path), str(staged))
-        else:
-            save_pdf(pdf, output_path)
-            preserved = finalize_preserving_signatures(str(input_path), str(output_path))
+        # Preservation can refuse late; no destination (including Save As)
+        # may be replaced before the complete write has succeeded.
+        with staged_write(output_path) as staged:
+            save_pdf(pdf, str(staged))
+            pdf.close()
+            preserved = finalize_preserving_signatures(str(input_path), str(staged))
 
     result = {
         "output": str(output_path),

@@ -30,15 +30,27 @@
 //! short-lived apartment per call, so listing devices needs no session and
 //! cannot be blocked by one already open.
 //!
+//! # Every apartment in this module belongs to a separate process
+//!
+//! The apartment rule above is not sufficient on its own: tearing an
+//! apartment down can block forever under the process-wide loader lock, which
+//! is unrecoverable from inside the process that holds it. So the three calls
+//! that reach the driver — enumerate, open, and the device picker — run in a
+//! host child process ([`crate::scan_host`]), bounded and terminable from
+//! outside. The code below is unchanged by that: it executes in the child. A
+//! WIA apartment is never initialised in the process that serves the user, and
+//! nothing here may be called into directly from one.
+//!
 //! # A live session holds a device lock
 //!
 //! WIA locks a device for as long as an `IWiaItem2` on it lives; a leaked one
 //! makes every other imaging application on the machine fail until this
-//! process exits. Three things release it: the session thread drops its
+//! process exits. Four things release it: the session thread drops its
 //! interfaces before `CoUninitialize`, `Session`'s `Drop` shuts that thread
-//! down and joins it, and the idle reaper drops a session nothing has used
-//! within `IDLE_TIMEOUT`. The session thread also catches panics rather than
-//! unwinding through COM.
+//! down and joins it, the idle reaper drops a session nothing has used within
+//! `IDLE_TIMEOUT`, and the host child's termination releases everything it
+//! held. The session thread also catches panics rather than unwinding through
+//! COM.
 //!
 //! # Refusals are structured, not prose
 //!
@@ -132,8 +144,58 @@ impl std::fmt::Display for ScanRefusal {
     }
 }
 
+/// Read a refusal back from its own serialised form.
+///
+/// Hand-written because the key is `&'static str`: the wire carries owned
+/// text, and the interner is what turns it back into the spelling the type
+/// requires. Every field round-trips, so a refusal that crossed a process
+/// boundary is the same refusal, `code` and `folder` included.
+impl<'de> serde::Deserialize<'de> for ScanRefusal {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            key: String,
+            message: String,
+            #[serde(default)]
+            code: Option<String>,
+            #[serde(default)]
+            folder: Option<String>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(ScanRefusal {
+            key: intern_refusal_key(&wire.key),
+            message: wire.message,
+            code: wire.code,
+            folder: wire.folder,
+        })
+    }
+}
+
+/// Resolve a refusal key that arrived as owned text back to the `'static`
+/// spelling the type carries.
+///
+/// Keys originate as literals in this module, so the set is finite and the
+/// interner leaks at most once per distinct key. An unrecognised key would be
+/// a key this module never wrote.
+pub(crate) fn intern_refusal_key(key: &str) -> &'static str {
+    static KNOWN: OnceLock<Mutex<std::collections::HashSet<&'static str>>> = OnceLock::new();
+    if key.is_empty() {
+        return "scan.failed";
+    }
+    let known = KNOWN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let Ok(mut known) = known.lock() else {
+        return "scan.failed";
+    };
+    if let Some(found) = known.get(key) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(key.to_string().into_boxed_str());
+    known.insert(leaked);
+    leaked
+}
+
 impl ScanRefusal {
-    fn named(key: &'static str, message: &str) -> Self {
+    pub(crate) fn named(key: &'static str, message: &str) -> Self {
         Self {
             key,
             message: message.to_string(),
@@ -236,7 +298,7 @@ fn refusal_from(err: windows::core::Error) -> ScanRefusal {
 // ── Reported shapes ─────────────────────────────────────────────────────────
 
 /// One enumerated imaging device of scanner type.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScannerDevice {
     /// `WIA_DIP_DEV_ID` — the durable id every other call round-trips.
     pub id: String,
@@ -257,7 +319,7 @@ pub struct ScannerList {
 /// for a control's legal values: a device whose resolution is a stepped range
 /// and one that lists three values need different controls, and neither is a
 /// hard-coded dropdown.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PropertyDomain {
     /// `WIA_PROP_NONE` — any value the property's type allows.
@@ -279,7 +341,7 @@ pub enum PropertyDomain {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PropertyReport {
     pub id: u32,
     /// The driver's own name for the property, not translated.
@@ -294,7 +356,7 @@ pub struct PropertyReport {
 /// are the two cases that must never render an interactive control: a device
 /// that reports no brightness gets no brightness slider, and a read-only
 /// property gets a value, not a picker.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlModel {
     Absent,
@@ -424,7 +486,7 @@ pub fn color_modes(report: Option<&PropertyReport>) -> Vec<ColorMode> {
     modes
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceCategory {
     Flatbed,
@@ -455,7 +517,7 @@ fn category_of(guid: &GUID) -> SourceCategory {
 }
 
 /// How a duplex run reaches both sides of a sheet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DuplexMode {
     /// No duplex is offered.
@@ -468,7 +530,7 @@ pub enum DuplexMode {
     FrontBackItems,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentHandling {
     /// The raw `WIA_DPS_DOCUMENT_HANDLING_CAPABILITIES` word.
     pub capabilities: i32,
@@ -525,7 +587,7 @@ pub fn document_handling(capabilities: i32, categories: &[SourceCategory]) -> Do
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScanSourceReport {
     /// `WIA_IPA_FULL_ITEM_NAME` — the item path the transfer names.
     pub item_name: String,
@@ -543,7 +605,7 @@ pub struct ScanSourceReport {
     pub document_handling_select: ControlModel,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceOptionId {
     Flatbed,
@@ -553,7 +615,7 @@ pub enum SourceOptionId {
 
 /// One row of the source picker: which item a run transfers from and what it
 /// writes to select it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ScanSourceOption {
     pub id: SourceOptionId,
     pub item_name: String,
@@ -565,7 +627,7 @@ pub struct ScanSourceOption {
     pub feeds: bool,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScannerCapabilities {
     pub device_id: String,
     pub device_name: String,
@@ -1049,8 +1111,20 @@ fn resolve_default(scanners: &[ScannerDevice], last_used: Option<String>) -> Opt
 }
 
 /// Every WIA scanner, by the id WIA itself knows it by.
-fn wia_enumerate() -> Result<Vec<ScannerDevice>, ScanRefusal> {
-    in_apartment(|| unsafe {
+///
+/// Reached only from inside a scanner host child: the driver and its apartment
+/// never load into the process that serves the user (see [`crate::scan_host`]).
+pub(crate) fn wia_enumerate_announced<A>(announce: A) -> Result<Vec<ScannerDevice>, ScanRefusal>
+where
+    A: FnOnce() + Send + 'static,
+{
+    in_apartment_announced(|| unsafe { wia_enumerate_body() }, announce)
+}
+
+/// # Safety
+/// Must run on a thread that has entered a single-threaded apartment.
+unsafe fn wia_enumerate_body() -> Result<Vec<ScannerDevice>, ScanRefusal> {
+    unsafe {
         let manager: IWiaDevMgr2 = CoCreateInstance(&WiaDevMgr2, None, CLSCTX_LOCAL_SERVER)
             .map_err(refusal_from)?;
         let devices = manager
@@ -1078,7 +1152,7 @@ fn wia_enumerate() -> Result<Vec<ScannerDevice>, ScanRefusal> {
         }
         scanners.sort_by_key(|d| d.name.to_lowercase());
         Ok(scanners)
-    })
+    }
 }
 
 // ── The backend seam ────────────────────────────────────────────────────────
@@ -1195,16 +1269,33 @@ impl ScanBackend for WiaBackend {
         ScanStack::Wia
     }
 
+    /// Each of the three calls below reaches the driver only inside a scanner
+    /// host child. In the process that serves the user they cross to that
+    /// child, where a stalled apartment teardown can be bounded from outside
+    /// (see [`crate::scan_host`]). There is no third path: a WIA apartment is
+    /// never initialised in this process.
     fn enumerate(&self) -> Result<Vec<ScannerDevice>, ScanRefusal> {
-        wia_enumerate()
+        if crate::scan_host::is_host_child() {
+            wia_enumerate_announced(|| {})
+        } else {
+            crate::scan_host::enumerate()
+        }
     }
 
     fn open(&self, native_id: &str) -> Result<Arc<dyn ScanSession>, ScanRefusal> {
-        Ok(Arc::new(Session::open(native_id.to_string())?))
+        if crate::scan_host::is_host_child() {
+            Ok(Arc::new(Session::open(native_id.to_string())?))
+        } else {
+            crate::scan_host::open(native_id)
+        }
     }
 
     fn select_device_dialog(&self, parent: usize) -> Result<Option<String>, ScanRefusal> {
-        wia_select_device_dialog(parent)
+        if crate::scan_host::is_host_child() {
+            wia_select_device_dialog_announced(parent, || {})
+        } else {
+            crate::scan_host::select_device_dialog(parent)
+        }
     }
 }
 
@@ -1226,12 +1317,22 @@ fn backend_for(stack: ScanStack) -> &'static dyn ScanBackend {
 /// Run `body` on a thread with its own single-threaded apartment, and tear
 /// the apartment down before returning.
 ///
-/// Every WIA entry point needs one, and no Tauri worker can be assumed to
-/// have the right apartment (or any).
-fn in_apartment<T, F>(body: F) -> Result<T, ScanRefusal>
+/// Every WIA entry point needs one, and no thread of the calling process can
+/// be assumed to have the right apartment (or any).
+///
+/// The announcement names the moment the driver call returned and the
+/// apartment teardown began.
+///
+/// The two are separately observable because the teardown is where an
+/// unbounded stall lands: `CoUninitialize` unloads the driver's DLLs under the
+/// loader lock, and a caller that cannot tell "still scanning" from "stuck
+/// unloading" can only bound the pair. The announcement is a notification, not
+/// a result: the outcome still travels through the join.
+fn in_apartment_announced<T, F, A>(body: F, announce: A) -> Result<T, ScanRefusal>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, ScanRefusal> + Send + 'static,
+    A: FnOnce() + Send + 'static,
 {
     std::thread::spawn(move || unsafe {
         let init = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -1242,6 +1343,7 @@ where
                 "The scanner service call failed unexpectedly.",
             ))
         });
+        let _ = catch_unwind(AssertUnwindSafe(announce));
         if owned {
             CoUninitialize();
         }
@@ -1719,6 +1821,8 @@ pub enum PageIntegrity {
     /// The format carries no self-describing length this check can read; the
     /// page is passed on rather than refused on a guess.
     Unverifiable,
+    /// The bytes could not be inspected; this is not proof of a short transfer.
+    Unreadable { error: String },
 }
 
 /// The bytes a BMP's own headers promise, from `bfSize` when the encoder wrote
@@ -1762,68 +1866,59 @@ fn bmp_declared_len(head: &[u8]) -> Option<u64> {
 /// records what the callback was told, and a lost device is exactly the case
 /// where that and the file disagree.
 pub fn page_integrity(path: &Path) -> PageIntegrity {
-    let Ok(actual) = std::fs::metadata(path).map(|m| m.len()) else {
-        return PageIntegrity::Truncated {
-            declared: 0,
-            actual: 0,
-        };
-    };
+    for attempt in 0..=5 {
+        match read_page_integrity(path) {
+            Ok(verdict) => return verdict,
+            Err(error) if matches!(error.raw_os_error(), Some(32 | 33)) && attempt < 5 => {
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+            }
+            Err(error) => return PageIntegrity::Unreadable { error: error.to_string() },
+        }
+    }
+    unreachable!()
+}
+
+fn read_page_integrity(path: &Path) -> std::io::Result<PageIntegrity> {
+    use std::io::{Read, Seek, SeekFrom};
+    // One handle supplies both the length and bytes. A failed metadata/open
+    // call used to fabricate a zero-length page and report device loss.
+    let mut file = std::fs::File::open(path)?;
+    let actual = file.metadata()?.len();
     let mut head = [0u8; 54];
-    let read = {
-        use std::io::Read;
-        std::fs::File::open(path)
-            .and_then(|mut f| f.read(&mut head))
-            .unwrap_or_default()
-    };
-    let head = &head[..read];
+    let count = actual.min(head.len() as u64) as usize;
+    file.read_exact(&mut head[..count])?;
+    let head = &head[..count];
     if head.starts_with(b"BM") {
-        return match bmp_declared_len(head) {
+        return Ok(match bmp_declared_len(head) {
             Some(declared) if actual < declared => PageIntegrity::Truncated { declared, actual },
             Some(_) => PageIntegrity::Complete,
             None => PageIntegrity::Unverifiable,
-        };
+        });
     }
     if head.starts_with(PNG_SIGNATURE) {
-        // PNG declares no total length; its terminator is the promise.
-        let mut tail = [0u8; 8];
-        let ended = {
-            use std::io::{Read, Seek, SeekFrom};
-            actual >= 8
-                && std::fs::File::open(path)
-                    .and_then(|mut f| {
-                        f.seek(SeekFrom::End(-8))?;
-                        f.read_exact(&mut tail)?;
-                        Ok(())
-                    })
-                    .is_ok()
-                && &tail[4..8] == b"IEND"
-        };
-        return if ended {
-            PageIntegrity::Complete
-        } else {
-            PageIntegrity::Truncated {
-                declared: 0,
-                actual,
-            }
-        };
+        // IEND is a zero-length chunk followed by its four-byte CRC.
+        const IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+        let mut tail = [0u8; 12];
+        let ended = if actual >= 12 {
+            file.seek(SeekFrom::End(-12))?;
+            file.read_exact(&mut tail)?;
+            tail == IEND
+        } else { false };
+        return Ok(if ended { PageIntegrity::Complete } else {
+            PageIntegrity::Truncated { declared: 0, actual }
+        });
     }
-    // TIFF and anything else: no cheap self-describing total length.
-    if actual == 0 {
-        PageIntegrity::Truncated {
-            declared: 0,
-            actual: 0,
-        }
-    } else {
-        PageIntegrity::Unverifiable
-    }
+    Ok(if actual == 0 {
+        PageIntegrity::Truncated { declared: 0, actual }
+    } else { PageIntegrity::Unverifiable })
 }
 
 const PNG_SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
-/// The first staged page that is short of its own header, if any.
-pub fn first_truncated_page(pages: &[PathBuf]) -> Option<(PathBuf, PageIntegrity)> {
+/// The first staged page that is short or cannot be inspected, if any.
+pub fn first_incomplete_page(pages: &[PathBuf]) -> Option<(PathBuf, PageIntegrity)> {
     pages.iter().find_map(|path| match page_integrity(path) {
-        short @ PageIntegrity::Truncated { .. } => Some((path.clone(), short)),
+        short @ (PageIntegrity::Truncated { .. } | PageIntegrity::Unreadable { .. }) => Some((path.clone(), short)),
         _ => None,
     })
 }
@@ -1831,7 +1926,7 @@ pub fn first_truncated_page(pages: &[PathBuf]) -> Option<(PathBuf, PageIntegrity
 /// What the dialog (or the CLI) asked for. Every field is optional: a control
 /// the device did not report is a control the dialog did not render, so its
 /// setting is absent rather than guessed.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ScanSettings {
     /// `WIA_IPA_FULL_ITEM_NAME` of the chosen scan source; the first reported
     /// source when absent.
@@ -1854,7 +1949,7 @@ pub struct ScanSettings {
 /// differently (`actual` present and unequal). Neither fails the scan — a
 /// device that silently clamps 1200 dpi to 600 still produced pages, and
 /// hiding that would be worse than a refusal.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PropertyAdjustment {
     /// The property's own name as the driver spells it, never translated.
     pub property: String,
@@ -1864,7 +1959,7 @@ pub struct PropertyAdjustment {
 
 /// One acquisition's outcome. A cancelled run is a RESULT: the pages that
 /// completed are here and the dialog offers them.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScanResult {
     pub pages: Vec<String>,
     pub cancelled: bool,
@@ -1891,7 +1986,7 @@ pub struct ScanResult {
 /// A per-invocation channel rather than a named global event: two dialogs, or
 /// a dialog and a CLI-driven run, sharing one event name would cross their
 /// progress.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ScanEvent {
     Warming,
@@ -2327,6 +2422,15 @@ fn is_feeder_interruption(hr: HRESULT) -> bool {
     hr == WIA_ERROR_PAPER_JAM || hr == WIA_ERROR_PAPER_PROBLEM
 }
 
+fn unreadable_page(path: &Path, error: String) -> ScanRefusal {
+    ScanRefusal {
+        key: "scan.pageUnreadable",
+        message: format!("The scanned page could not be read: {} ({error})", path.display()),
+        code: None,
+        folder: Some(path.to_string_lossy().into_owned()),
+    }
+}
+
 /// The verdict on one finished transfer: the pages to offer, or the refusal
 /// that names what went wrong.
 ///
@@ -2358,10 +2462,10 @@ pub fn judge_transfer(outcome: TransferOutcome<'_>) -> Result<TransferVerdict, S
             // and makes the user feed them again.
             let mut kept = Vec::with_capacity(staged.len());
             for page in staged {
-                if matches!(page_integrity(&page), PageIntegrity::Truncated { .. }) {
-                    let _ = std::fs::remove_file(&page);
-                } else {
-                    kept.push(page);
+                match page_integrity(&page) {
+                    PageIntegrity::Truncated { .. } => { let _ = std::fs::remove_file(&page); },
+                    PageIntegrity::Unreadable { error } => return Err(unreadable_page(&page, error)),
+                    _ => kept.push(page),
                 }
             }
             if kept.is_empty() {
@@ -2379,7 +2483,10 @@ pub fn judge_transfer(outcome: TransferOutcome<'_>) -> Result<TransferVerdict, S
     // as the assembler's unreadable-image error, which names nothing the user
     // can act on, and a run that lost its device has no honest partial to
     // offer.
-    if first_truncated_page(&staged).is_some() {
+    if let Some((path, verdict)) = first_incomplete_page(&staged) {
+        if let PageIntegrity::Unreadable { error } = verdict {
+            return Err(unreadable_page(&path, error));
+        }
         for page in &staged {
             let _ = std::fs::remove_file(page);
         }
@@ -2731,13 +2838,13 @@ impl ScannerSessions {
         });
     }
 
-    /// One device's capability report, opening a session for it if none is
-    /// live.
+    /// The live session on one device, opening it if none is live.
     ///
-    /// The report's own `device_id` comes back namespaced, so a caller that
-    /// round-trips it — the checklist runner does — reaches the same device.
-    pub fn capabilities(&self, device_id: &str) -> Result<ScannerCapabilities, ScanRefusal> {
-        let id = DeviceId::parse(device_id);
+    /// The store's lock is released before the returned session is used: a
+    /// device call is bounded but not instant, and a caller holding the store
+    /// lock across one would make `cancel` and `close` wait for the very call
+    /// they are trying to stop.
+    fn ensure(&self, id: &DeviceId) -> Result<Arc<dyn ScanSession>, ScanRefusal> {
         let key = id.qualified();
         let mut open = self.sessions.lock().map_err(|_| {
             ScanRefusal::named("scan.failed", "The scanner session store is unusable.")
@@ -2755,8 +2862,41 @@ impl ScannerSessions {
         }
         let entry = open.get_mut(&key).expect("session was just inserted");
         entry.last_used = Instant::now();
-        let report = entry.session.capabilities();
+        Ok(entry.session.clone())
+    }
+
+    /// Open a device and keep it, without asking it anything.
+    ///
+    /// The scanner host's own entry point: a caller that opens a device in one
+    /// request and reports on it in the next needs the open to have happened
+    /// and to have been reported as itself.
+    pub fn open(&self, device_id: &str) -> Result<(), ScanRefusal> {
+        self.ensure(&DeviceId::parse(device_id)).map(|_| ())
+    }
+
+    fn touch(&self, key: &str) {
+        if let Ok(mut open) = self.sessions.lock() {
+            if let Some(entry) = open.get_mut(key) {
+                entry.last_used = Instant::now();
+            }
+        }
+    }
+
+    /// One device's capability report, opening a session for it if none is
+    /// live.
+    ///
+    /// The report's own `device_id` comes back namespaced, so a caller that
+    /// round-trips it — the checklist runner does — reaches the same device.
+    pub fn capabilities(&self, device_id: &str) -> Result<ScannerCapabilities, ScanRefusal> {
+        let id = DeviceId::parse(device_id);
+        let key = id.qualified();
+        let session = self.ensure(&id)?;
+        let report = session.capabilities();
+        self.touch(&key);
         if report.is_err() {
+            let mut open = self.sessions.lock().map_err(|_| {
+                ScanRefusal::named("scan.failed", "The scanner session store is unusable.")
+            })?;
             // A session that failed its own report is not one to keep a
             // device locked with.
             open.remove(&key);
@@ -2790,31 +2930,9 @@ impl ScannerSessions {
     ) -> Result<ScanResult, ScanRefusal> {
         let id = DeviceId::parse(device_id);
         let key = id.qualified();
-        let session = {
-            let mut open = self.sessions.lock().map_err(|_| {
-                ScanRefusal::named("scan.failed", "The scanner session store is unusable.")
-            })?;
-            if !open.contains_key(&key) {
-                let session = backend_for(id.stack).open(&id.native)?;
-                self.start_reaper();
-                open.insert(
-                    key.clone(),
-                    Entry {
-                        session,
-                        last_used: Instant::now(),
-                    },
-                );
-            }
-            let entry = open.get_mut(&key).expect("session was just inserted");
-            entry.last_used = Instant::now();
-            entry.session.clone()
-        };
+        let session = self.ensure(&id)?;
         let outcome = session.acquire(settings, dir, sink);
-        if let Ok(mut open) = self.sessions.lock() {
-            if let Some(entry) = open.get_mut(&key) {
-                entry.last_used = Instant::now();
-            }
-        }
+        self.touch(&key);
         outcome
     }
 
@@ -2854,8 +2972,22 @@ pub fn select_device_dialog(parent: usize) -> Result<Option<String>, ScanRefusal
 }
 
 /// `IWiaDevMgr2::SelectDeviceDlgID`, returning WIA's own device id.
-fn wia_select_device_dialog(parent: usize) -> Result<Option<String>, ScanRefusal> {
-    in_apartment(move || unsafe {
+///
+/// Reached only from inside a scanner host child.
+pub(crate) fn wia_select_device_dialog_announced<A>(
+    parent: usize,
+    announce: A,
+) -> Result<Option<String>, ScanRefusal>
+where
+    A: FnOnce() + Send + 'static,
+{
+    in_apartment_announced(move || unsafe { wia_select_device_dialog_body(parent) }, announce)
+}
+
+/// # Safety
+/// Must run on a thread that has entered a single-threaded apartment.
+unsafe fn wia_select_device_dialog_body(parent: usize) -> Result<Option<String>, ScanRefusal> {
+    unsafe {
         let manager: IWiaDevMgr2 =
             CoCreateInstance(&WiaDevMgr2, None, CLSCTX_LOCAL_SERVER).map_err(refusal_from)?;
         let mut chosen = BSTR::new();
@@ -2875,7 +3007,7 @@ fn wia_select_device_dialog(parent: usize) -> Result<Option<String>, ScanRefusal
             Err(e) if e.code() == HRESULT(1) || e.code() == WIA_S_NO_DEVICE_AVAILABLE => Ok(None),
             Err(e) => Err(refusal_from(e)),
         }
-    })
+    }
 }
 
 // ── Commands ────────────────────────────────────────────────────────────────
@@ -3140,14 +3272,9 @@ mod tests {
         whole.extend_from_slice(&[0, 0, 0, 0]);
         whole.extend_from_slice(b"IEND");
         whole.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
-        // The check reads the last eight bytes: length then chunk type.
-        let mut ended = PNG_SIGNATURE.to_vec();
-        ended.extend_from_slice(&[1, 2, 3, 4]);
-        ended.extend_from_slice(&[0, 0, 0, 0]);
-        ended.extend_from_slice(b"IEND");
         let path = root.join("ended.png");
         std::fs::create_dir_all(&root).expect("a staging folder");
-        std::fs::write(&path, &ended).expect("a staged page");
+        std::fs::write(&path, &whole).expect("a staged page");
         assert_eq!(page_integrity(&path), PageIntegrity::Complete);
 
         let cut = root.join("cut.png");
@@ -3180,11 +3307,38 @@ mod tests {
         let (head, total) = bmp_header(16, 16, true);
         let good = stage_page(&root, "page-0000.bmp", &head, total);
         let short = stage_page(&root, "page-0001.bmp", &head, total - 10);
-        assert!(first_truncated_page(std::slice::from_ref(&good)).is_none());
-        let (named, _) = first_truncated_page(&[good, short.clone()])
+        assert!(first_incomplete_page(std::slice::from_ref(&good)).is_none());
+        let (named, _) = first_incomplete_page(&[good, short.clone()])
             .expect("a run holding a short page is caught");
         assert_eq!(named, short);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_real_png_has_a_complete_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.png");
+        // A complete 2 by 2 RGB PNG, including the IEND chunk CRC.
+        std::fs::write(&path, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x02, 0x00, 0x00, 0x00, 0xfd, 0xd4, 0x9a, 0x73, 0x00, 0x00, 0x00, 0x12, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x14, 0xd1, 0xb0, 0x61, 0x60, 0x60, 0x60, 0x62, 0x00, 0x03, 0x00, 0x05, 0xa2, 0x00, 0x7c, 0xa5, 0xca, 0xb4, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]).unwrap();
+        assert_eq!(page_integrity(&path), PageIntegrity::Complete);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 4]).unwrap();
+        assert!(matches!(page_integrity(&path), PageIntegrity::Truncated { .. }));
+    }
+
+    #[test]
+    fn an_unreadable_page_is_not_a_truncated_transfer_and_is_not_deleted() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (head, total) = bmp_header(16, 16, true);
+        let page = stage_page(dir.path(), "page.bmp", &head, total);
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&page).unwrap();
+        assert!(matches!(page_integrity(&page), PageIntegrity::Unreadable { .. }));
+        let refusal = judged(false, false, None, None, std::slice::from_ref(&page)).unwrap_err();
+        assert_eq!(refusal.key, "scan.pageUnreadable");
+        drop(held);
+        assert_eq!(page_integrity(&page), PageIntegrity::Complete);
+        assert_eq!(std::fs::read(&page).unwrap().len() as u64, total);
     }
 
     fn judged(
@@ -3270,6 +3424,7 @@ mod tests {
         assert_eq!(verdict.interrupted.map(|r| r.key), Some("scan.paperProblem"));
 
         // A jam with nothing whole behind it has no honest partial to offer.
+        let torn = stage_page(&root, "page-0003.bmp", &head, total - 500);
         let refusal = judged(
             false,
             false,
@@ -3934,6 +4089,7 @@ mod tests {
             "scan.cancelledAtDevice",
             "scan.notResponding",
             "scan.scratchFull",
+            "scan.pageUnreadable",
         ]);
         for key in &produced {
             assert!(

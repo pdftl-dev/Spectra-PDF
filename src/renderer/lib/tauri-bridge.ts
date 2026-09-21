@@ -3,6 +3,8 @@
  * All renderer code imports from here for backend communication.
  */
 import { Channel, invoke } from '@tauri-apps/api/core';
+import { withFileLock } from './engine-lock';
+import { withFileSave } from './file-save-barrier';
 import { listen } from '@tauri-apps/api/event';
 import type {
   ScanEvent,
@@ -12,9 +14,11 @@ import type {
   ScannerList,
 } from './scan';
 import type { ClipboardSourceResult } from './clipboard-source';
+import type { RecentPathStatus } from './recent-files';
 import type { CaptureRequest, CaptureResult } from './web-capture';
 import {
   readFile as fsReadFile,
+  exists as fsExists,
   writeFile as fsWriteFile,
   rename as fsRename,
   remove as fsRemove,
@@ -58,6 +62,21 @@ export interface ClaimResult {
   granted: boolean;
   owner: string;
 }
+
+/** A record the launch reads before any window exists, which it could not
+ * read. */
+export interface UnreadableRecord {
+  record: 'session' | 'startup';
+  /** Where the unread bytes were moved, or null when they are still under the
+   * record's own name. */
+  keptAs: string | null;
+}
+
+/** What claiming the folders of one run answered. `token` is a number exactly
+ * when `granted` is true. */
+export type RunClaimResult =
+  | { granted: true; owner: string; sameWindow: boolean; folder: string; token: number }
+  | { granted: false; owner: string; sameWindow: boolean; folder: string; token: null };
 
 /** What handing a document to another window did.
  *
@@ -175,15 +194,18 @@ export const claims = {
   claim: (path: string, mode: 'write' | 'read') =>
     invoke<ClaimResult>('claim_document', { path, mode }),
   release: (path: string) => invoke<void>('release_document', { path }),
-  claimOutputRoot: (path: string) => invoke<ClaimResult>('claim_output_root', { path }),
-  releaseOutputRoot: (path: string) => invoke<void>('release_output_root', { path }),
+  /** Claim every folder one run writes: all of them, or none. */
+  claimOutputRoots: (paths: string[]) =>
+    invoke<RunClaimResult>('claim_output_roots', { paths }),
+  /** Give back the folders of the run `token` names. */
+  releaseOutputRoots: (token: number) => invoke<void>('release_output_roots', { token }),
 };
 
 // ── File dialogs ──────────────────────────────────────────────────────────
 
 // Dialogs are OS-modal (parented in Rust), but modality lands a beat after
-// the click — serialize here too so a rapid second click joins the open
-// dialog instead of stacking another.
+// the click — guard here too instead of stacking another. Read pickers may
+// share a result; an output picker grants its answer to exactly one caller.
 let openDialogInflight: Promise<string[]> | null = null;
 let saveDialogInflight: Promise<string | null> | null = null;
 let createPdfDialogInflight: Promise<string[]> | null = null;
@@ -199,6 +221,35 @@ export interface StoreCertificate {
   machine_store: boolean;
 }
 
+/** Why `list_store_certificates` refused, as the command serializes it. */
+export interface StoreReadErrorPayload {
+  reason: 'open-failed' | 'unsupported';
+  code: string | null;
+  message: string;
+}
+
+/** What a pinned certificate-store enumeration answers with. `delayMs` holds
+ * the answer back, so the window before a read lands can be observed. */
+export type StoreCertificateAnswer =
+  | { rows: StoreCertificate[]; delayMs?: number }
+  | { error: StoreReadErrorPayload; delayMs?: number };
+
+let pinnedStoreCertificates: StoreCertificateAnswer | null = null;
+
+/**
+ * Test seam: pin what the certificate-store enumeration answers.
+ *
+ * An empty store and a store that refuses cannot be arranged from outside: a
+ * suite may not delete the machine's own certificates, and
+ * `__TAURI_INTERNALS__.invoke` is non-writable, so the IPC cannot be stubbed
+ * from the page. The pin sits in the module the shipped code already reads and
+ * is reached only from the harness, which exists only in a `VITE_E2E` build.
+ * `null` unpins and the next read goes to Windows for real.
+ */
+export function pinStoreCertificates(answer: StoreCertificateAnswer | null): void {
+  pinnedStoreCertificates = answer;
+}
+
 export const dialog = {
   openFiles: () => {
     if (!openDialogInflight) {
@@ -209,13 +260,16 @@ export const dialog = {
     return openDialogInflight;
   },
   saveFile: (options?: { defaultPath?: string }) => {
-    if (!saveDialogInflight) {
-      saveDialogInflight = invoke<string | null>('save_file_dialog', {
-        defaultPath: options?.defaultPath,
-      }).finally(() => {
-        saveDialogInflight = null;
-      });
-    }
+    // A chosen output authorizes ONE caller's write. Sharing this promise
+    // lets another intent overwrite the first caller's output without its
+    // own picker/overwrite confirmation. Treat overlap as cancellation;
+    // the original caller retains its dialog and the next idle call may ask.
+    if (saveDialogInflight) return Promise.resolve(null);
+    saveDialogInflight = invoke<string | null>('save_file_dialog', {
+      defaultPath: options?.defaultPath,
+    }).finally(() => {
+      saveDialogInflight = null;
+    });
     return saveDialogInflight;
   },
   /** Pick a PKCS#12 (.pfx/.p12) signer file. Returns null if cancelled. */
@@ -243,7 +297,20 @@ export const dialog = {
    * thing a signing request later carries is a thumbprint. Enumeration runs
    * under a silent context, so opening the picker never raises a PIN prompt.
    */
-  listStoreCertificates: () => invoke<StoreCertificate[]>('list_store_certificates'),
+  /** Rejects with a `StoreReadErrorPayload` when the store refuses, and with
+   * whatever the IPC layer produced when the command itself cannot run. */
+  listStoreCertificates: (): Promise<StoreCertificate[]> => {
+    const pinned = pinnedStoreCertificates;
+    if (pinned) {
+      return new Promise((resolve, reject) => {
+        setTimeout(() => {
+          if ('error' in pinned) reject(pinned.error);
+          else resolve(pinned.rows);
+        }, pinned.delayMs ?? 0);
+      });
+    }
+    return invoke<StoreCertificate[]>('list_store_certificates');
+  },
   /**
    * Sign in to a remote signing service in the SYSTEM BROWSER (RFC 8252) and
    * return the authorization code its redirect carried.
@@ -380,6 +447,11 @@ export interface BatchPdfListing {
 }
 
 export const batch = {
+  /** Passive inspection uses an isolated input, never the working pathname.
+   * Cleanup is idempotent even when an abandoned/failed write made no file. */
+  deleteHealthScratch: async (path: string): Promise<void> => {
+    if (await fsExists(path)) await invoke<void>('delete_batch_scratch', { path });
+  },
   /** Every *.pdf under root (recursive; cycle-safe; unreadable subdirs reported). */
   listPdfsRecursive: (root: string) => invoke<BatchPdfListing>('list_pdfs_recursive', { root }),
   /** Byte copy creating destination parents — the mirror's pass-through.
@@ -558,7 +630,14 @@ export const schedule = {
 // Binary file I/O goes through plugin-fs (efficient binary IPC, capability-
 // scoped to $TEMP/spectrapdf in capabilities/main.json) — the working copies,
 // snapshots, and commit temp files all live there.
-const snapshotRaw = (workingPath: string) => invoke<string>('snapshot', { workingPath });
+const snapshotRaw = (workingPath: string) => withFileLock([workingPath], () => invoke<string>('snapshot', { workingPath }));
+
+export const pageCommit = {
+  publish: (id: string, entries: import('./page-commit-transaction').PageCommitEntry[]) =>
+    invoke('publish_page_commit', { id, entries }),
+  abort: (id: string) => invoke('abort_page_commit', { id }),
+  acknowledge: (id: string) => invoke('acknowledge_page_commit', { id }),
+};
 
 export const file = {
   readBuffer: (filePath: string) => fsReadFile(filePath),
@@ -569,9 +648,9 @@ export const file = {
    * same command the batch driver uses for its out-of-workspace sources. */
   readExternalBuffer: async (filePath: string) =>
     new Uint8Array(await invoke<ArrayBuffer>('read_file_binary', { filePath })),
-  writeBuffer: (filePath: string, bytes: Uint8Array) => fsWriteFile(filePath, bytes),
-  rename: (fromPath: string, toPath: string) => fsRename(fromPath, toPath),
-  remove: (filePath: string) => fsRemove(filePath),
+  writeBuffer: (filePath: string, bytes: Uint8Array) => withFileLock([filePath], () => fsWriteFile(filePath, bytes)),
+  rename: (fromPath: string, toPath: string) => withFileLock([fromPath, toPath], () => fsRename(fromPath, toPath)),
+  remove: (filePath: string) => withFileLock([filePath], () => fsRemove(filePath)),
   createWorkingCopy: (filePath: string) =>
     invoke<string>('create_working_copy', { filePath }),
   /**
@@ -587,23 +666,24 @@ export const file = {
   /** Ungated variant — used by the commit implementation itself. */
   snapshotRaw,
   restoreSnapshot: (workingPath: string, snapshotPath: string) =>
-    invoke('restore_snapshot', { workingPath, snapshotPath }),
+    withFileLock([workingPath, snapshotPath], () => invoke('restore_snapshot', { workingPath, snapshotPath })),
   saveAs: (workingPath: string, destPath: string) =>
-    invoke('save_as', { workingPath, destPath }),
+    withFileSave(workingPath, destPath, () => invoke('save_as', { workingPath, destPath })),
   /** Show a file in the file manager, SELECTED. Rust refuses anything that is
    * not an existing file, and browses rather than shell-opens — see
    * `commands::reveal_in_file_manager`. */
   reveal: (filePath: string) => invoke<void>('reveal_in_file_manager', { path: filePath }),
+  /** Classify each recent path without reading file contents — an existing
+   * file, a positively missing or broken path, or indeterminate (permission,
+   * network, or a transient I/O failure — never treated as dead). Bounded to a
+   * small batch by the Rust side. This is the only path-liveness check in the
+   * app, and it never fetches a `sourceUrl`. Statuses come back in the order
+   * the paths went in. */
+  classifyRecentPaths: (paths: string[]) =>
+    invoke<RecentPathStatus[]>('classify_recent_paths', { paths }),
 };
 
 // ── App ───────────────────────────────────────────────────────────────────
-
-export interface GsInfo {
-  path: string;
-  version: string;
-  product: string;
-  vendor: string;
-}
 
 /** `src-tauri/src/gs.rs` `GsAnswer` — one validated answer about one path.
  * `reason` is a named code (`not-configured`, `not-executable`,
@@ -759,8 +839,6 @@ export const app = {
    * the path to the managed portfolio-members directory. */
   openPortfolioMemberFile: (path: string) =>
     invoke<void>('open_portfolio_member_file', { path }),
-  getBundledGsInfo: () => invoke<GsInfo>('get_bundled_gs_info'),
-  detectExternalGs: () => invoke<GsInfo | null>('detect_external_gs'),
   /** The validated capability answer for `path`, or for discovery when it is
    * omitted. Cached in Rust per path + mtime + size. */
   gsCapability: (path?: string) => invoke<GsAnswer>('gs_capability', { path: path ?? null }),
@@ -799,6 +877,10 @@ export const app = {
    * Windows" entry left behind by a moved copy, or "" when there was none.
    * Reading it clears it, so one launch reports once. */
   startupEntryNotice: () => invoke<string>('startup_entry_notice'),
+
+  /** The records this launch could not read. Taking them clears them, so one
+   * launch reports once, in whichever window asks first. */
+  takeUnreadableRecords: () => invoke<UnreadableRecord[]>('take_unreadable_records'),
 
   /** Set or remove the "Start with Windows" registry entry. */
   setStartupEnabled: (enabled: boolean, startMinimized: boolean) =>

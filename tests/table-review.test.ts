@@ -1,22 +1,26 @@
 import { describe, it, expect } from 'vitest';
 import {
   addColumn,
+  captureExportRequest,
   columnFractionAt,
   currentRotation,
   exportRegions,
   moveColumn,
   moveRegionBounds,
+  ownedAcceptedRegions,
   placeColumn,
   placeRow,
   prunedRegions,
   regionsFromDetection,
   removeColumn,
   selectionState,
+  sessionMatches,
   setAcceptedAll,
   toggleRegion,
   type DetectedTable,
   type TableDetectionResult,
   type TableRegion,
+  type TableReviewSession,
 } from '../src/renderer/lib/table-review';
 
 const DETECTED: DetectedTable = {
@@ -225,5 +229,100 @@ describe('stale pages', () => {
     const region = build();
     expect(prunedRegions([region], new Set(['other']))).toEqual([]);
     expect(prunedRegions([region], new Set([region.pageId]))).toEqual([region]);
+  });
+});
+
+describe('the revision a review belongs to', () => {
+  const buffer = new Uint8Array([1]);
+  const session: TableReviewSession = { path: 'C:/doc.pdf', workingPath: 'work.pdf', buffer };
+
+  it('matches the exact working copy and buffer object, nothing looser', () => {
+    expect(sessionMatches(session, { workingPath: 'work.pdf', buffer })).toBe(true);
+    expect(sessionMatches(session, { workingPath: 'work.pdf', buffer: new Uint8Array([1]) })).toBe(false);
+    expect(sessionMatches(session, { workingPath: 'work-reopened.pdf', buffer })).toBe(false);
+    expect(sessionMatches(session, { workingPath: 'work.pdf', buffer: null })).toBe(false);
+    expect(sessionMatches(session, undefined)).toBe(false);
+    expect(sessionMatches(null, { workingPath: 'work.pdf', buffer })).toBe(false);
+  });
+
+  it('captures exactly the accepted tables of the session document, before any await', () => {
+    const mine = setAcceptedAll([build(), build({ id: 'r2' })], true);
+    const rejected = build({ id: 'r3' });
+    const other = build({ id: 'r4', path: 'C:/other.pdf', accepted: true });
+    expect(captureExportRequest(session, [...mine, rejected, other])).toEqual({
+      session,
+      regions: mine,
+    });
+    expect(captureExportRequest(session, [rejected])).toBeNull();
+    expect(captureExportRequest(null, mine)).toBeNull();
+  });
+
+  it('exports the requested tables when the live set is still the same revision', () => {
+    const live = setAcceptedAll([build(), build({ id: 'r2' })], true);
+    const request = captureExportRequest(session, live)!;
+    expect(ownedAcceptedRegions(request, { session, regions: live })).toEqual({ ok: true, regions: live });
+  });
+
+  it.each([
+    ['moved buffer', { ...session, buffer: new Uint8Array([2]) }],
+    ['reopened working copy', { ...session, workingPath: 'work-reopened.pdf' }],
+    ['another document', { ...session, path: 'C:/other.pdf' }],
+    ['no review at all', null],
+  ] as const)('refuses a request whose revision is not the live one: %s', (_label, liveSession) => {
+    const live = setAcceptedAll([build()], true);
+    const request = captureExportRequest(session, live)!;
+    expect(ownedAcceptedRegions(request, { session: liveSession, regions: live }))
+      .toEqual({ ok: false, reason: 'stale-session' });
+  });
+
+  it('refuses a table the live set no longer holds', () => {
+    const live = setAcceptedAll([build()], true);
+    const request = captureExportRequest(session, [...live, build({ id: 'gone', accepted: true })])!;
+    expect(ownedAcceptedRegions(request, { session, regions: live }))
+      .toEqual({ ok: false, reason: 'missing-region' });
+  });
+
+  it('refuses a table that was unchecked after the request was captured', () => {
+    const live = setAcceptedAll([build()], true);
+    const request = captureExportRequest(session, live)!;
+    expect(ownedAcceptedRegions(request, { session, regions: toggleRegion(live, 'r1') }))
+      .toEqual({ ok: false, reason: 'not-accepted' });
+  });
+
+  it('refuses a table that belongs to another document', () => {
+    const foreign = build({ path: 'C:/other.pdf', accepted: true });
+    const request = captureExportRequest(session, [build({ accepted: true })])!;
+    expect(ownedAcceptedRegions(request, { session, regions: [foreign] }))
+      .toEqual({ ok: false, reason: 'foreign-region' });
+  });
+
+  it('refuses an empty request rather than exporting whatever is checked now', () => {
+    const live = setAcceptedAll([build()], true);
+    expect(ownedAcceptedRegions({ session, regions: [] }, { session, regions: live }))
+      .toEqual({ ok: false, reason: 'nothing-accepted' });
+  });
+
+  it('captures independent nested values and refuses in-place changes too', () => {
+    const live = setAcceptedAll([build()], true);
+    const request = captureExportRequest(session, live)!;
+    live[0].columns[1] = 0.8;
+    live[0].rect.x = 0.5;
+    live[0].rows[0] = 0.2;
+    expect(request.regions[0].columns[1]).toBe(0.25);
+    expect(request.regions[0].rect.x).toBe(0.1);
+    expect(request.regions[0].rows[0]).toBe(0.1);
+    expect(ownedAcceptedRegions(request, { session, regions: live }))
+      .toEqual({ ok: false, reason: 'changed-region' });
+  });
+
+  it('refuses ambiguous identities and does not widen a captured set', () => {
+    const live = setAcceptedAll([build()], true);
+    const request = captureExportRequest(session, live)!;
+    expect(ownedAcceptedRegions(request, { session, regions: [...live, ...live] }))
+      .toEqual({ ok: false, reason: 'duplicate-region' });
+    expect(ownedAcceptedRegions({ ...request, regions: [...request.regions, ...request.regions] }, { session, regions: live }))
+      .toEqual({ ok: false, reason: 'duplicate-region' });
+    expect(ownedAcceptedRegions(request, { session, regions: [...live, build({ id: 'later', accepted: true })] }))
+      .toEqual({ ok: true, regions: request.regions });
   });
 });

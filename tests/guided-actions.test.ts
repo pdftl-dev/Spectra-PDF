@@ -525,7 +525,9 @@ describe('the create_pdf source step', () => {
       resolve(__dirname, '../src/engine/guided_actions.py'),
       'utf-8',
     );
-    const block = engine.slice(engine.indexOf('"create_pdf": ('));
+    const row = engine.indexOf('"create_pdf": _Step(');
+    expect(row, 'the create_pdf row of _STEPS').toBeGreaterThan(-1);
+    const block = engine.slice(row);
     for (const p of catalogDef.params) {
       expect(block.slice(0, 600), p.key).toContain(`"${p.key}"`);
     }
@@ -596,7 +598,9 @@ describe('the create_pdf source step', () => {
 describe('the two step catalogs are pinned against each other', () => {
   const fixture = JSON.parse(
     readFileSync(resolve(__dirname, 'fixtures/guided-step-catalog.json'), 'utf8'),
-  ) as { steps: Record<string, { method: string; params: string[]; tools: string[] }> };
+  ) as {
+    steps: Record<string, { method: string; params: string[]; tools: string[] }>;
+  };
 
   it('offers exactly the ops the engine dispatches, in both directions', () => {
     expect([...STEP_CATALOG].map((d) => d.op).sort()).toEqual(Object.keys(fixture.steps).sort());
@@ -630,9 +634,10 @@ describe('the two step catalogs are pinned against each other', () => {
     // mojibake baked into the page.
     // `jbig2_path` is the one engine tool path with no flag: the panel
     // never resolves it, so the MRC arm of a guided compress takes the
-    // encoder the engine finds for itself.
+    // encoder the engine finds for itself. `gs_path` has no flag either: the
+    // runner hands it wherever the engine's plan names a need other than
+    // `never`, and the engine suite ties that need to this same tool list.
     const FLAGS: Record<string, (d: StepDef) => boolean> = {
-      gs_path: (d) => d.needsGs === true,
       font_dir: (d) => d.needsFontDir === true,
       tesseract_path: (d) => d.needsTesseract === true,
       soffice_path: (d) => d.needsSoffice === true,
@@ -643,7 +648,7 @@ describe('the two step catalogs are pinned against each other', () => {
         expect(flagged(def), `${def.op}.${tool}`).toBe(tools.has(tool));
       }
       expect(
-        fixture.steps[def.op].tools.filter((t) => !(t in FLAGS)),
+        fixture.steps[def.op].tools.filter((t) => !(t in FLAGS) && t !== 'gs_path'),
         `${def.op} takes a tool path the editor has no flag for`,
       ).toEqual(def.op === 'compress' ? ['jbig2_path'] : []);
     }

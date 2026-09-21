@@ -229,6 +229,192 @@ export function acceptedRegions(regions: readonly TableRegion[]): TableRegion[] 
   return regions.filter((r) => r.accepted);
 }
 
+/**
+ * The revision a review was read from.
+ *
+ * A region's geometry and the cells the export reads back describe ONE set of
+ * bytes: the working copy the detector was pointed at, as it stood at that
+ * moment. `path` is the document's stable identity and is not where those
+ * bytes live; `workingPath` is, and `buffer` is the exact revision object the
+ * workspace held for it. A review is meaningful against this and nothing
+ * else — a commit, an undo, another tool's rewrite or a reopen replaces the
+ * buffer, and the review stops describing what is on screen.
+ */
+export interface TableReviewSession {
+  path: string;
+  workingPath: string;
+  /** Compared by identity only; the bytes are never read here. */
+  buffer: object;
+}
+
+/** Whether `session` still describes `file` — the same working copy and the
+ * same buffer object. A missing file is a session with nothing to describe. */
+export function sessionMatches(
+  session: TableReviewSession | null,
+  file: { workingPath: string; buffer: object | null } | undefined,
+): boolean {
+  return session !== null && file !== undefined && file.buffer !== null
+    && file.workingPath === session.workingPath && file.buffer === session.buffer;
+}
+
+interface IndexedPage {
+  id: string; sourceDocId: string; sourcePageIndex: number; rotation?: number;
+}
+
+interface IndexedDoc<P extends IndexedPage> {
+  path: string; workingPath: string; buffer: object | null; pages: readonly P[];
+}
+
+/**
+ * What the workspace index says about a session's physical pages.
+ *
+ * `behind` and `contradicted` are different facts: the index is published by
+ * an async reindex, so a document opened a moment ago is not yet in it at all,
+ * or is in it under the previous buffer — the session's bytes are not in
+ * question there, only whether the index has caught up. A page that names
+ * another document, or two pages claiming one physical index, is the index
+ * DISPROVING the projection, and no amount of waiting makes it true.
+ */
+export type ReviewIndexState<P extends IndexedPage> =
+  | { kind: 'ready'; pages: Map<number, P> }
+  | { kind: 'behind' }
+  | { kind: 'contradicted' };
+
+export function reviewIndexState<P extends IndexedPage>(
+  session: TableReviewSession,
+  docs: readonly IndexedDoc<P>[],
+): ReviewIndexState<P> {
+  const owned = docs.filter((doc) => doc.path === session.path);
+  if (owned.length === 0 || owned.some((doc) => !sessionMatches(session, doc))) {
+    return { kind: 'behind' };
+  }
+  const pages = new Map<number, P>();
+  const ids = new Set<string>();
+  for (const doc of owned) for (const page of doc.pages) {
+    if (page.sourceDocId !== session.path || !Number.isSafeInteger(page.sourcePageIndex)
+        || page.sourcePageIndex < 0 || pages.has(page.sourcePageIndex + 1) || ids.has(page.id)) {
+      return { kind: 'contradicted' };
+    }
+    pages.set(page.sourcePageIndex + 1, page);
+    ids.add(page.id);
+  }
+  return { kind: 'ready', pages };
+}
+
+/** A detector addresses physical file pages, not a manifest partition's slots.
+ * Only a complete current index can project those addresses onto the canvas. */
+export function tableReviewPages<P extends IndexedPage>(
+  session: TableReviewSession,
+  docs: readonly IndexedDoc<P>[],
+): Map<number, P> | null {
+  const state = reviewIndexState(session, docs);
+  return state.kind === 'ready' ? state.pages : null;
+}
+
+/**
+ * The index a review is projected onto, waited for.
+ *
+ * Detection finishes against the file's bytes; the index that says which
+ * on-screen page each physical page is arrives from the async reindex, and for
+ * a document opened moments earlier — a `.pdfx` whose manifest partitions are
+ * read during that index — it can arrive after. Waiting is not a weakened
+ * check: `isCurrent` still proves the workspace holds the session's exact
+ * bytes on every pass, so what is awaited is only the index catching up to
+ * them. Bytes that move, an index that contradicts the projection, or a wait
+ * that outlasts the deadline all refuse.
+ */
+export async function awaitReviewPages<P extends IndexedPage>(
+  session: TableReviewSession,
+  getDocs: () => readonly IndexedDoc<P>[],
+  isCurrent: () => boolean,
+  options: { timeoutMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<Map<number, P> | null> {
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const sleep = options.sleep
+    ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!isCurrent()) return null;
+    const state = reviewIndexState(session, getDocs());
+    if (state.kind === 'ready') return state.pages;
+    if (state.kind === 'contradicted' || Date.now() >= deadline) return null;
+    await sleep(50);
+  }
+}
+
+/** What an export was asked for, captured before any await: the revision and
+ * the exact tables the reviewer had accepted at that moment. */
+export interface TableExportRequest {
+  session: TableReviewSession;
+  regions: readonly TableRegion[];
+}
+
+export function captureExportRequest(
+  session: TableReviewSession | null,
+  regions: readonly TableRegion[],
+): TableExportRequest | null {
+  if (session === null) return null;
+  const selected = acceptedRegions(regions).filter((r) => r.path === session.path);
+  if (selected.length === 0) return null;
+  return {
+    session: { ...session },
+    regions: selected.map((r) => ({
+      ...r, rect: { ...r.rect }, columns: [...r.columns], rows: [...r.rows],
+    })),
+  };
+}
+
+export type OwnershipRefusal = 'stale-session' | 'missing-region' | 'foreign-region'
+  | 'not-accepted' | 'nothing-accepted' | 'changed-region' | 'duplicate-region';
+
+function sameReviewedRegion(a: TableRegion, b: TableRegion): boolean {
+  return a.id === b.id && a.path === b.path && a.pageId === b.pageId && a.page === b.page
+    && a.accepted === b.accepted && a.rotationAtDraw === b.rotationAtDraw
+    && a.totalRotationAtDraw === b.totalRotationAtDraw && a.caption === b.caption
+    && a.cells === b.cells && a.evidence === b.evidence
+    && a.rect.x === b.rect.x && a.rect.y === b.rect.y
+    && a.rect.w === b.rect.w && a.rect.h === b.rect.h
+    && a.columns.length === b.columns.length && a.columns.every((v, i) => v === b.columns[i])
+    && a.rows.length === b.rows.length && a.rows.every((v, i) => v === b.rows[i]);
+}
+
+/**
+ * The tables an export may write, resolved against what is live NOW.
+ *
+ * Every table the request named must still exist, still be accepted, and
+ * belong to the request's own document; the request's revision must be the
+ * one the live set was read from. Anything else is refused by name rather
+ * than exported from whatever happens to be current — a workbook the
+ * reviewer believes carries the tables they checked must carry those tables,
+ * from those bytes, or not exist.
+ */
+export function ownedAcceptedRegions(
+  request: TableExportRequest,
+  live: { session: TableReviewSession | null; regions: readonly TableRegion[] },
+): { ok: true; regions: TableRegion[] } | { ok: false; reason: OwnershipRefusal } {
+  const { session } = request;
+  if (live.session === null || live.session.path !== session.path
+      || live.session.workingPath !== session.workingPath || live.session.buffer !== session.buffer) {
+    return { ok: false, reason: 'stale-session' };
+  }
+  if (request.regions.length === 0) return { ok: false, reason: 'nothing-accepted' };
+  const byId = new Map(live.regions.map((r) => [r.id, r] as const));
+  if (byId.size !== live.regions.length
+      || new Set(request.regions.map((r) => r.id)).size !== request.regions.length) {
+    return { ok: false, reason: 'duplicate-region' };
+  }
+  const out: TableRegion[] = [];
+  for (const captured of request.regions) {
+    const region = byId.get(captured.id);
+    if (!region) return { ok: false, reason: 'missing-region' };
+    if (region.path !== session.path) return { ok: false, reason: 'foreign-region' };
+    if (!region.accepted) return { ok: false, reason: 'not-accepted' };
+    if (!sameReviewedRegion(captured, region)) return { ok: false, reason: 'changed-region' };
+    out.push(captured);
+  }
+  return { ok: true, regions: out };
+}
+
 export type TriState = 'none' | 'some' | 'all';
 
 export function selectionState(regions: readonly TableRegion[]): TriState {

@@ -55,6 +55,7 @@ const noopHandlers = (): AppCommandHandlers => ({
   openFilesInPlace: vi.fn(async () => {}),
   openFromWeb: vi.fn(() => {}),
   openPath: vi.fn(async () => {}),
+  openRecentEntry: vi.fn(async () => {}),
   openPathAtPage: vi.fn(async () => {}),
   save: vi.fn(async () => {}),
   saveAs: vi.fn(async () => {}),
@@ -134,7 +135,7 @@ describe('enablement helpers', () => {
   it('canUndo/canRedo: page tier first, then the active file snapshots', () => {
     expect(canUndo(initialState)).toBe(false);
     const pageTier = stateWith({
-      pageUndoStack: [{ documents: [], dirtyPaths: [] }],
+      pageUndoStack: [{ documents: [], dirtyPaths: [], action: { type: 'REMOVE_DOC', docId: 'a' } }],
     });
     expect(canUndo(pageTier)).toBe(true);
     const snapshots = stateWith({
@@ -287,8 +288,8 @@ describe('the ghost import-source hazard', () => {
   // several meant `activeFileId !== null`, which is a different question.
   it('CLOSE_FILE lands on neither a ghost tab nor a ghost active file', () => {
     // Both fallbacks, checked together. The tab fallback was ghost-aware from
-    // the start; the ACTIVE-ID fallback wasn't, and the review showed why
-    // that mattered — see the two cases below. Now that the active id can't be
+    // the start; the ACTIVE-ID fallback wasn't, and the two cases below show why
+    // that matters. Now that the active id can't be
     // a ghost either, the tab guard is belt-and-braces rather than the thing
     // holding the invariant up, and both must stay true.
     let s = appReducer(initialState, {
@@ -389,7 +390,7 @@ describe('the ghost import-source hazard', () => {
   });
 
   it('SET_ACTIVE_FILE REFUSES a ghost — Save would overwrite the real file', () => {
-    // The worst reachable path this milestone found. A ghost's `path` is the
+    // The worst reachable path: a ghost's `path` is the
     // ORIGINAL file the user imported from, and File ▸ Save writes the working
     // copy back over `activeFile.path` with no dialog. So a ghost active file
     // is not a cosmetic mix-up: it is a silent overwrite of a real file on
@@ -707,6 +708,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -762,6 +764,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -836,6 +839,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -890,6 +894,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -1102,10 +1107,12 @@ describe('invokeCommand', () => {
     expect(invokeCommand('file.clearRecent')).toBe(false);
   });
 
-  it('file.clearRecent clears a non-empty recent list', () => {
+  it('file.clearRecent clears a non-empty recent list', async () => {
     const { dispatched } = wire(stateWith({ ui: { ...initialState.ui, recentFiles: [{ path: 'a.pdf', openedAt: null }] } }));
     expect(invokeCommand('file.clearRecent')).toBe(true);
-    expect(dispatched.at(-1)).toEqual({ type: 'UI_SET_RECENT_FILES', files: [] });
+    await vi.waitFor(() => {
+      expect(dispatched.at(-1)).toEqual({ type: 'UI_SET_RECENT_FILES', files: [] });
+    });
   });
 
   it('zoom commands require a mounted canvas handle', () => {
@@ -1151,6 +1158,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -1206,6 +1214,7 @@ describe('invokeCommand', () => {
       tableReview: {
         publish: async () => ({ shown: 0, skipped: 0 }),
         list: () => [],
+        session: () => null,
         update: () => {},
         clear: () => {},
         focus: () => {},
@@ -1405,9 +1414,9 @@ describe('Space temporary hand', () => {
 });
 
 describe('single-key accelerators at the DISPATCHER', () => {
-  // resolveBinding is pure and never consults settings; THIS is the gate the
-  // milestone is about, and deleting it passed the whole suite before these
-  // (regression). localStorage stub = the workbench-ui.test idiom.
+  // resolveBinding is pure and never consults settings; THIS is the gate, and
+  // without these cases deleting it passes the whole suite (regression).
+  // localStorage stub = the workbench-ui.test idiom.
   function letter(key: string, repeat = false): KeyboardEvent {
     return {
       key, repeat, target: null,

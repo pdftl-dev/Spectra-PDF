@@ -3,6 +3,7 @@
 // and the buffer-identity invalidation that moved with them.
 import { describe, expect, it } from 'vitest';
 import { appReducer, initialState } from '../src/renderer/state/reducer';
+import { committedDocuments } from '../src/renderer/lib/workspace-commit';
 import type { AppAction, AppState, OpenDocument, OpenFile, PageRef } from '../src/renderer/state/types';
 import { NAV_PANE_MAX_WIDTH, NAV_PANE_MIN_WIDTH } from '../src/renderer/state/types';
 import { selectedPageNumbers } from '../src/renderer/state/selectors';
@@ -114,11 +115,9 @@ describe('ui per-document focus', () => {
   // content") is structurally impossible, and the correct behavior is to
   // KEEP a focus whose id survives.
   it('KEEPS a per-doc focus whose id survives the reindex (adoption)', () => {
-    const a = makeFile('book.pdfx', 5);
-    const focused = appReducer(
-      { ...partitionedState(), activeFileId: 'book.pdfx' },
-      { type: 'UI_FOCUS_DOC', docId: 'book.pdfx#1' },
-    );
+    const start = { ...partitionedState(), activeFileId: 'book.pdfx' };
+    const a = start.files.get('book.pdfx')!;
+    const focused = appReducer(start, { type: 'UI_FOCUS_DOC', docId: 'book.pdfx#1' });
     expect(focused.ui.focusedDocId).toBe('book.pdfx#1');
     // An authored commit reindexed; adoption carried the doc ids through.
     const reindexed = appReducer(focused, {
@@ -164,11 +163,9 @@ describe('ui per-document focus', () => {
   });
 
   it('drops a per-doc focus when the focused id vanishes (partitions collapse to one)', () => {
-    const a = makeFile('book.pdfx', 5);
-    const focused = appReducer(
-      { ...partitionedState(), activeFileId: 'book.pdfx' },
-      { type: 'UI_FOCUS_DOC', docId: 'book.pdfx#1' },
-    );
+    const start = { ...partitionedState(), activeFileId: 'book.pdfx' };
+    const a = start.files.get('book.pdfx')!;
+    const focused = appReducer(start, { type: 'UI_FOCUS_DOC', docId: 'book.pdfx#1' });
     const reindexed = appReducer(focused, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'book.pdfx',
@@ -222,11 +219,13 @@ describe('ui per-document focus', () => {
 
   it('leaves a per-doc focus alone when a DIFFERENT path re-indexes', () => {
     const focused = appReducer(twoDocState(), { type: 'UI_FOCUS_DOC', docId: 'b.pdf#0' });
+    const a = focused.files.get('a.pdf')!;
     const reindexed = appReducer(focused, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
-      documents: [makeDoc(makeFile('a.pdf', 3), 'a.pdf#0', makePages('a.pdf', 3))],
+      documents: [makeDoc(a, 'a.pdf#g3#0', makePages('a.pdf#g3', 3))],
     });
+    expect(reindexed.workspace).not.toBe(focused.workspace);
     expect(reindexed.ui.focusedDocId).toBe('b.pdf#0');
   });
 
@@ -253,8 +252,8 @@ describe('ui per-document focus', () => {
   // case — same id, same logical page — so the reading position holds. One
   // whose id vanishes (fresh generation) still clears.
   it('keeps the current page when its id survives the reindex; clears when it vanishes', () => {
-    const a = makeFile('a.pdf', 3);
     const s = appReducer(twoDocState(), { type: 'UI_SET_CURRENT_PAGE', pageId: 'a.pdf#p2' });
+    const a = s.files.get('a.pdf')!;
     const adopted = appReducer(s, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
@@ -295,8 +294,8 @@ describe('ui per-document focus', () => {
 
   // Selection joins the same survive-or-prune pass.
   it('prunes the selection to ids the incoming documents still carry', () => {
-    const a = makeFile('a.pdf', 3);
     let s = select(twoDocState(), ['a.pdf#p0', 'a.pdf#p2', 'b.pdf#p0'], 'a.pdf#p2');
+    const a = s.files.get('a.pdf')!;
     s = appReducer(s, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
@@ -308,8 +307,8 @@ describe('ui per-document focus', () => {
   });
 
   it("a fresh-generation reindex prunes ALL of the path's selection but keeps other files", () => {
-    const a = makeFile('a.pdf', 2);
     let s = select(twoDocState(), ['a.pdf#p0', 'b.pdf#p0'], 'a.pdf#p0');
+    const a = s.files.get('a.pdf')!;
     s = appReducer(s, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
@@ -329,15 +328,15 @@ describe('ui per-document focus', () => {
   });
 
   it('leaves the current page alone when a DIFFERENT file re-indexes', () => {
-    const b = makeFile('b.pdf', 2);
     const s = appReducer(twoDocState(), { type: 'UI_SET_CURRENT_PAGE', pageId: 'b.pdf#p0' });
+    const a = s.files.get('a.pdf')!;
     const reindexed = appReducer(s, {
       type: 'SET_WORKSPACE_DOCUMENTS',
       path: 'a.pdf',
-      documents: [makeDoc(makeFile('a.pdf', 3), 'a.pdf#0', makePages('a.pdf', 3))],
+      documents: [makeDoc(a, 'a.pdf#g3#0', makePages('a.pdf#g3', 3))],
     });
+    expect(reindexed.workspace).not.toBe(s.workspace);
     expect(reindexed.ui.currentPageId).toBe('b.pdf#p0');
-    void b;
   });
 
   it('clearing to null returns to the default (first doc of the active file)', () => {
@@ -402,8 +401,7 @@ describe('ui tab/tool actions', () => {
 
   // A document OPENS in the reading view (a PDF is something you
   // read; the board is the tool you switch to when you want to rearrange it).
-  // Pinned so the flip can't be silently reverted: it was held back until every
-  // default-flip gate closed, and un-flipping would quietly undo that milestone.
+  // Pinned so the default can't be silently reverted.
   it('opens in the READING view by default', () => {
     expect(initialState.ui.docViewMode).toBe('document');
   });
@@ -585,17 +583,22 @@ describe('UI_SELECT_ALL_PAGES / UI_CLEAR_SELECTION', () => {
 
 describe('selection invalidation on buffer-identity changes (per-path prune)', () => {
   // Non-authored buffer changes prune ONLY the touched path's
-  // selection ids (their reindex mints a fresh generation — nothing could
-  // survive) and LEAVE other files' selection intact; the authored commit
-  // defers entirely to the SET_WORKSPACE_DOCUMENTS survive-or-prune pass
-  // (adoption lets its ids live).
+  // selection ids (the documents read from their bytes carry a fresh
+  // generation — nothing could survive) and LEAVE other files' selection
+  // intact; the authored commit defers entirely to the SET_WORKSPACE_DOCUMENTS
+  // survive-or-prune pass (adoption lets its ids live).
+  const readA = (buffer: number[]): OpenDocument[] =>
+    [makeDoc({ ...makeFile('a.pdf', 3), buffer }, 'a.pdf#g9#0',
+      makePages('a.pdf', 3).map((p, i) => ({ ...p, id: `a.pdf#g9#p${i}` })))];
   const cases: [string, (s: AppState) => AppAction][] = [
-    ['UPDATE_FILE', () => ({
-      type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 3, buffer: [9], snapshotPath: 'snap',
-    })],
-    ['REFRESH_BUFFER', () => ({
-      type: 'REFRESH_BUFFER', path: 'a.pdf', pageCount: 3, buffer: [9],
-    })],
+    ['UPDATE_FILE', () => {
+      const buffer = [9];
+      return { type: 'UPDATE_FILE', path: 'a.pdf', pageCount: 3, buffer, snapshotPath: 'snap', documents: readA(buffer) };
+    }],
+    ['REFRESH_BUFFER', () => {
+      const buffer = [9];
+      return { type: 'REFRESH_BUFFER', path: 'a.pdf', pageCount: 3, buffer, documents: readA(buffer) };
+    }],
     ['CLOSE_FILE', () => ({ type: 'CLOSE_FILE', path: 'a.pdf' })],
   ];
   for (const [name, make] of cases) {
@@ -613,7 +616,7 @@ describe('selection invalidation on buffer-identity changes (per-path prune)', (
     });
   }
 
-  // The phantom-id class (regression, both lenses): CLOSE_FILE
+  // The phantom-id class (regression): CLOSE_FILE
   // removes pages by CONTAINMENT (the path's documents, wholesale) AND by
   // SOURCE (its pages stripped out of other documents) — the prune must
   // cover the same union, or a dead id survives in the selection forever
@@ -659,17 +662,46 @@ describe('selection invalidation on buffer-identity changes (per-path prune)', (
     expect(selected(s)).toEqual(['b.pdf#p0']);
   });
 
-  it('COMMIT_PAGE_EDITS keeps the whole selection (adoption decides at reindex)', () => {
+  it('COMMIT_PAGE_EDITS keeps the whole selection (the committed documents keep the planned ids)', () => {
     const s = select(twoDocState(), ['a.pdf#p0', 'b.pdf#p0'], 'a.pdf#p0');
+    const buffer = [9];
     const next = appReducer(s, {
       type: 'COMMIT_PAGE_EDITS',
       updates: [{
-        path: 'a.pdf', pageCount: 3, buffer: [9], snapshotPath: 'snap',
+        path: 'a.pdf', pageCount: 3, buffer, snapshotPath: 'snap',
         authored: { pages: ['a.pdf#p0', 'a.pdf#p1', 'a.pdf#p2'], documents: [{ id: 'a#0', name: 'a' }] },
+        documents: committedDocuments(s.workspace.documents.filter((d) => d.path === 'a.pdf'), buffer),
       }],
+      planned: { pageUndoStack: s.pageUndoStack, pageRedoStack: s.pageRedoStack },
     });
     expect(next.ui.selectedPageIds.size).toBe(2);
     expect(next.ui.selectionAnchor).toBe('a.pdf#p0');
+  });
+
+  it('COMMIT_PAGE_EDITS prunes a selected page an edit made during the commit could not carry', () => {
+    // The page came from a.pdf's previous bytes; the commit replaced them, so
+    // the import made while it ran cannot be carried onto the committed file.
+    const s0 = twoDocState();
+    const stale = s0.files.get('a.pdf')!.buffer!;
+    const imported = appReducer(s0, {
+      type: 'IMPORT_PAGES', toDocId: 'b.pdf#0', toIndex: 0,
+      pages: [{ ...makePages('a.pdf', 1)[0], id: 'copy' }],
+      sources: [{ path: 'a.pdf', buffer: stale }],
+    });
+    const s = select(imported, ['copy', 'b.pdf#p0'], 'copy');
+    const buffer = [9];
+    const next = appReducer(s, {
+      type: 'COMMIT_PAGE_EDITS',
+      updates: [{
+        path: 'a.pdf', pageCount: 3, buffer, snapshotPath: 'snap',
+        authored: { pages: ['a.pdf#p0', 'a.pdf#p1', 'a.pdf#p2'], documents: [{ id: 'a.pdf#0', name: 'a' }] },
+        documents: committedDocuments(s0.workspace.documents.filter((d) => d.path === 'a.pdf'), buffer),
+      }],
+      planned: { pageUndoStack: s0.pageUndoStack, pageRedoStack: s0.pageRedoStack },
+    });
+    expect(next.pageEditRefusals).toBe(1);
+    expect(selected(next)).toEqual(['b.pdf#p0']);
+    expect(next.ui.selectionAnchor).toBeNull();
   });
 
   it('a REOPEN (OPEN_FILE on an open path) prunes its own path only; a fresh OPEN_FILE does not touch selection', () => {

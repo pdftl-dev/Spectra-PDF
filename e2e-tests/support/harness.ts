@@ -99,13 +99,45 @@ export async function openMenuItem(menuTestId: string, itemTestId: string): Prom
   const trigger = $(`[data-testid="${menuTestId}"]`);
   await trigger.waitForDisplayed({ timeout: 15_000 });
 
+  // The item is probed in the page rather than through an element reference
+  // the driver holds across the round trip: a menu instance that is closing
+  // is removed WHILE the probe is in flight, which answers the probe with a
+  // stale-element failure for a node whose removal is the point. The probe
+  // also refuses a menu that is CLOSING (Radix marks the content it is in
+  // `data-state="closed"`), so the trigger is re-clicked rather than the item
+  // reported as ready on a node about to go. The state is read from the
+  // ancestry only — a submenu TRIGGER carries `closed` for its own submenu
+  // while sitting in a perfectly open menu.
+  const itemShown = async (): Promise<boolean> =>
+    await browser.execute(function (testid: string) {
+      const el = document.querySelector('[data-testid="' + testid + '"]');
+      if (!(el instanceof HTMLElement)) return false;
+      if (el.parentElement?.closest('[data-state="closed"]')) return false;
+      if (typeof el.checkVisibility === 'function') {
+        return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    }, itemTestId);
+
+  // Shown TWICE across a settle: the dismissal this function exists to
+  // survive arrives tens of milliseconds after the menu opens, so a single
+  // observation can be of a menu already on its way out — and the caller's
+  // next act is a click on that item. Re-issuing the trigger is the remedy
+  // either way, which is why the check loops rather than throwing here.
+  const itemSettled = async (): Promise<boolean> => {
+    if (!(await itemShown())) return false;
+    await browser.pause(150);
+    return await itemShown();
+  };
+
   await browser.waitUntil(
     async () => {
-      if (await $(`[data-testid="${itemTestId}"]`).isDisplayed()) return true;
+      if (await itemSettled()) return true;
       if ((await trigger.getAttribute('aria-expanded')) !== 'true') {
         await trigger.click();
       }
-      return await $(`[data-testid="${itemTestId}"]`).isDisplayed();
+      return await itemSettled();
     },
     {
       timeout: 20_000,
@@ -145,15 +177,461 @@ export async function setActiveOp(op: string): Promise<void> {
   );
 }
 
+/** What the store command rejects with when the store refuses. */
+export interface PinnedStoreRefusal {
+  reason: 'open-failed' | 'unsupported';
+  code: string | null;
+  message: string;
+}
+
+/**
+ * Pin what the certificate-store enumeration answers.
+ *
+ * `{ rows: [] }` is an empty store, `{ error }` a store that refuses in the
+ * shape the command serializes, and `null` unpins so the next read goes to
+ * Windows for real. `delayMs` holds the answer back so the window before it
+ * lands can be observed. An empty or refusing store cannot be arranged from
+ * outside: a suite may not delete the machine's own certificates, and the IPC
+ * is not stubbable from the page.
+ */
+export async function pinStoreCertificates(
+  answer:
+    | { rows: unknown[]; delayMs?: number }
+    | { error: PinnedStoreRefusal; delayMs?: number }
+    | null,
+): Promise<void> {
+  await browser.execute<void, [unknown]>(
+    function (a) {
+      (window as any).__SPECTRA_TEST__.storeCertsPin(a);
+    },
+    answer,
+  );
+}
+
+/** Switch the UI language live, the way Preferences does. A layout assertion
+ * that only ever runs in `en` proves nothing about the locale whose label is
+ * longest. */
+export async function setUiLanguage(code: string): Promise<void> {
+  await browser.execute<void, [string]>(
+    function (c) {
+      (window as any).__SPECTRA_TEST__.setLanguage(c);
+    },
+    code,
+  );
+  await browser.waitUntil(
+    async () => (await browser.execute(() => document.documentElement.lang)) === code,
+    { timeout: 10_000, timeoutMsg: `the UI never switched to ${code}` },
+  );
+}
+
+/** Resize the tool dock. The reducer clamps, so a value below the minimum
+ * lands exactly ON the minimum — which is the width a panel has to survive. */
+export async function setToolDockWidth(width: number): Promise<void> {
+  await browser.execute<void, [number]>(
+    function (w) {
+      (window as any).__SPECTRA_TEST__.setToolDockWidth(w);
+    },
+    width,
+  );
+}
+
+export interface MeasuredBox {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+export interface BoxFit {
+  /** The element's box lies inside the container's client box along the INLINE
+   * axis. This is the one a clipped control fails: `overflow: hidden` narrows
+   * what is painted, never the box `getBoundingClientRect` reports. */
+  insideHorizontally: boolean;
+  /** The same along the block axis. A long panel that scrolls is not clipped,
+   * so this is information, not a verdict. */
+  insideVertically: boolean;
+  element: MeasuredBox;
+  container: MeasuredBox;
+}
+
+/**
+ * Measure one element against a container's CLIENT box, WITHOUT scrolling.
+ *
+ * Nothing here may scroll first: `overflow: hidden` still makes a scroll
+ * container, so `scrollIntoView` slides a clipped control into its clipping
+ * parent's visible strip and makes a clipped layout measure as a fitting one.
+ * That is also why a testid click proves nothing — WebDriver scrolls before it
+ * clicks.
+ */
+export async function boxFit(selector: string, containerSelector: string): Promise<BoxFit> {
+  return browser.execute(
+    function (sel: string, contSel: string) {
+      const el = document.querySelector(sel);
+      const cont = document.querySelector(contSel);
+      if (!el) throw new Error(`boxFit: no element for ${sel}`);
+      if (!cont) throw new Error(`boxFit: no container for ${contSel}`);
+      const e = el.getBoundingClientRect();
+      const c = cont.getBoundingClientRect();
+      // The container's client box, so its own scrollbar gutter is not counted
+      // as room the element may occupy.
+      const right = c.left + cont.clientLeft + cont.clientWidth;
+      const bottom = c.top + cont.clientTop + cont.clientHeight;
+      const left = c.left + cont.clientLeft;
+      const top = c.top + cont.clientTop;
+      const round = (b: MeasuredBox): MeasuredBox => ({
+        left: Math.round(b.left),
+        right: Math.round(b.right),
+        top: Math.round(b.top),
+        bottom: Math.round(b.bottom),
+        width: Math.round(b.width),
+        height: Math.round(b.height),
+      });
+      return {
+        insideHorizontally: e.width > 0 && e.left >= left - 0.5 && e.right <= right + 0.5,
+        insideVertically: e.height > 0 && e.top >= top - 0.5 && e.bottom <= bottom + 0.5,
+        element: round({ left: e.left, right: e.right, top: e.top, bottom: e.bottom, width: e.width, height: e.height }),
+        container: round({ left, right, top, bottom, width: cont.clientWidth, height: cont.clientHeight }),
+      };
+    },
+    selector,
+    containerSelector,
+  ) as Promise<BoxFit>;
+}
+
+export interface HorizontalOverflow {
+  /** `scrollWidth - clientWidth`. Blind on its own: it counts only what lies
+   * past the END edge in the scroll direction, so content poking out of the
+   * START edge reads zero. */
+  scroll: number;
+  /** The furthest any descendant pokes out of the container's client box on
+   * the left, in px. */
+  left: number;
+  /** The same on the right. */
+  right: number;
+  /** What the container tagged as poking out, for the failure message. */
+  worst: { testid: string | null; tag: string; text: string; left: number; right: number } | null;
+}
+
+/**
+ * How far a container's content overflows it along the inline axis, measured
+ * at BOTH edges.
+ *
+ * `scrollWidth - clientWidth` alone is not enough: it measures only past the
+ * END edge in the scroll direction, so content poking out of the START edge
+ * reads zero — and in a scroll container that start-side strip is clipped and
+ * cannot be scrolled back into view.
+ */
+export async function horizontalOverflow(containerSelector: string): Promise<HorizontalOverflow> {
+  return browser.execute(function (sel: string) {
+    const el = document.querySelector(sel) as HTMLElement | null;
+    if (!el) throw new Error(`horizontalOverflow: no container for ${sel}`);
+    const rect = el.getBoundingClientRect();
+    // The client box in page coordinates, with the current scroll applied so a
+    // scrolled container is compared against what it is showing.
+    const clientLeft = rect.left + el.clientLeft;
+    const clientRight = clientLeft + el.clientWidth;
+    let left = 0;
+    let right = 0;
+    let worst: { testid: string | null; tag: string; text: string; left: number; right: number } | null = null;
+    el.querySelectorAll('*').forEach((node) => {
+      const r = node.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      const overLeft = clientLeft - r.left;
+      const overRight = r.right - clientRight;
+      const over = Math.max(overLeft, overRight);
+      if (over <= 0.5) return;
+      if (overLeft > left) left = overLeft;
+      if (overRight > right) right = overRight;
+      if (!worst || over > Math.max(clientLeft - worst.left, worst.right - clientRight)) {
+        worst = {
+          testid: node.getAttribute('data-testid'),
+          tag: node.tagName + '.' + (node.getAttribute('class') ?? '').slice(0, 40),
+          text: (node.textContent ?? '').trim().slice(0, 40),
+          left: Math.round(r.left),
+          right: Math.round(r.right),
+        };
+      }
+    });
+    return {
+      scroll: el.scrollWidth - el.clientWidth,
+      left: Math.round(left),
+      right: Math.round(right),
+      worst,
+    };
+  }, containerSelector) as Promise<HorizontalOverflow>;
+}
+
+export interface RowMetrics {
+  /** The row's own box. */
+  width: number;
+  height: number;
+  /** The container's CONTENT width — its client box less its own padding,
+   * which is the width a full-width child can actually occupy. */
+  containerWidth: number;
+  /** The most line boxes any single TEXT NODE in the row occupies. Counted
+   * from the node's own line fragments, so a label whose text sits directly
+   * beside an element child is measured too. */
+  lines: number;
+  insideHorizontally: boolean;
+}
+
+/**
+ * Measure one row's legibility against its container, WITHOUT scrolling.
+ *
+ * Containment is not enough once labels wrap: a squeezed control stays inside
+ * its panel and grows taller instead. Width against the container's content
+ * box and a per-text-node line count are what separate a laid-out row from a
+ * squeezed one.
+ */
+export async function rowMetrics(selector: string, containerSelector: string): Promise<RowMetrics> {
+  return browser.execute(
+    function (sel: string, contSel: string) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      const cont = document.querySelector(contSel) as HTMLElement | null;
+      if (!el) throw new Error(`rowMetrics: no element for ${sel}`);
+      if (!cont) throw new Error(`rowMetrics: no container for ${contSel}`);
+      const r = el.getBoundingClientRect();
+      const c = cont.getBoundingClientRect();
+      const clientLeft = c.left + cont.clientLeft;
+      const clientRight = clientLeft + cont.clientWidth;
+      const contStyle = window.getComputedStyle(cont);
+      const pad = (parseFloat(contStyle.paddingLeft) || 0) + (parseFloat(contStyle.paddingRight) || 0);
+      let lines = 0;
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+        if (!(t.textContent ?? '').trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(t);
+        const tops = new Set<number>();
+        for (const fr of Array.from(range.getClientRects())) {
+          if (fr.width > 0 && fr.height > 0) tops.add(Math.round(fr.top));
+        }
+        if (tops.size > lines) lines = tops.size;
+      }
+      return {
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+        containerWidth: Math.round(cont.clientWidth - pad),
+        lines,
+        insideHorizontally: r.width > 0 && r.left >= clientLeft - 0.5 && r.right <= clientRight + 0.5,
+      };
+    },
+    selector,
+    containerSelector,
+  ) as Promise<RowMetrics>;
+}
+
+export interface ControlVisibility {
+  /** Share of the control's box left after every clipping ancestor and the
+   * viewport, once its real scroll container has scrolled it into reach. */
+  visibleFraction: number;
+  /** The point at the centre of the visible part hits the control itself (or
+   * a descendant), not something painted over it. */
+  hitsItself: boolean;
+  visibility: string;
+  /** Product of the control's and every ancestor's opacity. */
+  opacity: number;
+  width: number;
+  height: number;
+  /** The control's own content is wider than its box: truncated or clipped. */
+  textClipped: boolean;
+  /** Some line of its text lies outside the control's own box. */
+  textOutsideBox: boolean;
+  /** Its text is drawn in the colour of what is behind it, or fully
+   * transparent. */
+  textInvisible: boolean;
+  /** Which ancestor clipped it most, for the failure message. */
+  clippedBy: string | null;
+}
+
+/**
+ * Whether a control can actually be seen, not only where its box is.
+ *
+ * Boxes alone miss a control clipped by an ancestor on EITHER axis, one
+ * collapsed or covered, and one drawn invisibly. Only the given scroll
+ * container is scrolled, and only by setting its own `scrollTop`:
+ * `scrollIntoView` would also scroll an `overflow: hidden` ancestor and make a
+ * clipped control measure as visible.
+ */
+export async function controlVisibility(
+  selector: string,
+  scrollContainerSelector: string | null,
+): Promise<ControlVisibility> {
+  return browser.execute(
+    function (sel: string, scrollSel: string | null) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (!el) throw new Error(`controlVisibility: no element for ${sel}`);
+      const sc = scrollSel ? (document.querySelector(scrollSel) as HTMLElement | null) : null;
+      if (sc) {
+        const er = el.getBoundingClientRect();
+        const cr = sc.getBoundingClientRect();
+        const top = cr.top + sc.clientTop;
+        const bottom = top + sc.clientHeight;
+        if (er.top < top) sc.scrollTop -= top - er.top + 2;
+        else if (er.bottom > bottom) sc.scrollTop += Math.min(er.top - top, er.bottom - bottom + 2);
+      }
+      const r = el.getBoundingClientRect();
+      let left = r.left;
+      let top = r.top;
+      let right = r.right;
+      let bottom = r.bottom;
+      let clippedBy: string | null = null;
+      let worstLoss = 0;
+      for (let a = el.parentElement; a; a = a.parentElement) {
+        const cs = window.getComputedStyle(a);
+        const clipsX = cs.overflowX !== 'visible';
+        const clipsY = cs.overflowY !== 'visible';
+        if (!clipsX && !clipsY) continue;
+        const ar = a.getBoundingClientRect();
+        const cl = ar.left + a.clientLeft;
+        const ct = ar.top + a.clientTop;
+        const before = Math.max(0, right - left) * Math.max(0, bottom - top);
+        if (clipsX) {
+          left = Math.max(left, cl);
+          right = Math.min(right, cl + a.clientWidth);
+        }
+        if (clipsY) {
+          top = Math.max(top, ct);
+          bottom = Math.min(bottom, ct + a.clientHeight);
+        }
+        const after = Math.max(0, right - left) * Math.max(0, bottom - top);
+        if (before - after > worstLoss) {
+          worstLoss = before - after;
+          clippedBy = a.tagName.toLowerCase() + '.' + String(a.className).slice(0, 60);
+        }
+      }
+      left = Math.max(left, 0);
+      top = Math.max(top, 0);
+      right = Math.min(right, window.innerWidth);
+      bottom = Math.min(bottom, window.innerHeight);
+      const area = r.width * r.height;
+      const visibleArea = Math.max(0, right - left) * Math.max(0, bottom - top);
+      let hitsItself = false;
+      if (visibleArea > 0) {
+        const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
+        hitsItself = !!hit && (hit === el || el.contains(hit));
+      }
+      let opacity = 1;
+      for (let a: HTMLElement | null = el; a; a = a.parentElement) {
+        opacity *= parseFloat(window.getComputedStyle(a).opacity || '1');
+      }
+      // Every text line must lie inside the control's own box.
+      let textOutsideBox = false;
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+        if (!(t.textContent ?? '').trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(t);
+        for (const fr of Array.from(range.getClientRects())) {
+          if (fr.width <= 0 || fr.height <= 0) continue;
+          if (fr.left < r.left - 0.5 || fr.right > r.right + 0.5 || fr.top < r.top - 0.5 || fr.bottom > r.bottom + 0.5) {
+            textOutsideBox = true;
+          }
+        }
+      }
+      // Text drawn in the colour of what is behind it, judged per text node
+      // against the element that actually paints it.
+      const rgb = (c: string): number[] | null => {
+        const m = /rgba?\(([^)]+)\)/.exec(c);
+        if (!m) return null;
+        return m[1].split(',').map((v) => parseFloat(v));
+      };
+      const backdrop = (from: Element | null): number[] | null => {
+        for (let a: Element | null = from; a; a = a.parentElement) {
+          const b = rgb(window.getComputedStyle(a).backgroundColor);
+          if (b && (b.length < 4 || b[3] > 0)) return b;
+        }
+        return null;
+      };
+      let textInvisible = false;
+      const painters = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let t = painters.nextNode(); t; t = painters.nextNode()) {
+        if (!(t.textContent ?? '').trim() || !t.parentElement) continue;
+        const fg = rgb(window.getComputedStyle(t.parentElement).color);
+        const bg = backdrop(t.parentElement);
+        if (!fg) continue;
+        if (fg.length === 4 && fg[3] === 0) textInvisible = true;
+        else if (bg && Math.abs(fg[0] - bg[0]) + Math.abs(fg[1] - bg[1]) + Math.abs(fg[2] - bg[2]) < 3) {
+          textInvisible = true;
+        }
+      }
+      return {
+        visibleFraction: area > 0 ? Math.round((visibleArea / area) * 1000) / 1000 : 0,
+        hitsItself,
+        visibility: window.getComputedStyle(el).visibility,
+        opacity: Math.round(opacity * 100) / 100,
+        width: Math.round(r.width),
+        height: Math.round(r.height),
+        textClipped: el.scrollWidth > el.clientWidth + 1,
+        textOutsideBox,
+        textInvisible,
+        clippedBy,
+      };
+    },
+    selector,
+    scrollContainerSelector,
+  ) as Promise<ControlVisibility>;
+}
+
+/**
+ * Pairs of controls whose painted extents intersect: each control's box
+ * together with every line of its text, since text can spill out of a box
+ * that has been collapsed under it.
+ */
+export async function overlappingControls(selectors: string[]): Promise<string[]> {
+  return browser.execute(function (sels: string[]) {
+    type Box = { l: number; t: number; r: number; b: number };
+    const ink = (el: Element): Box => {
+      const r = el.getBoundingClientRect();
+      const box: Box = { l: r.left, t: r.top, r: r.right, b: r.bottom };
+      const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+        if (!(t.textContent ?? '').trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(t);
+        for (const fr of Array.from(range.getClientRects())) {
+          if (fr.width <= 0 || fr.height <= 0) continue;
+          box.l = Math.min(box.l, fr.left);
+          box.t = Math.min(box.t, fr.top);
+          box.r = Math.max(box.r, fr.right);
+          box.b = Math.max(box.b, fr.bottom);
+        }
+      }
+      return box;
+    };
+    const found: { sel: string; box: Box }[] = [];
+    for (const sel of sels) {
+      const el = document.querySelector(sel);
+      if (el) found.push({ sel, box: ink(el) });
+    }
+    const out: string[] = [];
+    for (let i = 0; i < found.length; i += 1) {
+      for (let k = i + 1; k < found.length; k += 1) {
+        const a = found[i].box;
+        const b = found[k].box;
+        const w = Math.min(a.r, b.r) - Math.max(a.l, b.l);
+        const h = Math.min(a.b, b.b) - Math.max(a.t, b.t);
+        if (w > 0.5 && h > 0.5) {
+          out.push(`${found[i].sel} \u00d7 ${found[k].sel}: ${Math.round(w)}\u00d7${Math.round(h)}px`);
+        }
+      }
+    }
+    return out;
+  }, selectors) as Promise<string[]>;
+}
+
 export async function saveActiveAs(destPath: string): Promise<void> {
-  await browser.executeAsync<void, [string]>(
+  const error = await browser.executeAsync<string | null, [string]>(
     function (dest, done) {
       (window as any).__SPECTRA_TEST__.saveActiveAs(dest)
-        .then(() => done(undefined))
-        .catch((err: unknown) => done(String(err) as any));
+        .then(() => done(null))
+        .catch((err: unknown) => done(String(err)));
     },
     destPath,
   );
+  if (typeof error === 'string') throw new Error(`saveActiveAs failed: ${error}`);
 }
 
 /** Compress panel run with an injected output path (panel must be open).
@@ -765,6 +1243,45 @@ export async function deleteSelectedCanvasPages(): Promise<void> {
   await browser.execute(function () {
     (window as any).__SPECTRA_TEST__.deleteSelectedCanvasPages();
   });
+}
+
+/** Wait for the active document's index AND its canvas registration before
+ * capturing opaque IDs. Panel fields can load before either async boundary. */
+export async function waitForActiveCanvasPageIds(): Promise<string[]> {
+  let ids: string[] = [];
+  await browser.waitUntil(async () => {
+    const ready = await browser.execute(() => {
+      const h = (window as any).__SPECTRA_TEST__;
+      const count = h.getState().activeFile?.pageCount;
+      const pages = h.getActiveDocPages().map((p: { id: string }) => p.id);
+      const canvas = h.getWorkspacePageIds();
+      return count > 0 && pages.length === count && pages.every((id: string) => canvas.includes(id)) ? pages : null;
+    }) as string[] | null;
+    if (!ready) return false;
+    ids = ready;
+    return true;
+  }, { timeout: 30_000, timeoutMsg: 'the active document page IDs never settled on the canvas' });
+  return ids;
+}
+
+/** Positive delete cases must prove both selection and the async policy-gated
+ * deletion settled before typing into a revision-bound panel. The fire-and-
+ * forget helper above remains available to tests that answer a consent dialog. */
+export async function deleteCanvasPagesAndWait(pageIds: string[]): Promise<void> {
+  const selected = [...new Set(pageIds)].sort();
+  const before = await getWorkspacePageIds();
+  if (!selected.length || selected.some(id => !before.includes(id))) {
+    throw new Error('deleteCanvasPagesAndWait requires existing selected pages');
+  }
+  await selectCanvasPages(pageIds);
+  await browser.waitUntil(async () =>
+    JSON.stringify((await getSelectedCanvasPageIds()).sort()) === JSON.stringify(selected),
+  { timeout: 10_000, timeoutMsg: 'canvas selection never settled before delete' });
+  await deleteSelectedCanvasPages();
+  const expected = before.filter(id => !selected.includes(id));
+  await browser.waitUntil(async () =>
+    JSON.stringify(await getWorkspacePageIds()) === JSON.stringify(expected),
+  { timeout: 20_000, timeoutMsg: 'policy-gated page deletion never produced the expected survivors' });
 }
 
 /** Rotate the current canvas selection ±90 via the batched path (`[`/`]`). */
@@ -1472,6 +1989,8 @@ export async function createPlacedField(
     multiline?: boolean;
     comb?: boolean;
     maxLength?: number;
+    writing?: 'horizontal' | 'vertical';
+    script?: 'japanese' | 'simplified-chinese' | 'traditional-chinese' | 'korean';
     /** Format / accepted range / calculation — the same object the card's own
      * control produces, so the spec drives the real authoring path. */
     actions?: Record<string, unknown>;
@@ -3115,7 +3634,7 @@ export interface GsAnswer {
  * needs one — so absence cannot be arranged from outside the app: discovery
  * reads the registry and the environment as well as PATH. The pin sits on the
  * renderer's one answer, so the disabled panels, the gated menu commands, the
- * partial legs and Settings ▸ Engine all read it.
+ * partial legs and Preferences ▸ Engine all read it.
  *
  * `reason` selects which absent state renders; the default is the
  * fresh-install one.
@@ -3141,7 +3660,7 @@ export async function gsAnswer(): Promise<GsAnswer> {
   }) as Promise<GsAnswer>;
 }
 
-/** Answer the next native "pick any file" dialog (Settings ▸ Engine ▸
+/** Answer the next native "pick any file" dialog (Preferences ▸ Engine ▸
  * Browse) with this path, or with `null` for a cancelled dialog. */
 export async function answerAnyFilePicker(path: string | null): Promise<void> {
   await browser.execute(function (p: string | null) {

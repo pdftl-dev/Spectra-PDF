@@ -13,9 +13,9 @@
 //     already consistent.
 //   - Everything a person READS — button labels, hints, statuses, headings
 //     inside a panel — is Sentence case.
-// The audit found "Apply Watermark" beside "Apply", "Enhance the scans" and
-// "Detect fields" on adjacent surfaces: three registers for one kind of label,
-// so casing had stopped carrying the name/not-a-name distinction at all. When
+// Mixed casing on adjacent surfaces ("Apply Watermark" beside "Apply") is
+// three registers for one kind of label, and then casing no longer carries
+// the name/not-a-name distinction. When
 // a button's job IS to run a named operation, its label spells that operation
 // the same way the operation is named ("Detect form fields"), in the button's
 // own register.
@@ -38,13 +38,13 @@ export const PANEL_STRINGS = {
   // three states a configured-but-unusable install can be in. Ghostscript is
   // a user-supplied prerequisite; nothing in the product ships it.
   'panel.common.gsRequired':
-    'This needs Ghostscript, which Spectra PDF does not include. Install it, then point Spectra PDF at it in Settings ▸ Engine.',
+    'This needs Ghostscript, which Spectra PDF does not include. Install it, then point Spectra PDF at it in Preferences ▸ Engine.',
   'panel.common.gsNotExecutable':
-    'The Ghostscript set in Settings ▸ Engine is not there any more. Choose the program again.',
+    'The Ghostscript set in Preferences ▸ Engine is not there any more. Choose the program again.',
   'panel.common.gsProbeFailed':
-    'The Ghostscript set in Settings ▸ Engine did not run. Check the install, then try again in Settings ▸ Engine.',
+    'The Ghostscript set in Preferences ▸ Engine did not run. Check the install, then try again in Preferences ▸ Engine.',
   'panel.common.gsTooOld':
-    'The Ghostscript set in Settings ▸ Engine is older than this version needs. Install a newer one.',
+    'The Ghostscript set in Preferences ▸ Engine is older than this version needs. Install a newer one.',
   'panel.common.gsSetUp': 'Set up Ghostscript',
   // The ONE explanation every bundled-colour-profile surface renders while the
   // profiles' separate licence is unaccepted. Three surfaces depend on them:
@@ -147,6 +147,8 @@ export const PANEL_STRINGS = {
   'panel.split.badSize': 'Enter a maximum size greater than 0.',
   'panel.split.pickFolder': 'Choose a folder for the split files',
   'panel.split.bookmarkCounting': 'Reading bookmarks…',
+  'panel.split.bookmarkUnavailable': 'The bookmark count could not be determined.',
+  'panel.split.retainedFiles': 'Output saved; temporary recovery files could not be removed: {{paths}}',
   'panel.split.bookmarkNone': 'This document has no top-level bookmarks to split at.',
   'panel.split.bookmarkCount_one': '{{count}} top-level bookmark to split at.',
   'panel.split.bookmarkCount_other': '{{count}} top-level bookmarks to split at.',
@@ -643,6 +645,7 @@ export const PANEL_STRINGS = {
     'This is an XML form (XFA). Values you fill are saved into both its XML form data and its standard form fields, so every reader shows the same answers.',
   'panel.forms.xfaDynamic':
     'This is a dynamic XML form (XFA): it builds its own pages from an XML template, so its fields cannot be filled here. The fields below are read-only.',
+  'panel.forms.xfaCalculationsUnknown': 'The XFA template could not be read completely. Its calculations and validations are unknown; review the form in a compatible reader.',
   'panel.forms.xfaCalculations':
     "This form's XML template authors its own calculations. They are not run here, so a value another field computes from stays as the document last saved it.",
   // The value shown came from the XFA datasets packet rather than from the
@@ -690,7 +693,7 @@ export const PANEL_STRINGS = {
   'panel.forms.scriptsTitle': 'Scripts this app does not run',
   'panel.forms.scriptsPosition':
     'This app runs no form script it cannot verify. It runs the standard formatting, validation and calculation calls, which are declarative and carry no code; anything else is left in the document exactly as it was, and reported here.',
-  // F26: the same list, once scripts can actually run. Off is still the
+  // The same list, once scripts can actually run. Off is still the
   // default, so the wording above stands and these only add what the reader
   // needs to act: which switch decides it, and what happened to each script
   // that did run.
@@ -758,6 +761,10 @@ export const PANEL_STRINGS = {
   'panel.links.pageKind': 'Page {{page}} · {{kind}}',
   'panel.links.noTarget': '(no target)',
   'panel.links.removed': 'Link removed',
+  'panel.links.sourceChanged': 'The document changed. The unsaved link is retained but cannot be saved to this revision.',
+  'panel.forms.sourceChanged': 'The document changed. Unsaved form values are retained but cannot be applied to this revision.',
+  'panel.forms.discardReload': 'Discard draft and reload',
+  'panel.links.discardReload': 'Discard draft and reload',
   'panel.links.delete': 'Delete',
   'panel.links.derive.title': 'Create links from web addresses',
   'panel.links.derive.pages': 'Pages',
@@ -2347,9 +2354,7 @@ export const PANEL_STRINGS = {
   'panel.portfolio.saving': 'Saving…',
   'panel.portfolio.updating': 'Updating…',
   'panel.portfolio.removing': 'Removing…',
-  // The DONE lines. The slice-B sweep threaded the …ing
-  // states but not these six, because each was a `${}` TEMPLATE rather than
-  // a bare literal; the attribute/literal regexes never saw them. Each is
+  // The DONE lines. Each is
   // one interpolated key ({{name}} is an attachment's own file name and
   // stays verbatim), never "Added " + name.
   'panel.portfolio.added': 'Added {{name}}',

@@ -35,7 +35,7 @@ import { RedactionPropertiesFields } from '../components/RedactionPropertiesFiel
 // → display conversion, shared with the mark seed, and from there the
 // SHIPPED path takes over: the status bar's apply / save marks / clear,
 // `buildRedactionRegions`, the commit gate and `performOperation`'s undo
-// chain. That is what keeps the review-hardened destructive path the ONLY
+// chain. That is what keeps the canvas's destructive path the ONLY
 // destructive path, and it is also what gives the user a review step for free
 // — marks are visible, movable, removable and undoable before anything is
 // destroyed, which is how a redaction job is actually done.
@@ -623,8 +623,8 @@ export function SearchRedactPanel(): React.ReactElement {
                             title={tChrome('panel.searchRedact.jump')}
                           >
                             <span className="text-neutral-200">{hit.text}</span>
-                            {/* N13: the context repeated the match in the body
-                                colour, so the row gave the reader no way to see
+                            {/* Context that repeats the match in the body
+                                colour gives the reader no way to see
                                 WHERE in the line the mark will land — which on a
                                 snippet flattened out of a table is the only
                                 thing that says whether the row is a hit at all.

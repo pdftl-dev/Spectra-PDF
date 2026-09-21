@@ -21,9 +21,8 @@ explains is flagged rather than counted.
 
 A claim sourced this way is worded "corroborated by two independent conformance
 suites at clause X". It is never worded "the standard requires", because the
-standard is ISO 19005 and this repository does not hold it (see `docs/README.md`
-for what `pdfa/` does hold). Where the normative text IS on disk, it outranks
-every file here.
+standard is ISO 19005 and this repository does not hold it. Where the
+normative text IS on disk, it outranks every file here.
 
 WHAT IS FETCHED
 
@@ -55,6 +54,9 @@ import urllib.request
 from datetime import date
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from download_retry import fetch_with_retry  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEST = REPO_ROOT / "pdfa-corpus"
 
@@ -80,8 +82,7 @@ TARBALL = "https://codeload.github.com/{owner}/{repo}/tar.gz/{sha}"
 
 def _download(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "spectra-pdf-corpus-fetch"})
-    with urllib.request.urlopen(request, timeout=300) as response:
-        return response.read()
+    return fetch_with_retry(request, timeout=300, description=url)
 
 
 def _extract(archive: bytes, into: Path) -> int:

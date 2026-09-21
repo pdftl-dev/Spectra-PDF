@@ -9,7 +9,8 @@
  * grant any capability the renderer doesn't already have. Treat it as a
  * scriptable remote control over the public IPC surface.
  */
-import { app, dialog, file, engine, scanner as scannerBridge } from './lib/tauri-bridge';
+import { app, dialog, file, engine, pinStoreCertificates, scanner as scannerBridge, type StoreCertificateAnswer } from './lib/tauri-bridge';
+import { runCommitGate } from './lib/commit-gate';
 import { windowLabel } from './lib/window-label';
 import { getRenderTimings, clearRenderTimings } from './components/canvas/raster';
 import {
@@ -56,7 +57,7 @@ export interface TestStateSnapshot {
   activeToolId: string | null;
   /** Which document pane is showing (the View menu's mode items). */
   docViewMode: 'organize' | 'document';
-  /** Split view (I.6, Window ▸ Split): two stacked reading panes. */
+  /** Split view (Window ▸ Split): two stacked reading panes. */
   splitView: boolean;
   /** The full split shape ('off' | 'two' | 'quad'); splitView stays the
    * boolean projection so pre-quad specs' truthy checks hold. */
@@ -72,6 +73,10 @@ export interface TestStateSnapshot {
     pageCount: number;
     dirty: boolean;
   } | null;
+}
+
+export interface TestHistoryState {
+  undo: string[]; redo: string[]; buffer: number[];
 }
 
 export interface TestAnnotationInput {
@@ -806,7 +811,7 @@ function armImagePicker(path: string | null): void {
 }
 
 /**
- * The native "pick any file" dialog — the Settings ▸ Engine browse control's
+ * The native "pick any file" dialog — the Preferences ▸ Engine browse control's
  * first step, and OS-modal like every other native picker.
  *
  * Answered at the DIALOG so the browse handler runs unchanged: the picked
@@ -1059,9 +1064,9 @@ export interface GuidedActionsHandlers {
     dest: string,
     inPlace?: boolean,
   ) => Promise<void>;
-  /** Slice 4: write one action to `path` (the `{name, steps}` file shape). */
+  /** Write one action to `path` (the `{name, steps}` file shape). */
   exportToPath: (actionId: string, path: string) => Promise<void>;
-  /** Slice 4: import an action file; rejects with the named refusal. */
+  /** Import an action file; rejects with the named refusal. */
   importFromPath: (path: string) => Promise<void>;
 }
 
@@ -1345,6 +1350,8 @@ export interface CanvasFormsHandlers {
     multiline?: boolean;
     comb?: boolean;
     maxLength?: number;
+    writing?: import('./lib/form-writing').FieldWriting;
+    script?: import('./lib/form-writing').FieldScript;
     /** Format / accepted range / calculation, in the renderer's own spelling —
      * the same object the card's control produces. */
     actions?: import('./lib/form-candidates').FieldActions;
@@ -1529,6 +1536,9 @@ export interface TestHarness {
   focusTab: (tab: FocusedTab) => void;
   /** Select an operation in the sidebar. */
   setActiveOp: (op: string) => void;
+  /** Resize the tool dock (clamped by the reducer). A panel at its narrowest
+   * real width is a layout condition no other harness call can set up. */
+  setToolDockWidth: (width: number) => void;
   /** Invoke a command-registry entry — the ONE entry point the menus,
    * toolbars and keymap share. Returns false when the command's
    * enablement predicate refused; throws on an unknown id. */
@@ -1542,6 +1552,7 @@ export interface TestHarness {
   setDocViewMode: (mode: 'organize' | 'document') => void;
   /** Snapshot of currently observable state, for assertions. */
   getState: () => TestStateSnapshot;
+  getHistoryState: () => TestHistoryState | null;
   /** Wait for the next state change matching a predicate (10s timeout). */
   waitForState: (
     predicate: (s: TestStateSnapshot) => boolean,
@@ -1610,7 +1621,7 @@ export interface TestHarness {
     hasImage?: boolean;
   } | null>;
   /** Every pending annotation on one page, workspace order (= z-order) —
-   * geometry assertions for the manipulation gestures (rung 1). */
+   * geometry assertions for the manipulation gestures. */
   getPageAnnotations: (
     docId: string,
     pageId: string,
@@ -1763,6 +1774,8 @@ export interface TestHarness {
     multiline?: boolean;
     comb?: boolean;
     maxLength?: number;
+    writing?: import('./lib/form-writing').FieldWriting;
+    script?: import('./lib/form-writing').FieldScript;
     /** Format / accepted range / calculation, in the renderer's own spelling —
      * the same object the card's control produces. */
     actions?: import('./lib/form-candidates').FieldActions;
@@ -2080,6 +2093,14 @@ export interface TestHarness {
    */
   gsForceAbsent: (reason?: string) => void;
   /**
+   * Pin what the certificate-store enumeration answers, so the empty and
+   * refused paths can be driven. `null` unpins and the next read goes to
+   * Windows for real. The `gsForceAbsent` reason applies unchanged: a
+   * machine's own certificates cannot be removed by a suite, and the IPC is
+   * not stubbable from the page.
+   */
+  storeCertsPin: (answer: StoreCertificateAnswer | null) => void;
+  /**
    * Lift the force and probe for real, returning the answer that landed.
    *
    * The no-restart claim in one call: a spec asserts a surface disabled,
@@ -2350,9 +2371,11 @@ export interface TestHarnessDeps {
   setView: (view: 'welcome' | 'operations' | 'canvas') => void;
   focusTab: (tab: FocusedTab) => void;
   setActiveOp: (op: string) => void;
+  setToolDockWidth: (width: number) => void;
   setTool: (tool: string) => void;
   setDocViewMode: (mode: 'organize' | 'document') => void;
   getStateSnapshot: () => TestStateSnapshot;
+  getHistoryState: () => TestHistoryState | null;
   subscribe: (listener: (s: TestStateSnapshot) => void) => () => void;
   /** First page of the active file's first workspace document, once the
    * async indexer has produced one; null until then. */
@@ -2375,7 +2398,7 @@ export interface TestHarnessDeps {
     hasImage?: boolean;
   } | null;
   /** Every pending annotation on one page, workspace order (= z-order) —
-   * for asserting geometry after manipulation gestures (rung 1). */
+   * for asserting geometry after manipulation gestures. */
   getPageAnnotations: (
     docId: string,
     pageId: string,
@@ -2535,6 +2558,7 @@ export function installTestHarness(deps: TestHarnessDeps): void {
         throw new Error(msg);
       }
       try {
+        await runCommitGate();
         await file.saveAs(snap.activeFile.workingPath, destPath);
       } catch (err) {
         captureError('saveActiveAs', err);
@@ -2618,6 +2642,7 @@ export function installTestHarness(deps: TestHarnessDeps): void {
     setView: (view) => deps.setView(view),
     focusTab: (tab) => deps.focusTab(tab),
     setActiveOp: (op) => deps.setActiveOp(op),
+    setToolDockWidth: (width) => deps.setToolDockWidth(width),
     invokeCommand: (id) => {
       if (!(id in COMMANDS)) {
         const msg = `invokeCommand: unknown command id "${id}"`;
@@ -2630,6 +2655,7 @@ export function installTestHarness(deps: TestHarnessDeps): void {
     setDocViewMode: (mode) => deps.setDocViewMode(mode),
     getActiveDocPages: () => deps.getActiveDocPages(),
     getState: () => deps.getStateSnapshot(),
+    getHistoryState: () => deps.getHistoryState(),
     waitForState: (predicate, timeoutMs = 10_000) =>
       new Promise<TestStateSnapshot>((resolve, reject) => {
         const initial = deps.getStateSnapshot();
@@ -3601,6 +3627,7 @@ export function installTestHarness(deps: TestHarnessDeps): void {
     breakTabOrderPublish: () => {
       setTabOrderChannel({ flush: async () => false });
     },
+    storeCertsPin: (answer) => pinStoreCertificates(answer),
     gsForceAbsent: (reason) => {
       pinGsCapability({
         available: false,

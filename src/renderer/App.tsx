@@ -1,24 +1,29 @@
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { AppStateProvider, useAppState, useAppDispatch } from './state/AppStateProvider';
-import { file, app, dialog, batch, tabDrag } from './lib/tauri-bridge';
+import { AppStateProvider, useAppState, useAppDispatch, useReadAppState, useSubscribeAppState } from './state/AppStateProvider';
+import { restoreHistory } from './lib/disk-history';
+import { captureCanvasTextRequest, type CanvasTextRequest } from './lib/extract-text-owner';
+import { hasWorkspacePublication, serializeWorkspacePublication } from './lib/workspace-publication';
+import { withFileLock } from './lib/engine-lock';
+import { file, app, dialog, batch, tabDrag, pageCommit } from './lib/tauri-bridge';
 import type { PhysicalScreenPoint, TabDragReservation, TabDragResult } from './lib/tauri-bridge';
 import { flushTabOrder, planHandOff, reservationHolds, tabMoved } from './lib/tab-drag';
 import {
   decodeToRawSource,
-  engineWantsRawFallback,
-  isJpegPath,
-  isSvgPath,
-  jpegExifOrientation,
   type AddImageSource,
   type ReplacementSource,
 } from './lib/image-replace';
+import { editWorkspaceImage, type ImageEdit } from './lib/image-edit-transaction';
 import { EDIT_DECLINED } from './lib/edit-text';
+import type { RedactionMark } from './lib/redaction';
+import { writeRedactionMarks } from './lib/redaction-write';
+import { getDocumentProxy } from './lib/pdfDocCache';
 import {
   lockNeedsFields,
   signedEditDecision,
   type EditClass,
   type FieldLock,
   type SignaturePolicy,
+  parseSignaturePolicy,
   type SignedEditDecision,
 } from './lib/signatures';
 import type { LinkSpec } from './lib/links';
@@ -29,15 +34,8 @@ import {
   type SubmitFormat,
   type WidgetAction,
 } from './lib/field-actions';
-import {
-  SUBMIT_EXTENSION as SUBMIT_PAYLOAD_EXTENSION,
-  destinationRefusal,
-  payloadPreview,
-  responseRoute,
-  statusAccepted,
-  submitRequest,
-  type PayloadPreview,
-} from './lib/form-submit';
+import type { PayloadPreview } from './lib/form-submit';
+import { runSubmission } from './lib/form-submission';
 import {
   SubmitConsentDialog,
   type SubmitConsentAnswer,
@@ -46,8 +44,11 @@ import type { FieldActions } from './lib/form-candidates';
 import type { EditImageMaskParam } from './lib/edit-images';
 import type { ParagraphEditOpts } from './lib/edit-paragraphs';
 import { ConfirmDialog, ConfirmResult } from './components/ConfirmDialog';
-import { PasswordDialog, PasswordResult } from './components/PasswordDialog';
-import { CertUnlockDialog, CertUnlockResult } from './components/CertUnlockDialog';
+import { createConfirmQueue } from './lib/confirm-queue';
+import { createUnlockPrompts, type UnlockPrompt } from './lib/unlock-prompts';
+import { reportLaunch } from './lib/launch-notices';
+import { PasswordDialog } from './components/PasswordDialog';
+import { CertUnlockDialog } from './components/CertUnlockDialog';
 import { SplitPanel } from './panels/SplitPanel';
 import { RotatePanel } from './panels/RotatePanel';
 import { DeletePanel } from './panels/DeletePanel';
@@ -90,8 +91,8 @@ import { DocumentJsPanel } from './panels/DocumentJsPanel';
 import { PrepressPanel } from './panels/PrepressPanel';
 import { useEngine } from './hooks/useEngine';
 import { useWorkspaceIndexer } from './hooks/useWorkspaceIndexer';
-import { indexOpenFile } from './lib/workspace';
-import type { PageRef, PdfBuffer } from './state/types';
+import { indexImportSource, readPublishedBytes } from './lib/workspace';
+import type { AppState, PageRef, PdfBuffer } from './state/types';
 import { isDocTab, viewOf } from './state/types';
 import { showableDoc, showableDocuments, tabFiles } from './state/selectors';
 import type { CanvasTool } from './state/types';
@@ -100,23 +101,24 @@ import { PresentationView } from './components/canvas/PresentationView';
 import { usePdfProxies } from './hooks/usePdfProxies';
 import type { CanvasDropResolver } from './components/canvas/WorkspaceCanvasView';
 import { commitPageEdits } from './lib/workspace-commit';
+import { awaitSettledWorkspace, indexError, retryFailedIndexes, workspaceSettled } from './lib/workspace-settle';
+import { hasPendingPageCommit, recoverPendingPageCommit } from './lib/page-commit-transaction';
 import { pageEditDecision, type PageDelta } from './lib/page-edit-gate';
-import { opEditClass, type OpMethod } from './lib/op-edit-class';
+import { sequenceEditClass, type OpMethod } from './lib/op-edit-class';
 import type { PreserveOutcome, PreserveRefusal } from './lib/preserve-reason';
 import { sealBeforeClose } from './lib/close-sequence';
 import { setCommitGate, runCommitGate } from './lib/commit-gate';
 import { initialViewPlan, parseInitialView, planIsInert } from './lib/initial-view';
-import { readFormFields } from './lib/forms';
 import type { FormFieldValue } from './lib/forms';
-import { fillClosure, formCalculation, resolveFillTargets } from './lib/form-overlay';
-import { classifyFillResult } from './lib/fill-result';
-import { addFormFields } from './lib/form-authoring';
+import { fillFormValues } from './lib/form-fill-transaction';
+import { createFormFields } from './lib/form-create-transaction';
+import { executeWorkspaceOperation } from './lib/operation-transaction';
+import { trackInteractive } from './lib/engine-idle-lane';
 import type { NewFieldSpec } from './lib/form-authoring';
-import { choiceAppearanceFields, verticalFontCalls } from './lib/form-writing';
 import { DropZone } from './components/DropZone';
 import { OperationsProvider, type PerformOperation } from './hooks/useOperations';
 import { OperationQueue } from './components/OperationQueue';
-import { QueueProvider, useOperationQueue } from './hooks/useOperationQueue';
+import { QueueProvider, useOperationQueue, isTrackableMethod } from './hooks/useOperationQueue';
 import { SearchProvider } from './search/SearchProvider';
 import { SeparationPreviewProvider } from './hooks/useSeparationPreview';
 import { FlattenerPreviewProvider } from './hooks/useFlattenerPreview';
@@ -170,8 +172,16 @@ import { UpdateBar } from './components/UpdateBar';
 import { NavPane } from './components/navpane/NavPane';
 import { ToolDock } from './components/ToolDock';
 import { type Operation } from './commands/operations';
-import { persistRecent, sameRecent, withRecent } from './lib/recent-files';
-import { claimPaths, releasePaths, soleOwner, type ClaimRefusal } from './lib/window-claims';
+import {
+  isRecentStorageKey,
+  readRecent,
+  recordRecentOpen,
+  removeRecentEntriesSafely,
+  sameRecent,
+  sweepDeadRecents,
+} from './lib/recent-files';
+import { claimPaths, createClaimHolds, departedImportSources, releasePaths, soleOwner, type ClaimRefusal } from './lib/window-claims';
+import { createOpenFlights, openPathOnce } from './lib/open-flights';
 import { writeWorkbenchUi } from './lib/workbench-ui';
 import { installTestHarness, TEST_HARNESS_ENABLED } from './testHarness';
 import type { TestStateSnapshot } from './testHarness';
@@ -257,11 +267,16 @@ const panels: Record<Operation, React.ComponentType> = {
   spelling: SpellingPanel,
 };
 
-/** What a built submission is saved as — one table, in `lib/form-submit.ts`
- * beside the content types it pairs with. `html` is
- * `application/x-www-form-urlencoded` text, which has no extension of its own,
- * so it takes the one a text editor will open. */
-const SUBMIT_EXTENSION = SUBMIT_PAYLOAD_EXTENSION;
+/** One request for the confirm dialog. `id` tells a late answer to an earlier
+ * request apart from an answer to the one on screen. */
+interface ConfirmRequest {
+  id: number;
+  message: string;
+  kind?: 'unsaved' | 'proceed' | 'notice';
+  title?: string;
+  affirmLabel?: string;
+  resolve: (result: ConfirmResult) => void;
+}
 
 function AppContent(): React.ReactElement {
   // Re-render on language change; the banner's buttons and every
@@ -269,6 +284,8 @@ function AppContent(): React.ReactElement {
   useTranslation();
   const state = useAppState();
   const dispatch = useAppDispatch();
+  const readState = useReadAppState();
+  const subscribeState = useSubscribeAppState();
   // The tab model lives in the ui slice so the command registry,
   // menus, and tab strip all read it. focusedTab replaces the old `view`.
   const focusedTab = state.ui.focusedTab;
@@ -360,7 +377,7 @@ function AppContent(): React.ReactElement {
   const [showExportImages, setShowExportImages] = useState(false);
   const [exportDocFormat, setExportDocFormat] = useState<DocumentExportFormat | null>(null);
   const [showCustomizeToolbar, setShowCustomizeToolbar] = useState(false);
-  // Full-screen presentation mode (I.6): a transient overlay; `startIndex`
+  // Full-screen presentation mode: a transient overlay; `startIndex`
   // is the page to open on, resolved from the page being read.
   const [presentation, setPresentation] = useState<{ startIndex: number } | null>(null);
   // Own proxy map (pdfDocCache dedupes against the canvas's) so the overlay
@@ -369,8 +386,8 @@ function AppContent(): React.ReactElement {
   // Manual "Check for Updates" (Help menu): bump a signal the UpdateBar
   // watches, so the banner surfaces the available / up-to-date / disabled state.
   const [updateCheckSignal, setUpdateCheckSignal] = useState(0);
-  const { items: queue, clear: clearQueue } = useOperationQueue();
-  const [extractPage, setExtractPage] = useState<number | null>(null);
+  const { items: queue, clear: clearQueue, track: trackOperation } = useOperationQueue();
+  const [extractPage, setExtractPage] = useState<CanvasTextRequest | null>(null);
   const [appVersion, setAppVersion] = useState('');
   const recentFiles = state.ui.recentFiles;
   const { call, callRaw, openFiles, saveFile } = useEngine();
@@ -378,73 +395,36 @@ function AppContent(): React.ReactElement {
 
   // Confirm dialog state — 3-choice unsaved (Save / Don't Save / Cancel),
   // 2-choice proceed (Continue / Cancel), or 1-button notice (OK); one
-  // dialog, one result type.
-  const [confirmState, setConfirmState] = useState<{
-    message: string;
-    kind?: 'unsaved' | 'proceed' | 'notice';
-    title?: string;
-    affirmLabel?: string;
-    resolve: (result: ConfirmResult) => void;
-  } | null>(null);
-
-  // Password prompt dialog state
-  const [passwordState, setPasswordState] = useState<{
-    fileName: string;
-    error?: string;
-    resolve: (result: PasswordResult) => void;
-  } | null>(null);
-
-  const showPasswordPrompt = useCallback((fileName: string, error?: string): Promise<PasswordResult> => {
-    return new Promise((resolve) => {
-      setPasswordState({ fileName, error, resolve });
-    });
-  }, []);
-
-  const handlePasswordResult = useCallback((result: PasswordResult) => {
-    if (passwordState) {
-      passwordState.resolve(result);
-      setPasswordState(null);
-    }
-  }, [passwordState]);
-
-  // Certificate-unlock prompt — the pubkey sibling of the password one.
-  const [certUnlockState, setCertUnlockState] = useState<{
-    fileName: string;
-    error?: string;
-    resolve: (result: CertUnlockResult) => void;
-  } | null>(null);
-
-  const showCertUnlockPrompt = useCallback(
-    (fileName: string, error?: string): Promise<CertUnlockResult> => {
-      return new Promise((resolve) => {
-        setCertUnlockState({ fileName, error, resolve });
-      });
+  // dialog, one result type. `confirmState` is the request on screen; the
+  // others wait in `confirmQueue`.
+  const [confirmState, setConfirmState] = useState<ConfirmRequest | null>(null);
+  const [confirmQueue] = useState(() => createConfirmQueue<ConfirmRequest>(setConfirmState));
+  const lastConfirmId = useRef(0);
+  const requestConfirm = useCallback(
+    (request: Omit<ConfirmRequest, 'id'>): void => {
+      lastConfirmId.current += 1;
+      confirmQueue.push({ ...request, id: lastConfirmId.current });
     },
-    [],
+    [confirmQueue],
   );
 
-  const handleCertUnlockResult = useCallback(
-    (result: CertUnlockResult) => {
-      if (certUnlockState) {
-        certUnlockState.resolve(result);
-        setCertUnlockState(null);
-      }
-    },
-    [certUnlockState],
-  );
+  const [unlockState, setUnlockState] = useState<UnlockPrompt | null>(null);
+  const [unlockPrompts] = useState(() => createUnlockPrompts(setUnlockState));
+  const showPasswordPrompt = unlockPrompts.password;
+  const showCertUnlockPrompt = unlockPrompts.certificate;
 
   const showConfirm = useCallback((message: string): Promise<ConfirmResult> => {
     return new Promise((resolve) => {
-      setConfirmState({ message, resolve });
+      requestConfirm({ message, resolve });
     });
-  }, []);
+  }, [requestConfirm]);
 
   /** Two-choice Continue/Cancel confirmation; resolves true on Continue. */
   const showProceedConfirm = useCallback((title: string, message: string): Promise<boolean> => {
     return new Promise((resolve) => {
-      setConfirmState({ message, kind: 'proceed', title, resolve: (r) => resolve(r === 'save') });
+      requestConfirm({ message, kind: 'proceed', title, resolve: (r) => resolve(r === 'save') });
     });
-  }, []);
+  }, [requestConfirm]);
 
   // The submission consent dialog's state. It resolves ONE answer for ONE
   // request: there is no per-host memory to keep, deliberately, so the state
@@ -487,25 +467,23 @@ function AppContent(): React.ReactElement {
   /** One-button OK notice — errors and outcomes with no choice to make. */
   const showNotice = useCallback((title: string, message: string): Promise<void> => {
     return new Promise((resolve) => {
-      setConfirmState({ message, kind: 'notice', title, resolve: () => resolve() });
+      requestConfirm({ message, kind: 'notice', title, resolve: () => resolve() });
     });
-  }, []);
+  }, [requestConfirm]);
 
-  // A launch that found a "Start with Windows" entry naming a path this copy
-  // has moved away from corrects it before any window exists. Only the launch
-  // that could NOT write the correction has anything to say, and it says it
-  // here because the correction ran with no surface to say it on.
+  // A launch that corrected a "Start with Windows" entry, or found a record it
+  // could not read, did so before any window existed; it reports here.
   useEffect(() => {
-    void app
-      .startupEntryNotice()
-      .then((detail) => {
-        if (!detail) return;
-        void showNotice(
-          tChrome('app.startupEntry.staleTitle'),
-          tChrome('app.startupEntry.stale', { detail }),
-        );
-      })
-      .catch(() => {});
+    void reportLaunch({
+      startupEntryNotice: () => app.startupEntryNotice(),
+      takeUnreadableRecords: () => app.takeUnreadableRecords(),
+      saveStartupFlags: () => {
+        const settings = getSettings();
+        app.setStartMinimized(settings.startMinimized).catch(() => {});
+        app.setRestoreWindowsOnLaunch(settings.restoreWindowsOnLaunch).catch(() => {});
+      },
+      showNotice,
+    });
   }, [showNotice]);
 
   /** A refusal that has somewhere to send the user: the affirmative button
@@ -513,7 +491,7 @@ function AppContent(): React.ReactElement {
   const showActionConfirm = useCallback(
     (title: string, message: string, affirmLabel: string): Promise<boolean> => {
       return new Promise((resolve) => {
-        setConfirmState({
+        requestConfirm({
           message,
           kind: 'proceed',
           title,
@@ -522,7 +500,7 @@ function AppContent(): React.ReactElement {
         });
       });
     },
-    [],
+    [requestConfirm],
   );
 
   const editWarnedPathsRef = useRef<Set<string>>(new Set());
@@ -534,8 +512,13 @@ function AppContent(): React.ReactElement {
   // sign). `signature_policy` is an internal read, so asking the question does
   // not flush the user's pending annotations to disk.
   const readSignaturePolicy = useCallback(
-    async (workingPath: string): Promise<SignaturePolicy> =>
-      (await call('signature_policy', { path: workingPath })) as unknown as SignaturePolicy,
+    async (workingPath: string): Promise<SignaturePolicy> => {
+      try {
+        return parseSignaturePolicy(await call('signature_policy', { path: workingPath }));
+      } catch {
+        return parseSignaturePolicy(null);
+      }
+    },
     [call],
   );
 
@@ -605,30 +588,33 @@ function AppContent(): React.ReactElement {
   );
 
   const handleConfirmResult = useCallback((result: ConfirmResult) => {
-    if (confirmState) {
-      confirmState.resolve(result);
-      setConfirmState(null);
-    }
-  }, [confirmState]);
+    if (confirmState) confirmQueue.answer(confirmState.id)?.resolve(result);
+  }, [confirmState, confirmQueue]);
 
   // Fetch app version on mount
   useEffect(() => {
     app.getVersion().then((v) => setAppVersion(`v${v}`));
   }, []);
 
-  // Mirror the recent-files list (ui slice) to localStorage — the single
-  // persistence point; every mutation just dispatches UI_SET_RECENT_FILES.
-  // The key is shared by every window, so the write folds in whatever another
-  // window recorded since this one last wrote, and the result is adopted back
-  // into state rather than left to drift from what is stored.
-  useEffect(() => {
-    const merged = persistRecent(recentFiles);
-    if (!sameRecent(merged, recentFiles)) {
-      dispatch({ type: 'UI_SET_RECENT_FILES', files: merged });
-    }
-  }, [recentFiles, dispatch]);
+  const recentFilesRef = useRef(recentFiles);
+  recentFilesRef.current = recentFiles;
 
-  // Mirror the toolbar overrides (I.6 customization) the same way.
+  // localStorage's `storage` event is delivered to the OTHER windows. Adopt
+  // their committed transaction so this window's Home/menu state converges
+  // without waiting for another local mutation.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (!isRecentStorageKey(event.key)) return;
+      const stored = readRecent();
+      if (!sameRecent(stored, recentFilesRef.current)) {
+        dispatch({ type: 'UI_SET_RECENT_FILES', files: stored });
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [dispatch]);
+
+  // Mirror the toolbar overrides the same way.
   useEffect(() => {
     persistToolbarOverrides(state.ui.toolbarOverrides);
   }, [state.ui.toolbarOverrides]);
@@ -654,6 +640,18 @@ function AppContent(): React.ReactElement {
   // Commit-failure banner: commits triggered from gates/effects have no
   // natural place to report, so failures surface here.
   const [commitError, setCommitError] = useState<string | null>(null);
+  const historyRetry = useRef<'undo' | 'redo' | null>(null);
+  // A page edit the reducer could not carry onto re-derived documents is
+  // refused there, where no surface exists; every increase of the count owes
+  // the user one notice. Kept apart from `commitError`, which a later
+  // successful commit clears.
+  const [pageEditRefused, setPageEditRefused] = useState(false);
+  const refusalsSeen = useRef(state.pageEditRefusals);
+  useEffect(() => {
+    if (state.pageEditRefusals === refusalsSeen.current) return;
+    refusalsSeen.current = state.pageEditRefusals;
+    setPageEditRefused(true);
+  }, [state.pageEditRefusals]);
 
   // Signed files whose commit could not be appended, waiting to be said out
   // loud. Queued rather than awaited inside the commit: the commit's promise
@@ -697,54 +695,76 @@ function AppContent(): React.ReactElement {
   // Materialize pending in-memory page edits onto the snapshot undo chain.
   // Runs before anything that reads or replaces file bytes (save, whole-file
   // ops, close) — all dirty files commit together because cross-file moves
-  // entangle them. Uses the raw (ungated) snapshot to avoid re-entering the
-  // commit gate.
+  // entangle them. The native page transaction owns snapshots/replacement;
+  // it does not re-enter this renderer commit gate.
   const inflightCommit = useRef<Promise<void> | null>(null);
   const commitIfNeeded = useCallback((): Promise<void> => {
     if (inflightCommit.current) return inflightCommit.current;
-    if (state.pageDirtyPaths.length === 0) return Promise.resolve();
-    const run = (async () => {
+    if (readState().pageDirtyPaths.length === 0 && !hasPendingPageCommit() && !hasWorkspacePublication()
+        && workspaceSettled(readState())) return Promise.resolve();
+    const run = serializeWorkspacePublication(async () => {
       try {
-        const outcome = await commitPageEdits({
-          workspace: state.workspace,
-          files: state.files,
-          dirtyPaths: state.pageDirtyPaths,
-          dispatch,
-          snapshot: file.snapshotRaw,
-          writeBuffer: file.writeBuffer,
-          rename: file.rename,
-          remove: file.remove,
-          // callRaw, deliberately — this runs INSIDE the commit, so
-          // the gated `call` would re-enter commitPageEdits (loud throw).
-          // The gate's guarantee ("engine reads bytes matching what the
-          // user sees") holds by construction here: we ARE the commit,
-          // reading the working copy plus the temp this very run staged.
-          // The engine's OUTCOME travels, not a boolean: `applied: false`
-          // covers an unsigned file and a refused append equally, and the
-          // reason is the only thing that separates the standing behaviour
-          // from a signature the user just lost.
-          preserveSignatures: async (workingPath, stagedPath) => {
-            const r = (await callRaw('transplant_incremental', {
-              original: workingPath,
-              modified: stagedPath,
-              output: stagedPath,
-            })) as unknown as PreserveOutcome;
-            return { ...r, applied: r.applied === true };
-          },
-          readBack: batch.readFileBuffer,
-        });
+        await recoverPendingPageCommit();
+        // A plan read from superseded documents writes superseded pages; the
+        // pending reindex also replays the edits this commit is about to take.
+        // A file may publish while we wait for the lock. Re-plan the gate
+        // against the settled revision; callers fence their own edit intent.
+        let outcome: { signatureRefusals: PreserveRefusal[] } | null = null;
+        for (let attempt = 0; attempt < 3 && outcome === null; attempt++) {
+          await awaitSettledWorkspace(readState, subscribeState);
+          const expected = readState();
+          outcome = await withFileLock(Array.from(expected.files.values(), f => f.workingPath), async () => {
+            const state = readState();
+            if (state.files !== expected.files || state.pageDirtyPaths !== expected.pageDirtyPaths
+                || state.pageUndoStack !== expected.pageUndoStack || state.pageRedoStack !== expected.pageRedoStack) {
+              return null;
+            }
+            if (!state.pageDirtyPaths.length) return { signatureRefusals: [] };
+            return commitPageEdits({
+              workspace: state.workspace,
+              files: state.files,
+              dirtyPaths: state.pageDirtyPaths,
+              tier: {
+                planned: { pageUndoStack: state.pageUndoStack, pageRedoStack: state.pageRedoStack },
+                current: readState,
+              },
+              dispatch,
+              transaction: pageCommit,
+              writeBuffer: file.writeBuffer,
+              remove: file.remove,
+              // callRaw, deliberately — this runs INSIDE the commit, so
+              // the gated `call` would re-enter commitPageEdits (loud throw).
+              // The gate's guarantee ("engine reads bytes matching what the
+              // user sees") holds by construction here: we ARE the commit,
+              // reading the working copy plus the temp this very run staged.
+              // The engine's OUTCOME travels, not a boolean: `applied: false`
+              // covers an unsigned file and a refused append equally, and the
+              // reason is the only thing that separates the standing behaviour
+              // from a signature the user just lost.
+              preserveSignatures: async (workingPath, stagedPath) => {
+                const r = (await callRaw('transplant_incremental', {
+                  original: workingPath,
+                  modified: stagedPath,
+                  output: stagedPath,
+                })) as unknown as PreserveOutcome;
+                return r; // the commit boundary validates the actual wire types
+              },
+              readBack: batch.readFileBuffer,
+            });
+          });
+        }
+        if (!outcome) throw new Error(tChrome('app.history.changed'));
         setCommitError(null);
         reportPreserveRefusals(outcome.signatureRefusals);
       } finally {
         inflightCommit.current = null;
       }
-    })();
+    });
     inflightCommit.current = run;
     return run;
   }, [
-    state.pageDirtyPaths,
-    state.workspace,
-    state.files,
+    readState,
+    subscribeState,
     dispatch,
     callRaw,
     reportPreserveRefusals,
@@ -756,6 +776,7 @@ function AppContent(): React.ReactElement {
   // throwing. Flows that must abort on failure (save, close) await
   // commitIfNeeded directly and handle the rejection themselves.
   const commitAndReport = useCallback(async () => {
+    historyRetry.current = null;
     try {
       await commitRef.current();
     } catch (err) {
@@ -780,15 +801,6 @@ function AppContent(): React.ReactElement {
     [state.pageDirtyPaths],
   );
 
-  // Reload the working copy buffer and page count into state
-  const reloadFile = useCallback(async (filePath: string) => {
-    const f = state.files.get(filePath);
-    if (!f) return;
-    const buffer = await file.readBuffer(f.workingPath);
-    const info = await call('get_page_count', { file: f.workingPath });
-    return { buffer, pageCount: info.pages };
-  }, [state.files, call]);
-
   // Create a working copy, unlock if encrypted, read bytes + page count. Shared
   // by opening files and by importing a file's pages into a document.
   // Returns null if the user cancelled an encrypted file.
@@ -802,14 +814,16 @@ function AppContent(): React.ReactElement {
       if (encStatus.encrypted) {
         let unlocked = false;
         let error: string | undefined;
+        let unlockPfx: string | undefined;
         while (!unlocked) {
           if (encStatus.kind === 'pubkey') {
             // Certificate-encrypted (Adobe.PubSec) — unlock with the
             // user's PKCS#12 key. The engine's refusals are already honest
             // ("does not match any recipient" / "check the file and its
             // password"), so they surface verbatim.
-            const result = await showCertUnlockPrompt(name, error);
+            const result = await showCertUnlockPrompt(name, error, unlockPfx);
             if (result === 'cancel') return null;
+            unlockPfx = result.pfx;
             try {
               await call('decrypt_pubkey', {
                 file: workingPath,
@@ -842,6 +856,21 @@ function AppContent(): React.ReactElement {
 
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // Launch-time dead-recent cleanup (auto-removes only positively confirmed
+  // missing local files; never a sourceUrl entry, never anything merely
+  // indeterminate — see sweepDeadRecents). Runs once, after hydration, without
+  // blocking first render. Reads through stateRef so the list it sweeps is the
+  // hydrated one, not the empty pre-hydration closure value.
+  useEffect(() => {
+    void sweepDeadRecents(
+      () => stateRef.current.ui.recentFiles,
+      (paths) => file.classifyRecentPaths(paths),
+    ).then((result) => {
+      if (result) dispatch({ type: 'UI_SET_RECENT_FILES', files: result.next });
+    });
+    // `dispatch` is stable, so the list is still a once-at-mount effect.
+  }, [dispatch]);
 
   // Documents this window has handed to another and not yet heard the outcome
   // for. A handover moves ownership before the receiving window has opened
@@ -966,6 +995,23 @@ function AppContent(): React.ReactElement {
   // in its own surface (Open from Web Address, beside the address it typed).
   // Everything else gets the notice, because the alternative is the defect
   // this exists to close: the user picked a file and nothing happened.
+  const openFlights = useRef(createOpenFlights());
+  const claimHolds = useRef(createClaimHolds());
+  // Whether this window still uses `path`: a document or import source of it,
+  // or an open or import of it that has not finished. A release is sent only
+  // when this answers false at the release's turn.
+  const pathInUse = useCallback(
+    (path: string): boolean => readState().files.has(path) || claimHolds.current.held(path),
+    [readState],
+  );
+  // An import source leaves `files` once no page references it; its read claim
+  // goes with it.
+  const filesSeen = useRef(state.files);
+  useEffect(() => {
+    const departed = departedImportSources(filesSeen.current, state.files);
+    filesSeen.current = state.files;
+    if (departed.length > 0) void releasePaths(departed, pathInUse);
+  }, [state.files, pathInUse]);
   const openByPaths = useCallback(async (
     paths: string[],
     opts?: { focus?: boolean; index?: number; webOrigin?: string; reportFailures?: boolean },
@@ -979,10 +1025,15 @@ function AppContent(): React.ReactElement {
     // The file that was really OPENED (not re-activated) and became the
     // landing tab. Only a fresh open applies an initial view: re-activating a
     // tab must not undo a layout the user chose while it was open.
-    let freshlyOpened: { path: string; workingPath: string } | null = null;
+    // Asserted, not annotated: the open steps assign it inside callbacks, which
+    // the compiler's flow narrowing does not follow.
+    let freshlyOpened = null as { path: string; workingPath: string } | null;
     let changed = false;
     // Claimed but not yet accounted for — released in the finally.
     let unopened = new Set<string>();
+    // Held from before the claim is sent until the finally: no release by
+    // another flow of this window drops the claim this open works under.
+    let holding: string[] = [];
     try {
       // THE PATH-IDENTITY GATE. File identity is the raw path string
       // app-wide (`state.files` keys, tabs, recents, activeFileId,
@@ -1022,16 +1073,8 @@ function AppContent(): React.ReactElement {
       //
       // The same path twice in one batch is one open. Nothing upstream
       // dedupes: `spectrapdf.exe a.pdf a.pdf` really arrives as two
-      // entries — and post-gate, `a.pdf A.PDF` collapses here too.
-      //
-      // This can't be left to the already-open check below: that reads state
-      // React hasn't flushed yet. The loop only awaits BEFORE each dispatch,
-      // never after, so the next iteration's read runs in the same tick as the
-      // previous OPEN_FILE and still sees the file as absent — `stateRef` is as
-      // stale as the closure was for this particular read. A duplicate would
-      // open twice, leaking the first working copy (`create_working_copy` mints
-      // a fresh temp dir per call and nothing purges them) and prompting twice
-      // for an encrypted file's password.
+      // entries — and post-gate, `a.pdf A.PDF` collapses here too. One entry
+      // per path is one claim and one outcome in the batch's report.
       // THE OWNERSHIP GATE. A path is live in at most one window, and the
       // claim is taken before any bytes are read: `create_working_copy` mints
       // a fresh temp directory per call, so a second window opening the same
@@ -1039,81 +1082,89 @@ function AppContent(): React.ReactElement {
       // are reconciled by whichever bare `save_as` copy lands last. The claim
       // sits here rather than at commit time because by commit time both
       // sessions exist and one of them has to be thrown away.
-      const { granted, refused } = await claimPaths([...new Set(canonical)], 'write');
+      holding = canonicalSet;
+      claimHolds.current.hold(holding);
+      const { granted, refused } = await claimPaths(canonicalSet, 'write');
       if (refused.length > 0) void reportClaimRefusal(refused, 'window');
       unopened = new Set(granted);
       for (const filePath of granted) {
-        // Already open as a real DOCUMENT → just re-activate it. A byte-only
-        // import source doesn't count: it has an entry in `files` but no tab,
-        // nothing ever upgrades the flag, and `focusTab` rejects a doc tab for
-        // it — so treating it as "already open" made File ▸ Open on a file you
-        // had previously imported pages FROM a permanent no-op with no
-        // feedback. Fall through and open it properly instead.
-        // Off the ref, not the closure: the closure's `state.files` is stale for
-        // the whole call (the same reason `recent` is threaded above), so a
-        // file opened by an earlier, separate openByPaths call would be missed.
-        // The ref is current as of the last completed render — which is enough
-        // here precisely because the dedupe above already handles the one case
-        // it can't see (a duplicate within this batch, dispatched but not yet
-        // flushed).
         const fileName = filePath.split(/[\\/]/).pop() || filePath;
-        const existing = stateRef.current.files.get(filePath);
-        if (existing && !existing.importOnly) {
-          outcomes.push({ name: fileName, reason: null });
-          dispatch({ type: 'SET_ACTIVE_FILE', path: filePath });
-          recent = withRecent(recent, filePath, Date.now(), originFor(filePath)); // only on success — a cancel/throw
-          lastOpened = filePath;                  // must not pollute Recent (regression)
-          freshlyOpened = null;
-          changed = true;
-          unopened.delete(filePath);
-          continue;
-        }
-        if (existing?.importOnly) {
-          // Upgrading a ghost REPLACES bytes that other documents' pending
-          // pages still point into (`PageRef.sourceDocId` + a positional
-          // `sourcePageIndex`, resolved at commit by `bytesFor`). If the file
-          // changed on disk since the import, those indices now mean something
-          // else — a silent wrong page, or a throw at commit. Flush first, so
-          // the imported pages are materialized into their own files and
-          // nothing references these bytes any more. `prepareFileBytes` can't
-          // be relied on for this: its only engine call is `check_encrypted`,
-          // which is an INTERNAL_METHOD and so deliberately ungated.
-          await runCommitGate();
-        }
-        // THE REFUSAL SEAM. `prepareFileBytes` mints the working copy and runs
-        // the engine's first reads; anything the file is too broken for throws
-        // HERE, and used to propagate out of the funnel into a rejection
-        // nobody caught. A throw is one file's verdict, never the batch's: the
-        // loop continues, the claim on this path is released by the finally,
-        // and the batch reports every outcome once at the end.
-        let prepared: Awaited<ReturnType<typeof prepareFileBytes>>;
-        try {
-          prepared = await prepareFileBytes(filePath);
-        } catch (err) {
-          outcomes.push({
-            name: fileName,
-            reason: translateOpenFailure(err instanceof Error ? err.message : String(err), {
-              name: fileName,
+        // An open of this path already in flight (another call of this funnel)
+        // is waited for, and its verdict stands: one path, one open.
+        const step = await openPathOnce(openFlights.current, filePath, {
+          // Already open as a real DOCUMENT → just re-activate it. A byte-only
+          // import source doesn't count: it has an entry in `files` but no
+          // tab, nothing ever upgrades the flag, and `focusTab` rejects a doc
+          // tab for it — so treating it as "already open" made File ▸ Open on
+          // a file you had previously imported pages FROM a permanent no-op
+          // with no feedback. Fall through and open it properly instead. Read
+          // from the store, which every dispatch settles synchronously.
+          isOpen: () => {
+            const existing = readState().files.get(filePath);
+            return !!existing && !existing.importOnly;
+          },
+          reactivate: async () => {
+            outcomes.push({ name: fileName, reason: null });
+            dispatch({ type: 'SET_ACTIVE_FILE', path: filePath });
+            recent = await recordRecentOpen(recent, filePath, Date.now(), originFor(filePath)); // only on success — a cancel/throw
+            lastOpened = filePath;                  // must not pollute Recent (regression)
+            freshlyOpened = null;
+            changed = true;
+          },
+          open: async () => {
+            if (readState().files.get(filePath)?.importOnly) {
+              // Upgrading a ghost REPLACES bytes that other documents' pending
+              // pages still point into (`PageRef.sourceDocId` + a positional
+              // `sourcePageIndex`, resolved at commit by `bytesFor`). If the
+              // file changed on disk since the import, those indices now mean
+              // something else — a silent wrong page, or a throw at commit.
+              // Flush first, so the imported pages are materialized into their
+              // own files and nothing references these bytes any more.
+              // `prepareFileBytes` can't be relied on for this: its only
+              // engine call is `check_encrypted`, which is an INTERNAL_METHOD
+              // and so deliberately ungated.
+              await runCommitGate();
+            }
+            // THE REFUSAL SEAM. `prepareFileBytes` mints the working copy and
+            // runs the engine's first reads; anything the file is too broken
+            // for throws HERE, and used to propagate out of the funnel into a
+            // rejection nobody caught. A throw is one file's verdict, never
+            // the batch's: the loop continues, the claim on this path is
+            // released by the finally, and the batch reports every outcome
+            // once at the end.
+            let prepared: Awaited<ReturnType<typeof prepareFileBytes>>;
+            try {
+              prepared = await prepareFileBytes(filePath);
+            } catch (err) {
+              outcomes.push({
+                name: fileName,
+                reason: translateOpenFailure(err instanceof Error ? err.message : String(err), {
+                  name: fileName,
+                  path: filePath,
+                }),
+              });
+              return false;
+            }
+            if (!prepared) return false; // cancelled encrypted file
+            outcomes.push({ name: fileName, reason: null });
+            dispatch({
+              type: 'OPEN_FILE',
               path: filePath,
-            }),
-          });
-          continue;
-        }
-        if (!prepared) continue; // cancelled encrypted file
-        outcomes.push({ name: fileName, reason: null });
-        dispatch({
-          type: 'OPEN_FILE',
-          path: filePath,
-          ...prepared,
-          index: opts?.index === undefined ? undefined : opts.index + inserted,
-          webOrigin: originFor(filePath),
+              ...prepared,
+              index: opts?.index === undefined ? undefined : opts.index + inserted,
+              webOrigin: originFor(filePath),
+            });
+            inserted += 1;
+            recent = await recordRecentOpen(recent, filePath, Date.now(), originFor(filePath));
+            lastOpened = filePath;
+            freshlyOpened = { path: filePath, workingPath: prepared.workingPath };
+            changed = true;
+            return true;
+          },
         });
-        inserted += 1;
-        recent = withRecent(recent, filePath, Date.now(), originFor(filePath));
-        lastOpened = filePath;
-        freshlyOpened = { path: filePath, workingPath: prepared.workingPath };
-        changed = true;
-        unopened.delete(filePath);
+        // A document holds the claim now; any other path is released in the
+        // finally unless this window uses it by then.
+        if (step === 'opened' || step === 'reactivated') unopened.delete(filePath);
       }
     } finally {
       // Flush whatever succeeded even if a later file threw (a malformed PDF
@@ -1123,7 +1174,8 @@ function AppContent(): React.ReactElement {
       // A claim outlives only what it protects: a cancelled password prompt or
       // a file that threw mid-batch must not leave this window holding a path
       // it never opened.
-      if (unopened.size > 0) void releasePaths([...unopened]);
+      claimHolds.current.drop(holding);
+      if (unopened.size > 0) void releasePaths([...unopened], pathInUse);
     }
     // Outside the finally: an initial view is a courtesy on top of a
     // completed open, never a reason for the open itself to report a failure.
@@ -1136,7 +1188,7 @@ function AppContent(): React.ReactElement {
     // can must not stay pending until they get to it.
     if (opts?.reportFailures !== false) void reportOpenSummary(summary);
     return summary;
-  }, [dispatch, prepareFileBytes, applyInitialView, reportClaimRefusal, reportOpenSummary]);
+  }, [dispatch, readState, pathInUse, prepareFileBytes, applyInitialView, reportClaimRefusal, reportOpenSummary]);
 
   // Import one or more files' pages INTO an existing document at an index (the
   // add-page ghost and per-position drops). Each file is registered
@@ -1165,62 +1217,78 @@ function AppContent(): React.ReactElement {
       // flush can fix it. Two readers coexist; nobody rewrites through a read
       // claim.
       const canonicalImports = [...new Set(await app.canonicalizePaths(rawPaths))];
-      const claimed = await claimPaths(canonicalImports, 'read');
-      if (claimed.refused.length > 0) void reportClaimRefusal(claimed.refused, 'import');
-      const filePaths = claimed.granted;
-      const toRegister: {
-        path: string;
-        workingPath: string;
-        name: string;
-        pageCount: number;
-        buffer: PdfBuffer;
-      }[] = [];
-      const allPages: PageRef[] = [];
-      // Paths this window already held before the import: releasing one would
-      // drop the WRITE claim on a document that is still open here.
-      const unused = new Set(filePaths.filter((p) => !state.files.has(p)));
-      for (const filePath of filePaths) {
-        const existing = state.files.get(filePath);
-        let src: { workingPath: string; name: string; buffer: PdfBuffer; pageCount: number };
-        if (existing?.buffer) {
-          src = {
-            workingPath: existing.workingPath,
-            name: existing.name,
-            buffer: existing.buffer,
-            pageCount: existing.pageCount,
-          };
-        } else {
-          const prepared = await prepareFileBytes(filePath);
-          if (!prepared) continue;
-          toRegister.push({ path: filePath, ...prepared });
-          src = prepared;
+      // Held from before the claim is sent until the finally: no release by
+      // another flow of this window (a cancelled open of the same file) drops
+      // the claim this import reads under.
+      claimHolds.current.hold(canonicalImports);
+      let filePaths: string[] = [];
+      try {
+        const claimed = await claimPaths(canonicalImports, 'read');
+        if (claimed.refused.length > 0) void reportClaimRefusal(claimed.refused, 'import');
+        filePaths = claimed.granted;
+        const toRegister: {
+          path: string;
+          workingPath: string;
+          name: string;
+          pageCount: number;
+          buffer: PdfBuffer;
+        }[] = [];
+        const allPages: PageRef[] = [];
+        const sources: { path: string; buffer: PdfBuffer }[] = [];
+        for (const filePath of filePaths) {
+          // A file being opened meanwhile is read once: the import takes the
+          // opened document's bytes instead of preparing the file a second time.
+          await openFlights.current.pending(filePath);
+          // Read from the store, not the render: a file opened or committed
+          // since the render holds other bytes, and pages indexed from the
+          // render's bytes name other pages of the file (the import is then
+          // refused).
+          const existing = readState().files.get(filePath);
+          let src: { workingPath: string; name: string; buffer: PdfBuffer; pageCount: number };
+          if (existing?.buffer) {
+            src = {
+              workingPath: existing.workingPath,
+              name: existing.name,
+              buffer: existing.buffer,
+              pageCount: existing.pageCount,
+            };
+          } else {
+            const prepared = await prepareFileBytes(filePath);
+            if (!prepared) continue;
+            toRegister.push({ path: filePath, ...prepared });
+            src = prepared;
+          }
+          const docs = await indexImportSource({
+            path: filePath,
+            workingPath: src.workingPath,
+            name: src.name,
+            pageCount: src.pageCount,
+            buffer: src.buffer,
+            dirty: false,
+            undoStack: [],
+            redoStack: [],
+            importOnly: true,
+          });
+          for (const d of docs) allPages.push(...d.pages);
+          sources.push({ path: filePath, buffer: src.buffer });
         }
-        const docs = await indexOpenFile({
-          path: filePath,
-          workingPath: src.workingPath,
-          name: src.name,
-          pageCount: src.pageCount,
-          buffer: src.buffer,
-          dirty: false,
-          undoStack: [],
-          redoStack: [],
-          importOnly: true,
-        });
-        for (const d of docs) allPages.push(...d.pages);
-        unused.delete(filePath);
+        if (allPages.length === 0) return;
+        for (const reg of toRegister) dispatch({ type: 'REGISTER_IMPORT_SOURCE', ...reg });
+        dispatch({ type: 'IMPORT_PAGES', toDocId, toIndex, pages: allPages, sources });
+      } finally {
+        claimHolds.current.drop(canonicalImports);
+        // A claim outlives only what it protects. A path this window uses by
+        // its release's turn keeps it: a document open here (releasing it would
+        // drop the WRITE claim of a document still open), a source this import
+        // registered, an open or another import of it in flight.
+        if (filePaths.length > 0) void releasePaths(filePaths, pathInUse);
       }
-      if (allPages.length === 0) {
-        if (unused.size > 0) void releasePaths([...unused]);
-        return;
-      }
-      for (const reg of toRegister) dispatch({ type: 'REGISTER_IMPORT_SOURCE', ...reg });
-      dispatch({ type: 'IMPORT_PAGES', toDocId, toIndex, pages: allPages });
-      if (unused.size > 0) void releasePaths([...unused]);
     },
     [
-      state.files,
       state.workspace.documents,
+      readState,
       dispatch,
+      pathInUse,
       prepareFileBytes,
       reportClaimRefusal,
       confirmPageEdit,
@@ -1436,57 +1504,43 @@ function AppContent(): React.ReactElement {
   // unguarded ones. The two `none` ops own their own confirms, for reasons
   // the roster states.
   //
-  // The decision runs BEFORE the snapshot: `file.snapshot` runs the commit
-  // gate, so asking afterwards would have flushed the user's pending page
-  // edits to disk on the way to refusing the edit that caused it.
+  // Consent precedes the commit gate. The operation writes only a private
+  // stage; complete bytes, working file and history publish as one transaction.
   const performOperation = useCallback<PerformOperation>(async (
     filePath: string,
     method: OpMethod,
     params: Record<string, unknown>,
+    options,
   ) => {
-    const f = state.files.get(filePath);
-    if (!f) return null;
-    const editClass = opEditClass(method);
-    if (editClass !== 'none' && !(await confirmEditOfSignedDoc(filePath, f.workingPath, editClass))) {
-      return EDIT_DECLINED;
-    }
-    const snapshotPath = await file.snapshot(f.workingPath);
-    const answer = await call(method, { ...params, file: f.workingPath, output: f.workingPath });
-    const reloaded = await reloadFile(filePath);
-    if (reloaded) {
-      dispatch({ type: 'UPDATE_FILE', path: filePath, pageCount: reloaded.pageCount, buffer: reloaded.buffer, snapshotPath });
-    }
-    return answer;
-  }, [state.files, call, reloadFile, dispatch, confirmEditOfSignedDoc]);
+    const editClass = options?.structuralConsent ? 'structural' : sequenceEditClass(method, options?.following?.map(step => step.method));
+    return trackInteractive(() => executeWorkspaceOperation(filePath, method, params, readState, dispatch, {
+      confirm: (path, working) => editClass === 'none' ? Promise.resolve(true) : confirmEditOfSignedDoc(path, working, editClass),
+      commit: () => commitRef.current(), read: file.readBuffer, write: file.writeBuffer,
+      remove: file.remove, index: readPublishedBytes, transaction: pageCommit,
+      callStaged: callRaw,
+      track: async (name, values, run) => isTrackableMethod(name) ? await trackOperation(name, values, run) as Awaited<ReturnType<typeof run>> : run(),
+    }, options));
+  }, [readState, callRaw, dispatch, confirmEditOfSignedDoc, trackOperation]);
 
-  // Applying redactions REWRITES the page content, so it is a structural-class
-  // edit however small the band: the append tier cannot carry it, every byte
-  // range breaks, and a certification that forbids the change is refused
-  // rather than warned about. Returns whether the redaction ran — the caller
-  // clears the applied marks, and clearing them after a declined edit would
-  // lose the user's markup with nothing to show for it.
+  const redactionGeometry = useCallback(async (page: PageRef, accepted: AppState) => {
+    const buffer = accepted.files.get(page.sourceDocId)?.buffer;
+    if (!buffer) throw new Error(tChrome('refusal.file.noLongerOpen'));
+    const proxy = await getDocumentProxy(page.sourceDocId, buffer);
+    const source = await proxy.getPage(page.sourcePageIndex + 1);
+    const [x0, y0, x1, y1] = source.view;
+    return { box: { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, bakedRotate: source.rotate };
+  }, []);
+
   const handleRedactFile = useCallback(
-    async (path: string, regions: { page: number; rect: [number, number, number, number] }[]): Promise<boolean> => {
-      const f = state.files.get(path);
-      if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      return (await performOperation(path, 'redact', { regions })) !== EDIT_DECLINED;
-    },
-    [state.files, performOperation],
+    (path: string, marks: readonly RedactionMark[], seen: AppState): Promise<boolean> =>
+      writeRedactionMarks(path, marks, seen, 'redact', readState, performOperation, redactionGeometry, gsPathIfAvailable),
+    [readState, performOperation, redactionGeometry],
   );
 
-  // Persist the pending marks as the file's /Redact set — undoable,
-  // same snapshot→engine→reload shape as apply. The reload's buffer change
-  // clears the transient marks and the re-seed loads them back from the
-  // file, so state and file agree by construction.
   const handleSaveRedactionMarks = useCallback(
-    async (path: string, regions: { page: number; rect: [number, number, number, number] }[]) => {
-      const f = state.files.get(path);
-      if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      // Saving marks writes /Redact annotations and removes nothing yet, so
-      // it is annotate-class in the roster; applying them is the content change.
-      await performOperation(path, 'save_redaction_marks', { regions });
-    },
-    [state.files, performOperation],
+    (path: string, marks: readonly RedactionMark[], seen: AppState): Promise<boolean> =>
+      writeRedactionMarks(path, marks, seen, 'save_redaction_marks', readState, performOperation, redactionGeometry, gsPathIfAvailable),
+    [readState, performOperation, redactionGeometry],
   );
 
   // An address this app will not open is still an address the user wants.
@@ -1599,170 +1653,45 @@ function AppContent(): React.ReactElement {
         case 'submit': {
           const f = state.files.get(path);
           if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-          const stem = (f.name || 'form').replace(/\.pdf$/i, '');
-          // A destination this app has no transport for — an empty address, a
-          // `mailto:`, anything that is not http(s). The payload is still
-          // built and can still be saved: the refusal is about the transport,
-          // never about the submission.
-          const refusalKey = destinationRefusal(action.url);
-          const proceed = await showProceedConfirm(
-            tChrome('app.formButton.submitTitle'),
-            refusalKey
-              ? tChrome(refusalKey, { field: fieldName })
-              : tChrome('app.formButton.submit', {
-                  field: fieldName,
-                  url: action.url,
+          // Read-only against the document: the payload is built with the gated
+          // call beside it, never through performOperation, which would replace
+          // the file with its own submission.
+          await runSubmission(
+            {
+              confirm: showProceedConfirm,
+              notice: showNotice,
+              consent: (ask) =>
+                showSubmitConsent(ask.field, ask.url, ask.format, ask.method, ask.preview, ask.fieldCount),
+              payloadPath: (stem, extension) => app.netPayloadPath(stem, extension),
+              buildPayload: async (output) =>
+                (await call('export_form_data', {
+                  file: f.workingPath,
+                  output,
                   format: action.format,
-                }),
+                  ...(action.fields ? { fields: action.fields, exclude: action.exclude } : {}),
+                  include_empty: action.includeEmpty,
+                })) as unknown as { count?: number },
+              payloadBytes: (payload) => app.netPayloadBytes(payload),
+              send: (request) => app.netRequest(request),
+              saveTarget: (suggested) => dialog.saveFormDataFile(suggested),
+              copyFile: (from, to) => batch.copyFile(from, to),
+              copyToClipboard,
+              importFormData: async (data) => {
+                await performOperation(path, 'import_form_data', {
+                  data,
+                  font_dir: await app.getEditFontPath(),
+                });
+              },
+              openDocument: async (reply) => {
+                await openByPaths([reply]);
+                const [opened] = await app.canonicalizePaths([reply]);
+                return !!readState().files.get(opened) && !readState().files.get(opened)?.importOnly;
+              },
+              remove: (scratch) => file.remove(scratch),
+            },
+            { field: fieldName, stem: (f.name || 'form').replace(/\.pdf$/i, ''), action },
           );
-          if (!proceed) return;
-          // The payload is built to the app's own temp tree FIRST, because the
-          // consent dialog shows that file's bytes: a preview assembled from
-          // anything else would be a second answer to what gets transmitted.
-          //
-          // Read-only against the document, so it takes the gated call and
-          // writes its payload beside — never through performOperation, which
-          // would replace the file with its own submission.
-          const payloadPath = await app.netPayloadPath(
-            `${stem}-submission`,
-            SUBMIT_EXTENSION[action.format].slice(1),
-          );
-          const built = (await call('export_form_data', {
-            file: f.workingPath,
-            output: payloadPath,
-            format: action.format,
-            ...(action.fields ? { fields: action.fields, exclude: action.exclude } : {}),
-            include_empty: action.includeEmpty,
-          })) as unknown as { count?: number };
-
-          /** The pre-transmit behaviour, kept: the built submission handed
-           * over as a file, with its destination offered to the clipboard. */
-          const saveBuiltCopy = async (): Promise<void> => {
-            const target = await dialog.saveFormDataFile(
-              `${stem}${SUBMIT_EXTENSION[action.format]}`,
-            );
-            if (!target) return;
-            await batch.copyFile(payloadPath, target);
-            const copy = await showProceedConfirm(
-              tChrome('app.formButton.submitBuiltTitle'),
-              tChrome('app.formButton.submitBuilt', { file: target, url: action.url }),
-            );
-            if (copy) await copyToClipboard(action.url);
-          };
-
-          if (refusalKey) {
-            await saveBuiltCopy();
-            return;
-          }
-
-          const answer = await showSubmitConsent(
-            fieldName,
-            action.url,
-            action.format,
-            action.method,
-            payloadPreview(action.format, await app.netPayloadBytes(payloadPath)),
-            built.count ?? 0,
-          );
-          if (answer === 'cancel') return;
-          if (answer === 'save') {
-            await saveBuiltCopy();
-            return;
-          }
-
-          let response;
-          try {
-            response = await app.netRequest(
-              submitRequest(action, payloadPath, `${stem}-reply`),
-            );
-          } catch (error) {
-            await showNotice(
-              tChrome('app.formButton.submitFailedTitle'),
-              tChrome('app.formButton.submitFailed', {
-                url: action.url,
-                detail: String(error),
-              }),
-            );
-            return;
-          }
-
-          /** The reply as a file the user keeps — the door that interprets
-           * nothing. An HTML reply always lands here: this app never renders a
-           * page it was sent. */
-          const saveReply = async (): Promise<void> => {
-            const suffix = response.path.slice(response.path.lastIndexOf('.'));
-            const target = await dialog.saveFormDataFile(`${stem}-reply${suffix}`);
-            if (!target) return;
-            await batch.copyFile(response.path, target);
-            await showNotice(
-              tChrome('app.formButton.submitSentTitle'),
-              tChrome('app.formButton.submitReplySaved', { file: target }),
-            );
-          };
-
-          if (!statusAccepted(response.status)) {
-            await showNotice(
-              tChrome('app.formButton.submitFailedTitle'),
-              tChrome('app.formButton.submitRejected', {
-                url: action.url,
-                status: response.status,
-              }),
-            );
-            if (response.bytes > 0) await saveReply();
-            return;
-          }
-          if (response.bytes === 0) {
-            await showNotice(
-              tChrome('app.formButton.submitSentTitle'),
-              tChrome('app.formButton.submitEmptyReply', { url: action.url }),
-            );
-            return;
-          }
-          // Everything below routes UNTRUSTED bytes into a door this app
-          // already has, and every door asks first. Nothing executes.
-          switch (responseRoute(response.contentType)) {
-            case 'formData': {
-              const importIt = await showProceedConfirm(
-                tChrome('app.formButton.submitSentTitle'),
-                tChrome('app.formButton.submitFormDataReply', {
-                  url: action.url,
-                  bytes: response.bytes,
-                }),
-              );
-              if (!importIt) return;
-              await performOperation(path, 'import_form_data', {
-                data: response.path,
-                font_dir: await app.getEditFontPath(),
-              });
-              return;
-            }
-            case 'document': {
-              const openIt = await showProceedConfirm(
-                tChrome('app.formButton.submitSentTitle'),
-                tChrome('app.formButton.submitDocumentReply', {
-                  url: action.url,
-                  bytes: response.bytes,
-                }),
-              );
-              if (!openIt) return;
-              await openByPaths([response.path]);
-              return;
-            }
-            default: {
-              const saveIt = await showProceedConfirm(
-                tChrome('app.formButton.submitSentTitle'),
-                tChrome('app.formButton.submitFileReply', {
-                  url: action.url,
-                  bytes: response.bytes,
-                  type:
-                    response.contentType ||
-                    tChrome('app.formButton.submitFileReplyUnknown'),
-                }),
-              );
-              if (!saveIt) return;
-              await saveReply();
-              return;
-            }
-          }
+          return;
         }
         case 'uri': {
           const copy = await showProceedConfirm(
@@ -1809,6 +1738,7 @@ function AppContent(): React.ReactElement {
       showSubmitConsent,
       openByPaths,
       copyToClipboard,
+      readState,
     ],
   );
 
@@ -1835,141 +1765,34 @@ function AppContent(): React.ReactElement {
   );
 
   const handleFillFormValues = useCallback(
-    async (path: string, values: Record<string, FormFieldValue>) => {
-      const f = state.files.get(path);
-      if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      // Pre/post reads route through the engine — `read_form_fields` is
-      // INTERNAL, so neither read runs the commit gate. The pre-read sees the
-      // current working copy (== buffer); `file.snapshot` then flushes pending
-      // page edits, and the post-read sees those committed bytes, so the
-      // fingerprint/rename-family re-resolution below still detects an import
-      // carry's field rename exactly as with the old pdf-lib read. It happens
-      // BEFORE the signed-edit question because that question has to be asked
-      // about the TRANSITIVE set — filling an unlocked line item that
-      // recalculates a locked Total produces a document reporting as altered,
-      // and a decision taken on the typed names alone would never see it.
-      const pre = f.buffer ? await readFormFields(call, f.workingPath) : null;
-      const preFields = pre?.fields ?? [];
-      const typed = Object.keys(values);
-      const targets = pre
-        ? fillClosure(formCalculation(pre.fields, pre.calculationOrder), typed)
-        : typed;
-      if (!(await confirmEditOfSignedDoc(path, f.workingPath, 'form-fill', targets, typed))) return;
-      const snapshotPath = await file.snapshot(f.workingPath);
-      const postFields = (await readFormFields(call, f.workingPath)).fields;
-      const { resolved, skipped } = resolveFillTargets(preFields, postFields, values);
-      if (skipped.length > 0) {
-        throw new Error(skipped.map((s) => `"${s.name}": ${s.reason}`).join('; '));
-      }
-      // Route the fill through the ENGINE — Unicode-capable
-      // (embeds a font for non-WinAnsi values) and multi-select-optionlist
-      // aware. Read (above) and fill are now one engine implementation;
-      // `resolveFillTargets`' fingerprint/rename-family machinery is unchanged.
-      // The snapshot already flushed pending edits, and `call` is commit-gated
-      // for `fill_form_fields`, so the engine reads the committed bytes.
-      const fillReport = await call('fill_form_fields', {
-        file: f.workingPath,
-        output: f.workingPath,
-        edits: resolved,
-        font_dir: await app.getEditFontPath(),
-      });
-      // The fill's own report, read rather than discarded. The engine refuses
-      // an inconsistent fill atomically, so what is left to check is that the
-      // success path accounts for every field this call named — the on-canvas
-      // fill has no other evidence, and a silent shortfall is announced as a
-      // completed fill.
-      const outcome = classifyFillResult(fillReport, Object.keys(resolved).length);
-      // The reload runs on both paths: the document changed on disk, and the
-      // refreshed bytes are what the refusal tells the caller to trust.
-      const result = await reloadFile(path);
-      if (!result) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      dispatch({
-        type: 'UPDATE_FILE',
-        path,
-        pageCount: result.pageCount,
-        buffer: result.buffer,
-        snapshotPath,
-      });
-      if (outcome.kind === 'refused') {
-        throw new Error(
-          outcome.refusal.kind === 'incomplete'
-            ? tChrome('panel.forms.fillIncomplete', {
-                named: outcome.refusal.requested,
-                written: outcome.refusal.filled,
-              })
-            : tChrome('panel.forms.fillUnverified'),
-        );
-      }
+    async (path: string, values: Record<string, FormFieldValue>, options?: import('./lib/form-fill-transaction').FormFillOptions) => {
+      const filled = await trackInteractive(() => fillFormValues(path, values, readState, dispatch, {
+        confirm: (source, policyPath, targets, typed, flatten) => confirmEditOfSignedDoc(source, policyPath, flatten ? 'structural' : 'form-fill', targets, typed),
+        commit: () => commitRef.current(), read: file.readBuffer, write: file.writeBuffer,
+        remove: file.remove, index: readPublishedBytes, fontDirectory: app.getEditFontPath,
+        callStaged: callRaw, transaction: pageCommit,
+        track: async run => { await trackOperation('fill_form_fields', { file: readState().files.get(path)?.workingPath }, run); },
+      }, options));
+      return filled.completed ? filled : EDIT_DECLINED;
     },
-    [state.files, reloadFile, dispatch, call, confirmEditOfSignedDoc],
+    [readState, dispatch, callRaw, confirmEditOfSignedDoc, trackOperation],
   );
 
-  // One snapshot, one write, one reload — so N accepted fields are ONE undo
-  // entry rather than N. The single-field placement path calls it with one
-  // spec; there is no second creation path.
-  //
-  // A VERTICAL field takes a second write: pdf-lib cannot author the
-  // CID-keyed font a column needs, so the field is created here and BOUND by
-  // the engine door, one call per script. Both writes land inside the single
-  // snapshot/reload/UPDATE_FILE pair — the pair is what makes the gesture one
-  // undo entry, and splitting it would put a horizontal half-field on the
-  // stack. A refusal from the door restores the snapshot before it rethrows,
-  // so a create that could not become a column leaves nothing behind.
+  // Single placements and accepted detection batches share one staged edit.
+  // Font binding/choice appearances finish before bytes and history publish.
   const handleAddFormFields = useCallback(
     async (path: string, specs: readonly NewFieldSpec[]) => {
-      const f = state.files.get(path);
-      if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      // Creating a field authors form STRUCTURE, not a value: pdf-lib's save
-      // coalesces the file, so every byte range breaks and no certification
-      // level carries it. Asked BEFORE the snapshot — `file.snapshot` runs the
-      // commit gate, so asking after would flush pending page edits on the way
-      // to refusing this one.
-      if (!(await confirmEditOfSignedDoc(path, f.workingPath, 'structural'))) return EDIT_DECLINED;
-      const snapshotPath = await file.snapshot(f.workingPath);
-      const bytes = await file.readBuffer(f.workingPath);
-      const withFields = await addFormFields(bytes, specs);
-      await file.writeBuffer(f.workingPath, withFields);
-      const vertical = verticalFontCalls(specs);
-      const choices = choiceAppearanceFields(specs);
-      if (vertical.length > 0 || choices.length > 0) {
-        const fontDir = await app.getEditFontPath();
-        try {
-          for (const bind of vertical) {
-            await call('author_vertical_field_font', {
-              file: f.workingPath,
-              output: f.workingPath,
-              fields: bind.fields,
-              script: bind.script,
-              font_dir: fontDir,
-            });
-          }
-          // After the vertical bind, never before: a list's writing mode is
-          // stated by the font its /DA names, so the appearance door has to
-          // read the /DA the bind wrote to draw rows as columns.
-          if (choices.length > 0) {
-            await call('author_choice_appearance', {
-              file: f.workingPath,
-              output: f.workingPath,
-              fields: choices,
-              font_dir: fontDir,
-            });
-          }
-        } catch (err) {
-          await file.restoreSnapshot(f.workingPath, snapshotPath);
-          throw err;
-        }
-      }
-      const result = await reloadFile(path);
-      if (!result) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      dispatch({
-        type: 'UPDATE_FILE',
-        path,
-        pageCount: result.pageCount,
-        buffer: result.buffer,
-        snapshotPath,
+      const created = await createFormFields(path, specs, readState, dispatch, {
+        confirm: (source, working) => confirmEditOfSignedDoc(source, working, 'structural'),
+        commit: () => commitRef.current(), read: file.readBuffer, write: file.writeBuffer,
+        remove: file.remove, index: readPublishedBytes, fontDirectory: app.getEditFontPath,
+        // Private staging, within the already gated/locked transaction. A
+        // normal call would recursively enter the workspace publication lane.
+        callStaged: callRaw, transaction: pageCommit,
       });
+      if (!created) return EDIT_DECLINED;
     },
-    [state.files, reloadFile, dispatch, call, confirmEditOfSignedDoc],
+    [readState, dispatch, callRaw, confirmEditOfSignedDoc],
   );
 
   const handleAddFormField = useCallback(
@@ -2356,6 +2179,15 @@ function AppContent(): React.ReactElement {
   // (gate → snapshot → engine → reload → undoable); extract is a gated read
   // that writes a NEW image file where the user chose. `opts` lets the e2e
   // harness inject what the native dialogs would collect.
+  const performImageEdit = useCallback((path: string, edit: ImageEdit) => trackInteractive(() =>
+    editWorkspaceImage(path, edit, readState, dispatch, {
+      confirm: (source, working) => confirmEditOfSignedDoc(source, working, 'structural'),
+      commit: () => commitRef.current(), read: file.readBuffer, write: file.writeBuffer,
+      remove: file.remove, index: readPublishedBytes, transaction: pageCommit, callStaged: callRaw,
+      pick: dialog.pickImageFile, readSource: batch.readFileBuffer, decode: decodeToRawSource,
+      track: async (method, working, run) => { await trackOperation(method, { file: working }, run); },
+    })), [readState, dispatch, confirmEditOfSignedDoc, callRaw, trackOperation]);
+
   const handleEditImage = useCallback(
     async (
       kind: 'delete' | 'replace' | 'extract' | 'transform' | 'crop' | 'opacity',
@@ -2374,16 +2206,6 @@ function AppContent(): React.ReactElement {
     ) => {
       const f = state.files.get(path);
       if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-
-      // Every mutating kind but `replace` runs through performOperation and
-      // is decided there by its roster class. `replace` is the deliberate
-      // exception: it holds ONE snapshot across a passthrough-then-raw retry
-      // (two performOperation calls would snapshot twice and leak a copy on
-      // every CMYK fallback), so it keeps its own guard — the shape is
-      // bespoke, not the decision.
-      if (kind === 'replace' && !(await confirmEditOfSignedDoc(path, f.workingPath, 'structural'))) {
-        return EDIT_DECLINED;
-      }
 
       if (kind === 'delete') {
         const r = await performOperation(path, 'delete_page_image', { page, index });
@@ -2434,73 +2256,7 @@ function AppContent(): React.ReactElement {
       }
 
       if (kind === 'replace') {
-        let source = opts?.source ?? null;
-        let pickedPath: string | null = null;
-        if (!source) {
-          pickedPath = await dialog.pickImageFile();
-          if (!pickedPath) return;
-          if (isJpegPath(pickedPath)) {
-            // EXIF-rotated photos must NOT passthrough: PDF viewers render
-            // the sensor pixel grid and ignore EXIF, so a portrait phone
-            // photo would land sideways. Route those to the decode path,
-            // where the webview applies the rotation (regression).
-            const head = await batch.readFileBuffer(pickedPath);
-            if (jpegExifOrientation(head) === 1) source = { jpeg_path: pickedPath };
-          }
-        }
-        // ONE snapshot for the whole attempt — the passthrough-then-raw
-        // retry lives INSIDE it. Two performOperation calls would snapshot
-        // twice and leak the first copy on every CMYK fallback
-        // (regression); this is performOperation's exact shape with the
-        // retry between snapshot and reload.
-        const tempFiles: string[] = [];
-        const writeTemp = async (data: Uint8Array): Promise<string> => {
-          const dir = f.workingPath.replace(/[\\/][^\\/]+$/, '');
-          const sep = f.workingPath.includes('\\') ? '\\' : '/';
-          const p = `${dir}${sep}replace-${crypto.randomUUID()}.raw`;
-          await file.writeBuffer(p, data);
-          tempFiles.push(p);
-          return p;
-        };
-        try {
-          const snapshotPath = await file.snapshot(f.workingPath);
-          // The replacement letterboxes into the old frame
-          // (aspect preserved, centered) instead of stretching — the engine
-          // emits a recognized transform frame, so later moves fold it.
-          const params = {
-            file: f.workingPath,
-            output: f.workingPath,
-            page,
-            index,
-            fit: 'contain',
-          };
-          if (source) {
-            try {
-              await call('replace_page_image', { ...params, source });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              if (!(pickedPath && engineWantsRawFallback(msg))) throw err;
-              source = null; // passthrough refused — decode below
-            }
-          }
-          if (!source) {
-            const bytes = await batch.readFileBuffer(pickedPath!);
-            const raw = await decodeToRawSource(bytes, writeTemp);
-            await call('replace_page_image', { ...params, source: raw });
-          }
-          const result = await reloadFile(path);
-          if (result) {
-            dispatch({
-              type: 'UPDATE_FILE',
-              path,
-              pageCount: result.pageCount,
-              buffer: result.buffer,
-              snapshotPath,
-            });
-          }
-        } finally {
-          for (const p of tempFiles) void file.remove(p).catch(() => {});
-        }
+        if (!await performImageEdit(path, { kind: 'replace', page, index, source: opts?.source })) return EDIT_DECLINED;
         return;
       }
 
@@ -2527,7 +2283,7 @@ function AppContent(): React.ReactElement {
         return out ? `Saved ${out.split(/[\\/]/).pop()}` : undefined;
       }
     },
-    [state.files, call, performOperation, reloadFile, dispatch, confirmEditOfSignedDoc],
+    [state.files, call, performOperation, performImageEdit],
   );
 
   // Multi-select: group transform/delete over N placements on one page —
@@ -2556,160 +2312,38 @@ function AppContent(): React.ReactElement {
     [state.files, performOperation],
   );
 
-  // Add Image: embed a NEW raster at `rect` (PDF user-space points). Picks
-  // the file with the SAME EXIF-aware JPEG-passthrough / raw-decode routing as
-  // image replace (one snapshot for the whole attempt, incl. the CMYK raw
-  // fallback). `injected` lets the harness supply a source (the native picker
-  // is undrivable). Undoable; refuses on a signed doc. The added image is an
-  // ordinary placement afterward (movable and resizable).
+  // Raster/vector placement and replacement share one private-stage gesture.
   const handleAddImage = useCallback(
-    async (
-      path: string,
-      page: number,
-      rect: [number, number, number, number] | null,
-      injected?: AddImageSource,
-      at?: [number, number],
-    ): Promise<string | void> => {
-      const f = state.files.get(path);
-      if (!f) throw new Error(tChrome('refusal.file.noLongerOpen'));
-      if (!(await confirmEditOfSignedDoc(path, f.workingPath, 'structural'))) return EDIT_DECLINED;
-
-      // An SVG (picked or injected) places as REAL vector
-      // content — the engine compiles it into a unit-square form and the
-      // result is an ordinary placement (movable, styleable, deletable).
-      let svgPath: string | null =
-        injected && 'svg_path' in injected ? injected.svg_path : null;
-      let source: ReplacementSource | null =
-        injected && !('svg_path' in injected) ? injected : null;
-      let pickedPath: string | null = null;
-      if (!injected) {
-        pickedPath = await dialog.pickImageFile(true);
-        if (!pickedPath) return; // cancelled — no-op
-        if (isSvgPath(pickedPath)) {
-          svgPath = pickedPath;
-        } else if (isJpegPath(pickedPath)) {
-          const head = await batch.readFileBuffer(pickedPath);
-          if (jpegExifOrientation(head) === 1) source = { jpeg_path: pickedPath };
-        }
-      }
-      if (svgPath) {
-        const snapshotPath = await file.snapshot(f.workingPath);
-        await call('add_page_vector_graphic', {
-          file: f.workingPath,
-          output: f.workingPath,
-          page,
-          ...(rect ? { rect } : { at }),
-          svg_path: svgPath,
-        });
-        const result = await reloadFile(path);
-        if (result) {
-          dispatch({
-            type: 'UPDATE_FILE',
-            path,
-            pageCount: result.pageCount,
-            buffer: result.buffer,
-            snapshotPath,
-          });
-        }
-        return;
-      }
-      const tempFiles: string[] = [];
-      const writeTemp = async (data: Uint8Array): Promise<string> => {
-        const dir = f.workingPath.replace(/[\\/][^\\/]+$/, '');
-        const sep = f.workingPath.includes('\\') ? '\\' : '/';
-        const p = `${dir}${sep}addimg-${crypto.randomUUID()}.raw`;
-        await file.writeBuffer(p, data);
-        tempFiles.push(p);
-        return p;
-      };
-      try {
-        const snapshotPath = await file.snapshot(f.workingPath);
-        // A drawn box embeds aspect-honest (fit contain — the
-        // engine shrinks the box around its center to the source's aspect);
-        // a click (`at`) places at natural size, page-clamped engine-side.
-        const params = {
-          file: f.workingPath,
-          output: f.workingPath,
-          page,
-          ...(rect ? { rect, fit: 'contain' } : { at }),
-        };
-        if (source) {
-          try {
-            await call('add_page_image', { ...params, source });
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (!(pickedPath && engineWantsRawFallback(msg))) throw err;
-            source = null; // passthrough refused — decode below
-          }
-        }
-        if (!source) {
-          const bytes = await batch.readFileBuffer(pickedPath!);
-          const raw = await decodeToRawSource(bytes, writeTemp);
-          await call('add_page_image', { ...params, source: raw });
-        }
-        const result = await reloadFile(path);
-        if (result) {
-          dispatch({
-            type: 'UPDATE_FILE',
-            path,
-            pageCount: result.pageCount,
-            buffer: result.buffer,
-            snapshotPath,
-          });
-        }
-      } finally {
-        for (const p of tempFiles) void file.remove(p).catch(() => {});
-      }
+    async (path: string, page: number, rect: [number, number, number, number] | null,
+      injected?: AddImageSource, at?: [number, number]): Promise<string | void> => {
+      if (!await performImageEdit(path, { kind: 'add', page, rect, source: injected, at })) return EDIT_DECLINED;
     },
-    [state.files, call, reloadFile, dispatch, confirmEditOfSignedDoc],
+    [performImageEdit],
   );
 
 
-  const handleUndo = useCallback(async () => {
-    if (state.pageUndoStack.length > 0) {
-      dispatch({ type: 'UNDO_PAGE_OP' });
-      return;
-    }
-    if (!activeFile || activeFile.undoStack.length === 0) return;
-    const snapshotPath = activeFile.undoStack[activeFile.undoStack.length - 1];
-    const redoSnapshot = await file.snapshotRaw(activeFile.workingPath);
-    await file.restoreSnapshot(activeFile.workingPath, snapshotPath);
-    dispatch({ type: 'UNDO', path: activeFile.path, redoSnapshot });
-    const result = await reloadFile(activeFile.path);
-    if (result) {
-      dispatch({
-        type: 'REFRESH_BUFFER',
-        path: activeFile.path,
-        pageCount: result.pageCount,
-        buffer: result.buffer,
+  const handleHistory = useCallback(async (direction: 'undo' | 'redo') => {
+    try {
+      await restoreHistory(direction, readState, dispatch, {
+        read: file.readBuffer, write: file.writeBuffer, remove: file.remove,
+        index: readPublishedBytes, transaction: pageCommit,
       });
+      historyRetry.current = null;
+      setCommitError(null);
+    } catch (err) {
+      historyRetry.current = direction;
+      setCommitError(tChrome('app.history.failed', {
+        message: err instanceof Error ? err.message : String(err),
+      }));
     }
-  }, [activeFile, state.pageUndoStack.length, reloadFile, dispatch]);
-
-  const handleRedo = useCallback(async () => {
-    if (state.pageRedoStack.length > 0) {
-      dispatch({ type: 'REDO_PAGE_OP' });
-      return;
-    }
-    if (!activeFile || activeFile.redoStack.length === 0) return;
-    const snapshotPath = activeFile.redoStack[activeFile.redoStack.length - 1];
-    const undoSnapshot = await file.snapshotRaw(activeFile.workingPath);
-    await file.restoreSnapshot(activeFile.workingPath, snapshotPath);
-    dispatch({ type: 'REDO', path: activeFile.path, undoSnapshot });
-    const result = await reloadFile(activeFile.path);
-    if (result) {
-      dispatch({
-        type: 'REFRESH_BUFFER',
-        path: activeFile.path,
-        pageCount: result.pageCount,
-        buffer: result.buffer,
-      });
-    }
-  }, [activeFile, state.pageRedoStack.length, reloadFile, dispatch]);
+  }, [readState, dispatch]);
+  const handleUndo = useCallback(() => handleHistory('undo'), [handleHistory]);
+  const handleRedo = useCallback(() => handleHistory('redo'), [handleHistory]);
 
   // Run the commit ahead of a dependent step; on failure surface the error
   // and tell the caller to abort (the edits are still pending and retryable).
   const commitOrAbort = useCallback(async (): Promise<boolean> => {
+    historyRetry.current = null;
     try {
       await commitIfNeeded();
       return true;
@@ -2747,20 +2381,26 @@ function AppContent(): React.ReactElement {
     // a file another window has open replaces the bytes under a live document
     // that has no idea, so the destination is claimed like any other path and
     // released again — Save As does not take ownership of what it wrote.
-    const { granted, refused } = await claimPaths([dest], 'write');
-    if (refused.length > 0) {
-      await reportClaimRefusal(refused, 'window');
-      return;
-    }
+    // Held until the copy is written: no release by another flow of this
+    // window drops the claim the copy is written under.
+    claimHolds.current.hold([dest]);
+    let granted: string[] = [];
     try {
+      const claim = await claimPaths([dest], 'write');
+      if (claim.refused.length > 0) {
+        await reportClaimRefusal(claim.refused, 'window');
+        return;
+      }
+      granted = claim.granted;
       if (!(await commitOrAbort())) return;
       await file.saveAs(activeFile.workingPath, dest);
       dispatch({ type: 'MARK_SAVED', path: activeFile.path });
     } finally {
-      const held = stateRef.current.files;
-      void releasePaths(granted.filter((p) => !held.has(p)));
+      claimHolds.current.drop([dest]);
+      // A document of this window open at `dest` keeps the claim.
+      if (granted.length > 0) void releasePaths(granted, pathInUse);
     }
-  }, [activeFile, saveFile, dispatch, commitOrAbort, reportClaimRefusal]);
+  }, [activeFile, saveFile, dispatch, commitOrAbort, reportClaimRefusal, pathInUse]);
 
   // Save routes INTO Save As for a downloaded document, and Save As is
   // declared after it. One implementation either way — a second copy of the
@@ -2781,8 +2421,8 @@ function AppContent(): React.ReactElement {
       const staged = await app.stageSendCopy(activeFile.workingPath, activeFile.name);
       await app.sendByEmail(staged);
     } catch (e: unknown) {
-      // The engine/OS failure text itself stays verbatim (the slice-D
-      // boundary); only the notice's TITLE is ours to translate.
+      // The engine/OS failure text itself stays verbatim; only the notice's
+      // TITLE is ours to translate.
       await showNotice(
         tChrome('app.sendEmail.title'),
         e instanceof Error ? e.message : String(e),
@@ -2821,8 +2461,8 @@ function AppContent(): React.ReactElement {
       }
     }
     dispatch({ type: 'CLOSE_FILE', path: filePath });
-    void releasePaths([filePath]);
-  }, [state.files, dispatch, showConfirm, isFileDirty, commitOrAbort]);
+    void releasePaths([filePath], pathInUse);
+  }, [state.files, dispatch, showConfirm, isFileDirty, commitOrAbort, pathInUse]);
 
   // Close all open files with unsaved changes prompt
   const handleCloseAll = useCallback(async () => {
@@ -2842,8 +2482,8 @@ function AppContent(): React.ReactElement {
     for (const f of allOpen) {
       dispatch({ type: 'CLOSE_FILE', path: f.path });
     }
-    void releasePaths(allOpen.map((f) => f.path));
-  }, [state.files, dispatch, showConfirm, isFileDirty, commitOrAbort]);
+    void releasePaths(allOpen.map((f) => f.path), pathInUse);
+  }, [state.files, dispatch, showConfirm, isFileDirty, commitOrAbort, pathInUse]);
 
   // Exit the app (File ▸ Exit / Ctrl+Q) — always quits when clean; the
   // tray-minimize setting governs the window × (below), not an explicit Exit.
@@ -3020,7 +2660,7 @@ function AppContent(): React.ReactElement {
   );
 
   // --- Command layer ----------------------------------------------------
-  // Reading mode's Escape exit (I.6). An interceptor, not a keymap entry —
+  // Reading mode's Escape exit. An interceptor, not a keymap entry —
   // in-flight drags push their own interceptors ABOVE this one (LIFO), so Esc
   // still cancels a drag first, then leaves reading mode on the next press.
   const readingModeOn = state.ui.readingMode;
@@ -3043,6 +2683,36 @@ function AppContent(): React.ReactElement {
     // Pre-filled, never pre-fetched: opening the dialog is not a request.
     openFromWeb: (url) => setOpenWebUrl(url ?? ''),
     openPath: async (path) => { await openByPaths([path]); },
+    // A failed open re-probes the path and drops the entry ONLY when the probe
+    // positively proves the file is gone. A file that exists but will not
+    // parse (a malformed PDF) keeps its row — removing it would delete the
+    // user's only route back to a document they may still repair. One
+    // implementation for the Home row and File ▸ Open Recent both, so the two
+    // surfaces cannot disagree about whether a dead entry is pruned.
+    openRecentEntry: async (entry) => {
+      // A downloaded entry re-opens through the DIALOG, pre-filled: its local
+      // copy is a temporary path that may already be gone, and a click is not
+      // consent to make a request. The user presses Open, as the first time.
+      if (entry.sourceUrl) {
+        setOpenWebUrl(entry.sourceUrl);
+        return;
+      }
+      const summary = await openByPaths([entry.path]);
+      if (summary.kind === 'none') return;
+      const statuses = await file
+        .classifyRecentPaths([entry.path])
+        .catch(() => ['indeterminate'] as const);
+      if (statuses[0] === 'missing') {
+        const result = await removeRecentEntriesSafely(
+          stateRef.current.ui.recentFiles,
+          [entry.path],
+          [entry],
+        );
+        if (result.removedPaths.length > 0) {
+          dispatch({ type: 'UI_SET_RECENT_FILES', files: result.next });
+        }
+      }
+    },
     openPathAtPage: async (path, pageNumber) => {
       await openByPaths([path], { focus: true });
       // The OPEN_FILE dispatch + index update land over the next renders, so
@@ -3130,6 +2800,7 @@ function AppContent(): React.ReactElement {
       openFilesInPlace: () => h.current.openFilesInPlace(),
       openFromWeb: (url) => h.current.openFromWeb(url),
       openPath: (path) => h.current.openPath(path),
+      openRecentEntry: (entry) => h.current.openRecentEntry(entry),
       openPathAtPage: (path, pageNumber) => h.current.openPathAtPage(path, pageNumber),
       save: () => h.current.save(),
       saveAs: () => h.current.saveAs(),
@@ -3180,21 +2851,23 @@ function AppContent(): React.ReactElement {
       removeLink: (path, page, index) => h.current.removeLink(path, page, index),
       confirmPageEdit: (paths, delta) => h.current.confirmPageEdit(paths, delta),
     });
-    setCommandStateSource(() => ({ state: stateRef.current, dispatch }));
+    setCommandStateSource(() => ({ state: readState(), dispatch }));
     return () => {
       registerAppCommandHandlers(null);
       setCommandStateSource(null);
     };
-  }, [dispatch]);
+  }, [dispatch, readState]);
   // The ONE window-level shortcut dispatcher.
   useKeymapDispatcher();
 
   const handleExtractFromCanvas = useCallback((path: string, page: number) => {
+    const request = captureCanvasTextRequest(readState(), path, page);
+    if (!request) return;
     dispatch({ type: 'SET_ACTIVE_FILE', path });
-    setExtractPage(page);
-    // Leaving the board commits, so the panel reads committed bytes.
+    setExtractPage(request);
+    // The panel proves this view and commits before reading its page number.
     invokeCommand('tools.panel.extract_text');
-  }, [dispatch]);
+  }, [dispatch, readState]);
 
   // Keep refs to current state so the close handler always sees latest values
   const filesRef = useRef(state.files);
@@ -3398,9 +3071,12 @@ function AppContent(): React.ReactElement {
       : null,
   });
 
+  // The harness hands out ids from the store, never from the last render: an
+  // id the store no longer holds is refused when a spec edits through it.
   const harnessFirstPageRef = useRef<() => { docId: string; pageId: string } | null>(() => null);
   harnessFirstPageRef.current = () => {
-    const doc = state.workspace.documents.find((d) => d.path === state.activeFileId);
+    const now = readState();
+    const doc = now.workspace.documents.find((d) => d.path === now.activeFileId);
     const page = doc?.pages[0];
     return doc && page ? { docId: doc.id, pageId: page.id } : null;
   };
@@ -3420,7 +3096,8 @@ function AppContent(): React.ReactElement {
     } | null
   >(() => null);
   harnessFirstAnnotationRef.current = () => {
-    const doc = state.workspace.documents.find((d) => d.path === state.activeFileId);
+    const now = readState();
+    const doc = now.workspace.documents.find((d) => d.path === now.activeFileId);
     const page = doc?.pages[0];
     const annotation = page?.annotations?.[0];
     return doc && page && annotation
@@ -3469,21 +3146,31 @@ function AppContent(): React.ReactElement {
       setView: (v) => harnessSetView(v),
       focusTab: (tab) => dispatch({ type: 'UI_FOCUS_TAB', tab }),
       setActiveOp: (op) => setActiveOp(op as Operation),
+      setToolDockWidth: (width) => dispatch({ type: 'UI_SET_TOOL_DOCK_WIDTH', width }),
       setTool: (tool) => dispatch({ type: 'UI_SET_TOOL', tool: tool as CanvasTool }),
       setDocViewMode: (mode) => dispatch({ type: 'UI_SET_DOC_VIEW_MODE', mode }),
       getStateSnapshot: () => harnessSnapshotRef.current(),
+      getHistoryState: () => {
+        const current = readState();
+        const f = current.activeFileId ? current.files.get(current.activeFileId) : null;
+        if (!f?.buffer) return null;
+        return { undo: [...f.undoStack], redo: [...f.redoStack],
+          buffer: Array.from(f.buffer instanceof ArrayBuffer ? new Uint8Array(f.buffer) : f.buffer) };
+      },
       subscribe: (listener) => {
         harnessListenersRef.current.add(listener);
         return () => harnessListenersRef.current.delete(listener);
       },
       getFirstPage: () => harnessFirstPageRef.current(),
-      getActiveDocPages: () =>
-        stateRef.current.workspace.documents
-          .filter((d) => d.path === stateRef.current.activeFileId)
-          .flatMap((d) => d.pages.map((p) => ({ id: p.id, width: p.width, height: p.height }))),
+      getActiveDocPages: () => {
+        const now = readState();
+        return now.workspace.documents
+          .filter((d) => d.path === now.activeFileId)
+          .flatMap((d) => d.pages.map((p) => ({ id: p.id, width: p.width, height: p.height })));
+      },
       getFirstPageAnnotation: () => harnessFirstAnnotationRef.current(),
       getPageAnnotations: (docId, pageId) => {
-        const d = stateRef.current.workspace.documents.find((x) => x.id === docId);
+        const d = readState().workspace.documents.find((x) => x.id === docId);
         const p = d?.pages.find((x) => x.id === pageId);
         return (p?.annotations ?? []).map((a) => ({
           id: a.id,
@@ -3529,11 +3216,22 @@ function AppContent(): React.ReactElement {
         dispatch({ type: 'RECOLOR_ANNOTATION', docId, pageId, annotationId, color }),
       dispatchRemoveAnnotation: (docId, pageId, annotationId) =>
         dispatch({ type: 'REMOVE_ANNOTATION', docId, pageId, annotationId }),
-      commitPendingEdits: () => commitRef.current(),
+      // Returns once the read-back of what the commit wrote has landed, so a
+      // spec reads and edits the imports it became: an edit to a baked
+      // annotation is refused until then. A read-back that fails rejects with
+      // the index's own error: a spec must not go on over the documents the
+      // commit composed.
+      commitPendingEdits: async () => {
+        await commitRef.current();
+        await awaitSettledWorkspace(readState, subscribeState).catch((refusal: unknown) => {
+          const cause = indexError(refusal);
+          throw new Error(`commitPendingEdits: the read-back of the committed bytes failed: ${cause.message}`, { cause });
+        });
+      },
       closeAllFiles: () => {
         const paths = [...filesRef.current.values()].map((f) => f.path);
         for (const path of paths) dispatch({ type: 'CLOSE_FILE', path });
-        void releasePaths(paths);
+        void releasePaths(paths, pathInUse);
       },
       importPagesIntoDoc: (filePath, toDocId, toIndex) =>
         importFilesIntoDoc([filePath], toDocId, toIndex),
@@ -3553,7 +3251,7 @@ function AppContent(): React.ReactElement {
         });
       },
     });
-  }, [openByPaths, dispatch, importFilesIntoDoc, harnessSetView, setActiveOp, call]);
+  }, [openByPaths, dispatch, importFilesIntoDoc, harnessSetView, setActiveOp, call, readState, subscribeState, pathInUse]);
 
   // Notify harness subscribers on every state-relevant change.
   useEffect(() => {
@@ -3564,6 +3262,7 @@ function AppContent(): React.ReactElement {
 
   return (
     <OperationsProvider
+      fillFormValues={handleFillFormValues}
       performOperation={performOperation}
       addFormFields={handleAddFormFields}
       confirmSignedEdit={confirmEditOfSignedDoc}
@@ -3583,13 +3282,33 @@ function AppContent(): React.ReactElement {
         <div data-testid="commit-error-bar" className="app-banner flex items-center gap-3 px-4 py-2 bg-red-600/20 border-b border-red-500/40 text-sm text-red-200 shrink-0">
           <span className="flex-1">{commitError}</span>
           <button
-            onClick={() => void commitAndReport()}
+            onClick={() => {
+              retryFailedIndexes(readState());
+              if (historyRetry.current) void handleHistory(historyRetry.current);
+              else void commitAndReport();
+            }}
             className="px-2 py-0.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded font-medium"
           >
             {tChrome('app.commit.retry')}
           </button>
           <button
             onClick={() => setCommitError(null)}
+            className="text-red-300 hover:text-red-100 text-xs"
+          >
+            {tChrome('app.commit.dismiss')}
+          </button>
+        </div>
+      )}
+
+      {pageEditRefused && (
+        <div
+          data-testid="page-edit-refused-bar"
+          role="alert"
+          className="app-banner flex items-center gap-3 px-4 py-2 bg-red-600/20 border-b border-red-500/40 text-sm text-red-200 shrink-0"
+        >
+          <span className="flex-1">{tChrome('app.history.changed')}</span>
+          <button
+            onClick={() => setPageEditRefused(false)}
             className="text-red-300 hover:text-red-100 text-xs"
           >
             {tChrome('app.commit.dismiss')}
@@ -3607,15 +3326,41 @@ function AppContent(): React.ReactElement {
             <HomeTab
               recentFiles={recentFiles}
               onOpen={() => invokeCommand('file.open')}
-              onOpenRecent={(entry) =>
-                entry.sourceUrl
-                  ? setOpenWebUrl(entry.sourceUrl)
-                  : void openByPaths([entry.path])
-              }
+              // The shared handler, not a second copy of it: File ▸ Open
+              // Recent runs the same probe-and-prune through the same method.
+              onOpenRecent={(entry) => void commandHandlers.openRecentEntry(entry)}
               onClearRecent={() => invokeCommand('file.clearRecent')}
-              onRevealRecent={(path) => {
-                void file.reveal(path).catch(() =>
-                  showNotice(tChrome('chrome.home.recentFiles'), tChrome('chrome.recent.revealFailed')),
+              onRevealRecent={(entry) => {
+                void file.reveal(entry.path).catch(async () => {
+                  showNotice(tChrome('chrome.home.recentFiles'), tChrome('chrome.recent.revealFailed'));
+                  // A downloaded entry's local copy is a temp path whose
+                  // disappearance says nothing about the entry: the web
+                  // address is still the way back to the document, so a failed
+                  // reveal never prunes one — the same exemption the open path
+                  // and the launch sweep make.
+                  if (entry.sourceUrl) return;
+                  const statuses = await file
+                    .classifyRecentPaths([entry.path])
+                    .catch(() => ['indeterminate'] as const);
+                  if (statuses[0] === 'missing') {
+                    const result = await removeRecentEntriesSafely(
+                      stateRef.current.ui.recentFiles,
+                      [entry.path],
+                      [entry],
+                    );
+                    if (result.removedPaths.length > 0) {
+                      dispatch({ type: 'UI_SET_RECENT_FILES', files: result.next });
+                    }
+                  }
+                });
+              }}
+              onRemoveRecent={(path) => {
+                void removeRecentEntriesSafely(stateRef.current.ui.recentFiles, [path]).then(
+                  (result) => {
+                    if (result.removedPaths.length > 0) {
+                      dispatch({ type: 'UI_SET_RECENT_FILES', files: result.next });
+                    }
+                  },
                 );
               }}
               onOpenTool={(id) => invokeCommand(`tools.open.${id}`)}
@@ -3623,7 +3368,7 @@ function AppContent(): React.ReactElement {
           ) : (
             <div className="flex-1 flex flex-row overflow-hidden">
               {/* Left navigation pane — thumbnails etc. for the active doc.
-                  Hidden entirely in reading mode (I.6); navPane.open state is
+                  Hidden entirely in reading mode; navPane.open state is
                   untouched underneath, so exiting restores it exactly. */}
               {!state.ui.readingMode && <NavPane
                 activeFile={activeFile ?? null}
@@ -3674,7 +3419,7 @@ function AppContent(): React.ReactElement {
                 <ToolDock
                   panels={panels}
                   extractPage={extractPage}
-                  onConsumeExtractPage={() => setExtractPage(null)}
+                  onConsumeExtractPage={(request) => setExtractPage(current => current === request ? null : current)}
                 />
               )}
             </div>
@@ -3802,6 +3547,10 @@ function AppContent(): React.ReactElement {
         <CustomizeToolbarDialog onClose={() => setShowCustomizeToolbar(false)} />
       )}
       <ConfirmDialog
+        // A queued request replaces the one on screen without the dialog
+        // closing; a new key opens it fresh, as a first request would be, so
+        // focus and the announcement start over.
+        key={confirmState?.id ?? 0}
         open={confirmState !== null}
         message={confirmState?.message ?? ''}
         kind={confirmState?.kind}
@@ -3809,18 +3558,25 @@ function AppContent(): React.ReactElement {
         affirmLabel={confirmState?.affirmLabel}
         onResult={handleConfirmResult}
       />
-      <PasswordDialog
-        open={passwordState !== null}
-        fileName={passwordState?.fileName ?? ''}
-        error={passwordState?.error}
-        onResult={handlePasswordResult}
-      />
-      <CertUnlockDialog
-        open={certUnlockState !== null}
-        fileName={certUnlockState?.fileName ?? ''}
-        error={certUnlockState?.error}
-        onResult={handleCertUnlockResult}
-      />
+      {unlockState?.kind === 'password' && (
+        <PasswordDialog
+          key={unlockState.id}
+          open
+          fileName={unlockState.fileName}
+          error={unlockState.error}
+          onResult={(answer) => unlockPrompts.answer(unlockState, answer)}
+        />
+      )}
+      {unlockState?.kind === 'certificate' && (
+        <CertUnlockDialog
+          key={unlockState.id}
+          open
+          fileName={unlockState.fileName}
+          error={unlockState.error}
+          initialPfx={unlockState.pfx}
+          onResult={(answer) => unlockPrompts.answer(unlockState, answer)}
+        />
+      )}
       {submitConsentState ? (
         <SubmitConsentDialog
           fieldName={submitConsentState.fieldName}

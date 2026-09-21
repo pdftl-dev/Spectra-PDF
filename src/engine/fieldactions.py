@@ -41,6 +41,7 @@ import pikepdf
 from pikepdf import Array, Dictionary, Name, String
 
 from engine.acroform import fq_field_name
+from engine.pdf_tree import name_text, token_text
 
 #: Widget action triggers, in the order a document declares them. ``A`` is the
 #: activation action and lives on the widget itself; the rest are `/AA` keys.
@@ -96,7 +97,7 @@ class ActionError(ValueError):
 
 
 def _text(value) -> str:
-    return "" if value is None else str(value)
+    return "" if value is None else token_text(value)
 
 
 def _flags(node, key: str = "/Flags") -> int:
@@ -121,9 +122,15 @@ def _page_index_of(pdf: pikepdf.Pdf, ref) -> int | None:
 
 
 def _named_destination(pdf: pikepdf.Pdf, name):
-    """A destination named by string or name: the `/Names /Dests` name tree
-    first, then the legacy `/Dests` dictionary."""
-    key = str(name).lstrip("/")
+    """A name addresses catalog `/Dests`; a string addresses `/Names /Dests`.
+    Prefer the typed address, then tolerate the other storage for older
+    malformed producers (ISO 32000-2 12.3.2.4, 7.3.5)."""
+    legacy = pdf.Root.get("/Dests")
+    if isinstance(name, pikepdf.Name) and isinstance(legacy, Dictionary):
+        found = legacy.get(name)
+        if found is not None:
+            return found
+    key = name_text(name).lstrip("/")
     names = pdf.Root.get("/Names")
     if names is not None:
         dests = names.get("/Dests")
@@ -134,14 +141,27 @@ def _named_destination(pdf: pikepdf.Pdf, name):
                 found = None
             if found is not None:
                 return found
-    legacy = pdf.Root.get("/Dests")
     if legacy is not None:
         try:
-            found = legacy.get("/" + key)
+            found = legacy.get(name if isinstance(name, pikepdf.Name) else "/" + key)
         except (TypeError, ValueError, AttributeError):
             found = None
         if found is not None:
             return found
+    return None
+
+
+def destination_array(pdf: pikepdf.Pdf, dest, depth: int = 0):
+    """Resolve the complete destination, including its view, with bounded
+    indirection through both forms of named-destination storage."""
+    if depth > 8 or dest is None:
+        return None
+    if isinstance(dest, pikepdf.Array):
+        return dest if len(dest) > 0 else None
+    if isinstance(dest, Dictionary):
+        return destination_array(pdf, dest.get("/D"), depth + 1)
+    if isinstance(dest, (pikepdf.Name, pikepdf.String)):
+        return destination_array(pdf, _named_destination(pdf, dest), depth + 1)
     return None
 
 
@@ -154,15 +174,8 @@ def destination_page(pdf: pikepdf.Pdf, dest, depth: int = 0) -> int | None:
     rather than guessing -- the action is then reported without a target
     instead of navigating somewhere the author never wrote.
     """
-    if depth > 8 or dest is None:
-        return None
-    if isinstance(dest, pikepdf.Array):
-        return _page_index_of(pdf, dest[0]) if len(dest) > 0 else None
-    if isinstance(dest, Dictionary):
-        return destination_page(pdf, dest.get("/D"), depth + 1)
-    if isinstance(dest, (pikepdf.Name, pikepdf.String)):
-        return destination_page(pdf, _named_destination(pdf, dest), depth + 1)
-    return None
+    resolved = destination_array(pdf, dest, depth)
+    return _page_index_of(pdf, resolved[0]) if resolved is not None else None
 
 
 def _field_names(pdf: pikepdf.Pdf, entries) -> list[str]:
@@ -226,7 +239,7 @@ def _file_spec(value) -> str:
         for key in ("/UF", "/F"):
             inner = value.get(key)
             if inner is not None:
-                return str(inner)
+                return token_text(inner)
     return ""
 
 
@@ -235,7 +248,7 @@ def classify(pdf: pikepdf.Pdf, node) -> dict | None:
     if not isinstance(node, Dictionary):
         return None
     try:
-        subtype = str(node.get("/S"))
+        subtype = token_text(node.get("/S"))
     except (TypeError, ValueError):
         return {"kind": "other", "action": ""}
     if subtype == "/GoTo":

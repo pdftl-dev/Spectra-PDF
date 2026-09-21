@@ -6,13 +6,13 @@
 // ever removes an original it can positively fingerprint-match against
 // something in this list.
 //
-// Rung 2 widens the list to the drawing shapes (/Circle /Line /Polygon
+// The list also takes the drawing shapes (/Circle /Line /Polygon
 // /PolyLine) and callouts (/FreeText + /IT /FreeTextCallout) — but ONLY when
 // the raw-style sidecar (annotation-raw-style.ts) supplies the entries
 // pdf.js hides (/IC /CA /BE /CL /RD /LE), because importing one blind and
 // re-committing it would silently strip those. Faithful-or-untouched: no
 // sidecar entry, or a line-ending outside the set we author, and the
-// annotation stays raster-only exactly like before rung 2. Dimension lines
+// annotation stays raster-only. Dimension lines
 // (/Measure or /IT LineDimension) always stay untouched — the measure
 // class's own no-degradation rule.
 import type { PDFPageProxy } from 'pdfjs-dist';
@@ -35,7 +35,7 @@ const RECOGNIZED_SUBTYPES = new Set([
   'Highlight', 'Underline', 'StrikeOut', 'Squiggly',
   // Native /Text sticky note, imported as `kind: 'note'`.
   'Text',
-  // Rung 2 — drawing shapes (sidecar-gated; see the header).
+  // Drawing shapes (sidecar-gated; see the header).
   'Circle', 'Line', 'Polygon', 'PolyLine',
 ]);
 
@@ -111,7 +111,7 @@ interface RawAnnotation {
   inkLists?: ArrayLike<number>[];
   quadPoints?: unknown; // markup only — pdf.js's parsed /QuadPoints
   hasAppearance?: boolean;
-  // Rung 2 — pdf.js's parses where they exist; the sidecar supplies the rest.
+  // Shapes and callouts: pdf.js's parses where they exist; the sidecar supplies the rest.
   it?: string;
   vertices?: ArrayLike<number>;
   lineCoordinates?: ArrayLike<number>;
@@ -205,7 +205,7 @@ export async function importPageAnnotations(
     };
     const sidecar = takeRawStyle(rawStyles, consumedStyles, a.subtype, a.rect);
 
-    // ── Rung 2: drawing shapes + callouts (sidecar-gated) ────────────
+    // ── Drawing shapes + callouts (sidecar-gated) ────────────────────
     if (a.subtype === 'Circle' || a.subtype === 'Line' || a.subtype === 'Polygon' || a.subtype === 'PolyLine') {
       const shape = importShape(a, sidecar, box, rotation, color, contents, importedOriginal);
       if (shape) imported.push(shape);

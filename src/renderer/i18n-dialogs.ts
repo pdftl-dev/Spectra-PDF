@@ -94,7 +94,7 @@ export const DIALOG_STRINGS = {
   'dialog.gsMissing.usedFor':
     'Installing it adds Compress, Grayscale, PDF/A and PDF/X, printing, page rasterization and image export, visual comparison, OCR and scan enhancement, transparency flattening, Rebuild, and PostScript conversion.',
   'dialog.gsMissing.route':
-    'Choose OK to open Settings ▸ Engine ▸ Ghostscript, where you can point Spectra PDF at an installed copy.',
+    'Choose OK to open Preferences ▸ Engine ▸ Ghostscript, where you can point Spectra PDF at an installed copy.',
   'dialog.gsMissing.dontAsk': 'Don’t ask again',
 
   // The consent for an operation that cannot keep a document's protection
@@ -175,6 +175,25 @@ export const DIALOG_STRINGS = {
   'dialog.opqueue.format': '{{op}} {{fmt}} — {{file}}',
   'dialog.opqueue.formatDpi': '{{op}} {{fmt}} {{dpi}}dpi — {{file}}',
 
+  // What a redaction did to the images under its marks: the detail of a
+  // finished queue line. Each count is a whole message; the line joins them
+  // with the language's own list pattern and frames the list with
+  // `dialog.opqueue.outcome`. The categories are disjoint, so no image is
+  // counted twice.
+  'dialog.opqueue.outcome': '{{label}} — {{detail}}',
+  'dialog.opqueue.redactImagesEdited_one': '{{count}} image partly redacted',
+  'dialog.opqueue.redactImagesEdited_other': '{{count}} images partly redacted',
+  'dialog.opqueue.redactImagesWidened_one':
+    '{{count}} image redacted past the mark because of its compression',
+  'dialog.opqueue.redactImagesWidened_other':
+    '{{count}} images redacted past the mark because of their compression',
+  'dialog.opqueue.redactImagesRemoved_one': '{{count}} image removed',
+  'dialog.opqueue.redactImagesRemoved_other': '{{count}} images removed',
+  'dialog.opqueue.redactImagesCompressed_one':
+    '{{count}} image removed whole because of its compression',
+  'dialog.opqueue.redactImagesCompressed_other':
+    '{{count}} images removed whole because of their compression',
+
   'dialog.props.title': 'Document Properties',
   'dialog.props.tabsAria': 'Properties tabs',
   'dialog.props.tab.description': 'Description',
@@ -204,6 +223,7 @@ export const DIALOG_STRINGS = {
   'dialog.props.size': 'Size',
   'dialog.props.location': 'Location',
   'dialog.props.unknown': 'Unknown',
+  'dialog.props.reload': 'Reload properties (discard edits)',
   'dialog.props.bytes_one': '{{count}} byte',
   'dialog.props.bytes_other': '{{count}} bytes',
   'dialog.props.kilobytes': '{{size}} KB',
@@ -264,6 +284,7 @@ export const DIALOG_STRINGS = {
   'dialog.props.iv.openPage': 'Open on page',
   'dialog.props.iv.magnification': 'Magnification',
   'dialog.props.iv.zoom.default': 'Default',
+  'dialog.props.iv.zoom.custom': 'Stored view rectangle',
   'dialog.props.iv.zoom.fit-page': 'Fit page',
   'dialog.props.iv.zoom.fit-width': 'Fit width',
   'dialog.props.iv.zoom.fit-height': 'Fit height',
@@ -292,7 +313,9 @@ export const DIALOG_STRINGS = {
   'dialog.signer.modePem': 'PEM key + cert',
   'dialog.signer.modeToken': 'Token (PKCS#11)',
   'dialog.signer.modeStore': 'Windows store',
+  'dialog.signer.modeStoreHint': 'Certificates installed in Windows',
   'dialog.signer.modeCsc': 'Signing service',
+  'dialog.signer.sourceAdvanced': 'Other certificate sources',
   'dialog.signer.cscProvider': 'Service',
   'dialog.signer.cscChooseProvider': 'Choose a signing service…',
   'dialog.signer.cscAddProvider': 'Add service…',
@@ -337,6 +360,16 @@ export const DIALOG_STRINGS = {
   'dialog.signer.storeLoading': 'Reading the certificate store…',
   'dialog.signer.storeNone':
     'No certificate in the Windows certificate store can sign a document.',
+  'dialog.signer.storeErrorDenied':
+    'Windows refused access to your certificate store.',
+  'dialog.signer.storeErrorMissing':
+    'This account has no personal certificate store to read.',
+  'dialog.signer.storeErrorUnsupported':
+    'The Windows certificate store is not available on this system.',
+  'dialog.signer.storeErrorCode':
+    'The Windows certificate store could not be read (error {{code}}).',
+  'dialog.signer.storeErrorUnknown':
+    'The Windows certificate store could not be read.',
   'dialog.signer.storeHardware': 'hardware-held key',
   'dialog.signer.storeMachine': 'machine store',
   'dialog.signer.storeNote':

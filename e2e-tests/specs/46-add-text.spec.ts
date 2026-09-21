@@ -55,6 +55,17 @@ async function editParagraphs(pageId: string): Promise<ListedParagraph[]> {
   }, pageId);
 }
 
+// The card is GONE, asked in the page rather than through an element
+// reference the driver holds across the round trip: the card unmounts while
+// such a probe is in flight, which answers it with a stale-element failure
+// for the very removal being waited on. Unmounted is also the stronger claim
+// than not-displayed — the card is a conditional render, not a hidden node.
+async function cardGone(): Promise<boolean> {
+  return await browser.execute(function () {
+    return document.querySelector('[data-testid="add-text-form"]') === null;
+  });
+}
+
 // The authored paragraph, once the post-commit re-index lists it.
 async function authoredParagraph(
   needle: string,
@@ -149,19 +160,14 @@ describe('add text', () => {
     // Rotate rides the same authored-op path; the engine wraps
     // the block in one rotation frame.
     //
-    // INVERSION (the spec-42 / test_rotated_text_never_groups
-    // precedent — the capability this pinned is deliberately replaced).
-    // This case used to require the phrase on the RUN-BOX layer with NO
-    // paragraph carrying it. Neither half survives the orientation model, and the probe
-    // (`probe-rot90.local.ts`) shows why: admission now runs in the
-    // member's OWN transposed frame, so a quarter-turned run is an
+    // The pin is the PARAGRAPH layer, not the run-box layer: admission runs
+    // in the member's OWN transposed frame, so a quarter-turned run is an
     // ordinary axis-aligned member there and GROUPS. Once it groups the
-    // run-box layer is empty — and it is empty for the 0° control too,
-    // so "on the run layer" was never the authoring proof it read as,
-    // and the old undo check (an always-empty runs list) was vacuous.
-    // The honest pin is the paragraph layer, including the ORIENTATION,
-    // which is the whole point. Off-quarter angles still refuse
-    // — that boundary is retained and the 37° case below is its pin.
+    // run-box layer is empty — and it is empty for the 0° control too, so a
+    // run-layer check proves no authoring, and an undo check against the
+    // always-empty runs list is vacuous. The paragraph layer carries the
+    // ORIENTATION, which is the whole point. Off-quarter angles still refuse;
+    // the 37° case below pins that boundary.
     await commitAddText({ text: phrase, size: 14, rotate: 90 });
 
     expect(await invokeAppCommand('tools.edit')).toBe(true);
@@ -265,7 +271,7 @@ describe('add text', () => {
     // Close without authoring (Escape cancels the card).
     await browser.keys(['Escape']);
     await browser.waitUntil(
-      async () => !(await $('[data-testid="add-text-form"]').isDisplayed().catch(() => false)),
+      cardGone,
       { timeout: 10_000, timeoutMsg: 'the card never closed' },
     );
   });
@@ -290,7 +296,14 @@ describe('add text', () => {
       { timeout: 30_000, timeoutMsg: 'the wrapped multi-line authored text never appeared' },
     );
 
+    const undoDepth = await browser.execute(() => (window as any).__SPECTRA_TEST__.getHistoryState().undo.length);
     expect(await invokeAppCommand('edit.undo')).toBe(true);
+    await browser.waitUntil(async () =>
+      await browser.execute(() => (window as any).__SPECTRA_TEST__.getHistoryState().undo.length) === undoDepth - 1 &&
+      (await authoredParagraph('one two three')) === null, {
+      timeout: 30_000,
+      timeoutMsg: 'undo did not remove the wrapped text before the next card opened',
+    });
   });
 
   // Vertical AUTHORING. The embed side (Identity-V, /W2) and the edit side
@@ -326,7 +339,7 @@ describe('add text', () => {
 
     await $('[data-testid="add-text-create"]').click();
     await browser.waitUntil(
-      async () => !(await $('[data-testid="add-text-form"]').isDisplayed().catch(() => false)),
+      cardGone,
       { timeout: 30_000, timeoutMsg: 'the card never closed after authoring the column' },
     );
 
@@ -364,10 +377,17 @@ describe('add text', () => {
       timeout: 30_000,
       timeoutMsg: 'undo did not take back the reflow',
     });
+    const undoCountBeforeAuthorUndo = await browser.execute(() =>
+      (window as any).__SPECTRA_TEST__.getHistoryState().undo.length as number);
     expect(await invokeAppCommand('edit.undo')).toBe(true);
     await browser.waitUntil(async () => (await authoredParagraph('日本語')) === null, {
       timeout: 30_000,
       timeoutMsg: 'undo did not remove the authored column',
+    });
+    await browser.waitUntil(async () => await browser.execute(() =>
+      (window as any).__SPECTRA_TEST__.getHistoryState().undo.length as number) < undoCountBeforeAuthorUndo, {
+      timeout: 30_000,
+      timeoutMsg: 'the authored column undo did not finish publishing',
     });
   });
 

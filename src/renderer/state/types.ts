@@ -43,7 +43,7 @@ export interface ImportedAnnotationFingerprint {
   subtype:
     | 'Square' | 'FreeText' | 'Ink' | 'Stamp' | 'Highlight' | 'Underline' | 'StrikeOut'
     | 'Squiggly' | 'Text'
-    // Rung 2 — the shape subtypes import as editable shapes/callouts.
+    // The shape subtypes import as editable shapes/callouts.
     | 'Circle' | 'Line' | 'Polygon' | 'PolyLine';
   rect: [number, number, number, number];
   contents?: string;
@@ -152,7 +152,7 @@ export interface PageAnnotation {
   // embedded image instead of the bordered label; `note` still carries the
   // stamp's display name for the comment sidebar and /Contents.
   imageData?: string;
-  // stamp only: a TYPED personal signature (F31's "type" door). The id of the
+  // stamp only: a TYPED personal signature (the "type" door). The id of the
   // app-bundled script face — see lib/signature-fonts, whose faces are
   // outside the font-resolution ladder and named only by an asset. `note`
   // carries the name itself and lands in /Contents like any stamp's label;
@@ -225,6 +225,13 @@ export interface PageAnnotation {
   // original still shows until the commit resolves both — the same
   // pending-tier semantics as deleting an imported annotation.
   geometryDiverged?: boolean;
+  // Written into the file's current bytes by the page-tier commit, and not
+  // read back yet. The raster draws it and the copied page's /Annots carries
+  // it, so the overlay draws no body and a commit authors nothing for it. It
+  // has no fingerprint of the written object, so an edit that changes or
+  // removes it, and an import that copies it, is refused until the read-back
+  // replaces it with an import.
+  baked?: true;
 }
 
 export interface PageRef {
@@ -253,6 +260,11 @@ export interface PageRef {
 export interface OpenDocument extends OpenFile {
   id: string;       // unique within the workspace — path alone can't distinguish manifest partitions
   pages: PageRef[]; // page-level index, mutated in memory by page-level ops
+  // Composed by the page-tier commit that wrote `buffer`, not read from it.
+  // Page ids, order, positions and rotations describe `buffer` exactly; each
+  // annotation the commit wrote is `baked`. The reindex of `buffer` replaces
+  // the document, and a commit waits for that read-back.
+  provisional?: true;
 }
 
 export interface Workspace {
@@ -264,6 +276,50 @@ export interface Workspace {
 export interface PageEditSnapshot {
   documents: OpenDocument[];
   dirtyPaths: string[];
+  // The edit between this entry's composition and the composition above it.
+  // Documents re-derived from new bytes invalidate every stored composition;
+  // replaying these actions onto the re-derived base is what rebuilds them.
+  action: PageEditAction;
+}
+
+// The page-tier edits: every action that lands through the undo tier. Each is
+// addressed by page and document ids only, so it replays onto documents that
+// carry the same ids. The absolute ROTATE_PAGE_REF is recorded as its delta.
+export type PageEditAction = Extract<
+  AppAction,
+  {
+    type:
+      | 'REORDER_PAGES'
+      | 'MOVE_PAGE'
+      | 'MOVE_PAGE_TO_NEW_DOC'
+      | 'MOVE_PAGES'
+      | 'MOVE_PAGES_TO_NEW_DOC'
+      | 'IMPORT_PAGES'
+      | 'DELETE_PAGE_REF'
+      | 'DELETE_PAGE_REFS'
+      | 'SPLIT_DOC'
+      | 'ADD_ANNOTATION'
+      | 'REGROUP_COUNT_MARKS'
+      | 'UPDATE_ANNOTATION'
+      | 'RECOLOR_ANNOTATION'
+      | 'REMOVE_ANNOTATION'
+      | 'TRANSFORM_ANNOTATIONS'
+      | 'REORDER_ANNOTATIONS'
+      | 'RESTYLE_ANNOTATIONS'
+      | 'RECALIBRATE_ANNOTATION'
+      | 'RECOLOR_ANNOTATIONS'
+      | 'REMOVE_ANNOTATIONS'
+      | 'ROTATE_PAGE_REFS'
+      | 'REORDER_DOCS'
+      | 'RENAME_DOC'
+      | 'REMOVE_DOC';
+  }
+>;
+
+// The two page-tier stacks by reference: what a commit planned from.
+export interface PageTierStacks {
+  pageUndoStack: PageEditSnapshot[];
+  pageRedoStack: PageEditSnapshot[];
 }
 
 // The canvas interaction tool. Lives in the ui slice so command enablement
@@ -337,19 +393,19 @@ export type CanvasTool =
   | 'measuredist'
   | 'measureperim'
   | 'measurearea'
-  // Scale calibration (rung 3): drag a KNOWN length, then state its value —
+  // Scale calibration: drag a KNOWN length, then state its value —
   // the toolbar ratio derives from it. Commits nothing.
   | 'measurecal'
-  // Drawing shapes (rung 2) — ONE mode; the secondary toolbar's shape picker
+  // Drawing shapes — ONE mode; the secondary toolbar's shape picker
   // (like stamp's preset picker) chooses WHICH figure the gesture draws:
   // rect/ellipse band, line/arrow drag, polygon/polyline/cloud vertex clicks.
   | 'shape'
-  // Callout (rung 2): drag the text box; the leader lands pointing at the
+  // Callout: drag the text box; the leader lands pointing at the
   // drag origin, editable per-vertex afterward.
   | 'callout'
   // Sticky note: click places a native /Text note at the point and opens
-  // its editor. Comment's mode; the note keeps its fixed icon size (rung 1's
-  // kind rule) so placement is the only geometry.
+  // its editor. Comment's mode; the note keeps its fixed icon size (the
+  // manipulation kind rule) so placement is the only geometry.
   | 'note'
   // The ink eraser cuts stroke segments out of ink annotations. A mid-stroke
   // cut splits the
@@ -414,7 +470,7 @@ export function viewOf(tab: FocusedTab): ViewMode {
 
 // Left navigation pane. The panel-id union is the full
 // stable set; the runtime NAV_PANELS registry (components/navpane) only lists
-// the panels that actually exist at a given sub-slice, so an icon never
+// the panels that actually exist, so an icon never
 // appears without a working panel (completeness rule). Persisted under the
 // `workbench-ui` localStorage key (new keys don't extend `spectra-`).
 export type NavPanelId =
@@ -440,7 +496,7 @@ export interface NavPaneState {
 // tool; `View ▸ Organize All Documents` forces the board.
 export type DocViewMode = 'document' | 'organize';
 
-// Reading-view page layout (I.6): one page per row, or two-up facing spreads.
+// Reading-view page layout: one page per row, or two-up facing spreads.
 export type PageLayoutMode = 'single' | 'two';
 
 // Which way a two-up spread reads. Set from the open document's
@@ -500,13 +556,13 @@ export interface UiState {
   // Document-pane view mode. The board and the reading view are two
   // renders of the same per-page cells; commands/toolbar read this.
   docViewMode: DocViewMode;
-  // Reading-view page layout (I.6). `twoUpCover` = first page alone (the book
+  // Reading-view page layout. `twoUpCover` = first page alone (the book
   // convention); only meaningful while pageLayout === 'two'.
   pageLayout: PageLayoutMode;
   twoUpCover: boolean;
   // Facing-page order, from the open document's own reading direction.
   spreadDirection: SpreadDirection;
-  // Reading mode (I.6): collapse the app chrome (toolbar, tab strip, nav pane)
+  // Reading mode: collapse the app chrome (toolbar, tab strip, nav pane)
   // around the document. Menu bar stays (the discoverable exit); Esc/Ctrl+H
   // leave; leaving the doc tab clears it (chrome must exist on Home/Tools).
   readingMode: boolean;
@@ -524,7 +580,7 @@ export interface UiState {
   // organize board never splits
   // (one d3 world; both commands are document-mode-gated).
   splitView: 'off' | 'two' | 'quad';
-  // Toolbar customization (I.6): the user's show/hide overrides against the
+  // Toolbar customization: the user's show/hide overrides against the
   // toolbar catalog. Persisted — App mirrors it to localStorage, the
   // recent-files pattern (lib/toolbar-layout.ts).
   toolbarOverrides: ToolbarOverrides;
@@ -592,6 +648,10 @@ export interface AppState {
   pageUndoStack: PageEditSnapshot[];
   pageRedoStack: PageEditSnapshot[];
   pageDirtyPaths: string[]; // open files whose content must be rebuilt at commit
+  // Edits refused because they could not be carried onto documents re-derived
+  // from new bytes, or because the document or page they address is gone or
+  // no longer as it was drawn on. Monotonic: each increase is one notice owed.
+  pageEditRefusals: number;
 }
 
 export type AppAction =
@@ -609,7 +669,10 @@ export type AppAction =
   | { type: 'REGISTER_IMPORT_SOURCE'; path: string; workingPath: string; name: string; pageCount: number; buffer: PdfBuffer }
   | { type: 'CLOSE_FILE'; path: string }
   | { type: 'SET_ACTIVE_FILE'; path: string }
-  | { type: 'UPDATE_FILE'; path: string; pageCount: number; buffer: PdfBuffer; snapshotPath: string }
+  // `documents`: the path's documents as `buffer` holds them, read from it
+  // and placed in the same step, so nothing addresses the previous documents
+  // against the new bytes. Empty leaves the path to the workspace indexer.
+  | { type: 'UPDATE_FILE'; path: string; pageCount: number; buffer: PdfBuffer; snapshotPath: string; documents: OpenDocument[] }
   // Atomic variant dispatched by the commit bridge after all files are
   // rebuilt on disk: applies every file update and clears the page-edit tier
   // in one step, so no intermediate state is observable.
@@ -622,16 +685,23 @@ export type AppAction =
         snapshotPath: string;
         // The identity channel — old ids in authored (new-file) order.
         authored: { pages: string[]; documents: { id: string; name: string }[] };
+        // The path's documents as the new bytes hold them, placed in the
+        // workspace in the same step, so nothing reads the previous
+        // composition against the new bytes.
+        documents: OpenDocument[];
       }[];
+      // The stacks the commit was planned from. Entries pushed on top of
+      // them after planning are edits the commit does not contain.
+      planned: PageTierStacks;
     }
-  // Snapshot-tier history. UNDO carries a snapshot of the pre-restore state
-  // so REDO can return to it; the caller performs the disk restore and then
-  // refreshes the buffer via REFRESH_BUFFER (which must not touch history —
-  // that was the original multi-level-undo bug: refreshing via OPEN_FILE
-  // reset the stacks after every undo).
-  | { type: 'UNDO'; path: string; redoSnapshot: string }
-  | { type: 'REDO'; path: string; undoSnapshot: string }
-  | { type: 'REFRESH_BUFFER'; path: string; pageCount: number; buffer: PdfBuffer }
+  // One revision-checked publication, never a stack move followed by a reload.
+  | { type: 'RESTORE_HISTORY'; direction: 'undo' | 'redo'; expected: AppState;
+      path: string; snapshotPath: string; counterpart: string; buffer: PdfBuffer; pageCount: number;
+      documents: OpenDocument[] }
+  // `documents` as for UPDATE_FILE.
+  | { type: 'REFRESH_BUFFER'; path: string; pageCount: number; buffer: PdfBuffer; documents: OpenDocument[] }
+  // An edit refused outside the reducer: one more notice is owed.
+  | { type: 'NOTE_EDIT_REFUSED' }
   | { type: 'MARK_SAVED'; path: string }
   // Workspace actions. SET_WORKSPACE_DOCUMENTS is dispatched by
   // useWorkspaceIndexer after a file is opened or its buffer changes. The
@@ -651,14 +721,23 @@ export type AppAction =
   // Splice NEW page refs (sourced from a REGISTER_IMPORT_SOURCE byte-only file)
   // into an existing document at an index — the import-into-doc machinery,
   // one page-edit undo step.
-  | { type: 'IMPORT_PAGES'; toDocId: string; toIndex: number; pages: PageRef[] }
+  // `sources` names, per source path, the buffer the pages' positional
+  // indexes were read from. A page index resolves against the file's buffer
+  // at commit, so a source whose buffer changed since then names another page.
+  | {
+      type: 'IMPORT_PAGES';
+      toDocId: string;
+      toIndex: number;
+      pages: PageRef[];
+      sources: { path: string; buffer: PdfBuffer }[];
+    }
   | { type: 'DELETE_PAGE_REF'; docId: string; pageId: string }
   | { type: 'DELETE_PAGE_REFS'; pageIds: string[] }
   | { type: 'ADD_ANNOTATION'; docId: string; pageId: string; annotation: PageAnnotation }
   | { type: 'UPDATE_ANNOTATION'; docId: string; pageId: string; annotationId: string; note: string }
   | { type: 'RECOLOR_ANNOTATION'; docId: string; pageId: string; annotationId: string; color: string }
   | { type: 'REMOVE_ANNOTATION'; docId: string; pageId: string; annotationId: string }
-  // Annotation manipulation (rung 1). One dispatch = one gesture = one undo
+  // Annotation manipulation. One dispatch = one gesture = one undo
   // step, so every action below is BATCH-shaped even when the UI sends one
   // entry. Geometry is display-normalized in the page.rotation frame (the
   // stored frame) — callers un-project view-frame gestures first.
@@ -681,7 +760,7 @@ export type AppAction =
         calloutBox?: [number, number, number, number]; // callout only
       }[];
     }
-  // Shared style edit (rung 2): stroke width / fill / opacity across the
+  // Shared style edit: stroke width / fill / opacity across the
   // selection, one undo step. The reducer applies each property only to
   // kinds that carry it (shape/callout; ink takes width+opacity, no fill).
   // `fillColor: null` clears the fill; undefined leaves it untouched.
@@ -709,7 +788,7 @@ export type AppAction =
       direction: 'front' | 'back' | 'forward' | 'backward';
     }
   | { type: 'RECOLOR_ANNOTATIONS'; docId: string; pageId: string; annotationIds: string[]; color: string }
-  // Rung 3: override ONE measurement's recorded scale — new /Measure factors
+  // Override ONE measurement's recorded scale — new /Measure factors
   // + ratio + recomputed note, undoable like any edit. Geometry untouched.
   | {
       type: 'RECALIBRATE_ANNOTATION';

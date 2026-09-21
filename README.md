@@ -1,10 +1,12 @@
 # Spectra PDF
 
-[![CI](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml/badge.svg)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/jasonulbright/Spectra-PDF?sort=semver)](https://github.com/jasonulbright/Spectra-PDF/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/jasonulbright/Spectra-PDF/total)](https://github.com/jasonulbright/Spectra-PDF/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078d4)](https://github.com/jasonulbright/Spectra-PDF/releases/latest)
+[![CI](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml)
+[![Release workflow](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release.yml?label=release%20workflow)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release.yml)
+[![Release recovery](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release-redo.yml?label=release%20recovery)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release-redo.yml)
+[![Latest release](https://img.shields.io/github/v/release/jasonulbright/Spectra-PDF?label=release)](https://github.com/jasonulbright/Spectra-PDF/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/jasonulbright/Spectra-PDF/total?label=downloads)](https://github.com/jasonulbright/Spectra-PDF/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows-0078D4)](#requirements)
+[![License](https://img.shields.io/github/license/jasonulbright/Spectra-PDF)](LICENSE)
 
 A modern, open-source PDF workbench for Windows. **Ported to linux: see the `linux-cross-platform` branch of this fork.**
 
@@ -45,7 +47,7 @@ A full-featured PDF workbench with a familiar user interface: a menu bar, custom
 > Features marked **(requires Ghostscript)** need a Ghostscript installation,
 > which you install separately — it is not part of this download and is
 > licensed to you by its own publisher. Point the app at it under
-> Settings ▸ Engine, or let it find one on your machine; every marked feature
+> Preferences ▸ Engine, or let it find one on your machine; every marked feature
 > then works exactly as described. Until then each one is disabled and says so
 > by name — nothing here is removed or silently degraded.
 
@@ -397,7 +399,7 @@ Ghostscript **10.0 or newer** is a separately installed requirement for these fe
 
 | Requirement | Version |
 |-------------|---------|
-| Node.js | 22 LTS (or 20.19+) |
+| Node.js | The newest release of the major version in `.node-version` |
 | Rust | Stable toolchain |
 | Ghostscript | 10.0+; optional except for the end-user features listed above. Not vendored or shipped; install it separately to use those features and to run the capability-present half of the test suite |
 

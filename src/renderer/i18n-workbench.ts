@@ -18,6 +18,13 @@
 //     the catalog gate derives `tool.desc.*` / `navpanel.*` from them, the way
 //     it derives the toolbar groups and the guided-action steps.
 export const WORKBENCH_STRINGS = {
+  'panel.docjs.sourceChanged': 'The document changed. Unsaved scripts are retained but cannot be saved to this revision.',
+  'panel.docjs.incomplete': 'Document scripts could not be read completely. Editing is disabled to preserve the original scripts.',
+  'panel.docjs.discardReload': 'Discard draft and reload',
+  'panel.pageLabels.sourceChanged': 'The document changed. Unsaved page labels are retained but cannot be applied to this revision.',
+  'panel.pageLabels.incomplete': 'Page labels could not be read completely. Editing is disabled to preserve the original labels.',
+  'panel.pageLabels.invalid': 'Invalid page label ranges',
+  'panel.pageLabels.discardReload': 'Discard draft and reload',
   // ── The right tool dock ───────────────────────────────────────────────
   'dock.paneLabel': 'Tool pane',
   'dock.resize': 'Drag to resize',
@@ -41,6 +48,9 @@ export const WORKBENCH_STRINGS = {
   'nav.pages.aria': 'Page thumbnails',
 
   'nav.bookmarks.loading': 'Loading bookmarks…',
+  'nav.bookmarks.sourceChanged': 'The document changed. Unsaved bookmarks are retained but cannot be saved to this revision.',
+  'nav.bookmarks.discardReload': 'Discard draft and reload',
+  'nav.bookmarks.incomplete': 'Some bookmarks could not be read completely. Editing is disabled to preserve the original outline.',
   'nav.bookmarks.empty': 'No bookmarks yet.',
   'nav.bookmarks.truncated': 'Outline truncated (too many bookmarks)',
   'nav.bookmarks.saving': 'Saving…',
@@ -92,6 +102,8 @@ export const WORKBENCH_STRINGS = {
   'nav.articles.save': 'Save articles',
   'nav.articles.saving': 'Saving…',
   'nav.articles.unsaved': 'Unsaved changes.',
+  'nav.articles.sourceChanged': 'The document changed. Unsaved articles are retained but cannot be saved to this revision.',
+  'nav.articles.discardReload': 'Discard draft and reload',
 
   'nav.find.matchCase': 'Match case',
   'nav.find.wholeWord': 'Whole word',
@@ -241,6 +253,8 @@ export const WORKBENCH_STRINGS = {
     'This document is certified, which states what may change in it, and carries {{count}} signatures. Removing hidden information changes more than the certification allows and breaks them. Continue?',
 
   'app.signedEdit.title': 'Document is signed',
+  'app.signedEdit.policyUnreadable':
+    "The document's signature policy could not be read. Editing is blocked.",
   'app.signedEdit.body':
     'Editing this document will invalidate its digital signatures. Continue?',
   'app.signedEdit.certifiedTitle': 'Document is certified',
@@ -286,9 +300,12 @@ export const WORKBENCH_STRINGS = {
   'app.window.importElsewhere':
     'Pages cannot be imported from a file that is open in another window: {{names}}.',
   'app.window.folderBusy':
-    'Another window is already writing to this folder: {{folder}}.',
-  // N20: sentence case, like every other button in the product — it was the
-  // last multi-word Title Case label across thirty-six screenshots.
+    'Another run is already writing to this folder: {{folder}}.',
+  // A run whose dialog was closed while it stopped still writes until its
+  // current file is done; a second run on that folder is refused until then.
+  'app.window.folderBusyHere':
+    'A run in this window is still writing to this folder: {{folder}}. Wait until it stops, then try again.',
+  // Sentence case, like every other button in the product.
   'app.window.focusOther': 'Show that window',
 
   // The commit-failure banner. Both messages were built by `+`-concatenating
@@ -299,7 +316,13 @@ export const WORKBENCH_STRINGS = {
   'app.commit.failedAbort':
     'Applying page changes failed: {{message}}. Nothing was saved — your edits are still pending.',
   'app.commit.retry': 'Retry',
+  'app.commit.recoveryRequired': 'The page commit needs recovery. Original working copies are retained. Retry before continuing.',
   'app.commit.dismiss': 'Dismiss',
+  'app.history.changed': 'The document or history changed. Try again.',
+  'app.history.invalid': 'The saved history revision could not be read as a non-empty PDF.',
+  'app.history.failed': 'Undo/redo failed: {{message}}',
+  'app.formCreate.unverified': 'Form creation could not be verified.',
+  'app.operation.unverified': 'The operation result could not be verified.',
 
   // A signed document whose page changes could not be appended. The rewrite
   // is the standing fallback and it lands; what used to be missing is the
@@ -336,6 +359,19 @@ export const WORKBENCH_STRINGS = {
   'app.startupEntry.staleTitle': 'Start with Windows needs attention',
   'app.startupEntry.stale':
     'This copy has moved since "Start with Windows" was switched on, and the entry could not be updated, so the application will not start with Windows. Switch the setting off and on again in Preferences. ({{detail}})',
+
+  // A record the launch reads before any window exists, and could not read.
+  // The unread file is moved aside when it can be; the path is where it went.
+  'app.unreadableRecord.sessionTitle': 'Last session not restored',
+  'app.unreadableRecord.session':
+    'The record of your last session could not be read, so the session was not restored. The unreadable file was moved to {{path}}.',
+  'app.unreadableRecord.sessionInPlace':
+    'The record of your last session could not be read, so the session was not restored.',
+  'app.unreadableRecord.startupTitle': 'Startup settings not applied',
+  'app.unreadableRecord.startup':
+    'The startup settings could not be read, so this launch used the default settings. The unreadable file was moved to {{path}}.',
+  'app.unreadableRecord.startupInPlace':
+    'The startup settings could not be read, so this launch used the default settings.',
 } as const;
 
 export type WorkbenchKey = keyof typeof WORKBENCH_STRINGS;

@@ -140,16 +140,22 @@ distill.postscriptJobDeclaresPjl	pattern	distill	not a PostScript job (it declar
 distill.postscriptJobPayloadZip	exact	distill	not a PostScript job (the payload is a ZIP/XPS package)
 distill.postscriptJobPjlEnvelope	exact	distill	not a PostScript job (the PJL envelope carries no payload)
 distill.unknownPresetScreenEbook	pattern	distill	unknown preset {{preset}} (screen, ebook, printer, prepress, default)
+doc_properties.chooseOpeningPageBefore	exact	doc_properties	Choose an opening page before changing its magnification.
 doc_properties.directionMustLR	pattern	doc_properties	direction must be 'L2R' or 'R2L', got {{direction}}
+doc_properties.documentBaseUrlMust	exact	doc_properties	The document base URL must be text.
 doc_properties.documentCertifiedAllowChanges	exact	doc_properties	this document is certified to allow no changes, so setting the document language would produce a file that reports as illegally modified
 doc_properties.documentCertifiedAllowChanges2	exact	doc_properties	this document is certified to allow no changes, so setting the document title would produce a file that reports as illegally modified
 doc_properties.documentCertifiedAllowChanges3	exact	doc_properties	this document is certified to allow no changes, so setting the tab order would produce a file that reports as illegally modified
-doc_properties.documentSOpenAction	exact	doc_properties	the document's open action is a script, not a destination; it was left unchanged
+doc_properties.documentSAdvancedProperties	exact	doc_properties	The document's advanced properties cannot be read completely.
+doc_properties.documentSInitialView	exact	doc_properties	The document's initial view cannot be read completely.
+doc_properties.documentSOpenAction	exact	doc_properties	The document's opening action cannot be changed without losing behavior.
 doc_properties.documentSignedSettingDocument	exact	doc_properties	this document is signed and setting the document language invalidates its signatures -- the run must state that signed documents are included before it will touch one
 doc_properties.documentSignedSettingDocument2	exact	doc_properties	this document is signed and setting the document title invalidates its signatures -- the run must state that signed documents are included before it will touch one
 doc_properties.documentSignedSettingTab	exact	doc_properties	this document is signed and setting the tab order invalidates its signatures -- the run must state that signed documents are included before it will touch one
+doc_properties.initialViewWindowOptions	exact	doc_properties	Initial-view window options must be booleans.
 doc_properties.nameLanguageExampleEn	exact	doc_properties	Name the language, for example en-GB.
 doc_properties.openPageOutRange	pattern	doc_properties	open_page {{page_number}} is out of range (1-{{total}})
+doc_properties.openingPageMustInteger	exact	doc_properties	The opening page must be an integer.
 doc_properties.pageHereCarriesAnnotation	exact	doc_properties	No page here carries an annotation, so there is no tab order to declare: /Tabs on a page with nothing to order says nothing.
 doc_properties.pageLayoutMustDefault	pattern	doc_properties	page_layout must be 'default' or one of {{v0}}, got {{page_layout}}
 doc_properties.pageModeMustDefault	pattern	doc_properties	page_mode must be 'default' or one of {{v0}}, got {{page_mode}}
@@ -166,6 +172,8 @@ doc_properties.wellFormedLanguageTag7	pattern	doc_properties	"{{text}}" is not a
 doc_properties.zoomMustOneGot	pattern	doc_properties	zoom must be one of {{v0}}, got {{zoom}}
 doc_properties.zoomPercentMustBetween	pattern	doc_properties	zoom_percent must be between {{minimum}} and {{maximum}}, got {{zoom_percent}}
 doc_properties.zoomPercentNeedsZoom	exact	doc_properties	zoom 'percent' needs a zoom_percent
+docmdp.documentSSignaturePolicy	exact	docmdp	The document's signature policy could not be read. Editing is blocked.
+document_js.documentScriptsExceedEditing	exact	document_js	Document scripts exceed editing limits.
 document_js.duplicateDocumentScriptName	pattern	document_js	Duplicate document-script name: {{name}}.
 document_js.eachDocumentScriptMust	exact	document_js	Each document script must be an object with name and js.
 document_js.eachDocumentScriptNeeds	exact	document_js	Each document script needs a non-empty name.
@@ -304,6 +312,8 @@ image_export.dpiMustNumberGot	pattern	image_export	dpi must be a number, got {{d
 image_export.ghostscriptReportedSuccessExpected	pattern	image_export	Ghostscript reported success but {{v0}} expected output file(s) are missing (first: {{v1}})
 image_export.outputPathDirectoryFile	pattern	create_pdf,extract_text,image_export,office_export,soffice	output path is a directory, not a file: {{output}}
 image_export.unsupportedImageFormat	pattern	image_export	unsupported image format {{fmt}} (have {{v1}})
+image_redact.imageCannotPartlyRedacted	pattern	image_redact	This image cannot be partly redacted ({{reason}}). Mark the whole image to remove it.
+image_redact.redactedCharactersCannotRemoved	pattern	image_redact	The redacted characters cannot be removed from the font {{font}} ({{reason}}).
 incremental.editClassMustForm	exact	incremental	edit class must be "form-fill", "annotate" or "structural"
 incremental.incrementalTransplantFailed	pattern	incremental	Incremental transplant failed: {{e}}
 incremental.incrementalWriteDidPreserve	exact	incremental	Incremental write did not preserve the original bytes verbatim — refusing to emit a signature-breaking file
@@ -318,7 +328,9 @@ ink_manager.inkUsedPatternTool	pattern	ink_manager	Ink "{{name}}" is used by a p
 ink_manager.nameLeastOneInk	exact	ink_manager	Name at least one ink to convert.
 ink_manager.processInksCannotAliased	exact	ink_manager	Process inks cannot be aliased to a spot colour.
 inspect.pageOutRange	pattern	inspect	Page {{page}} out of range (1-{{v1}})
+layers.layerConfigurationCannotRead	exact	layers	Layer configuration cannot be read completely.
 layers.layerIndexOutRange	pattern	layers	layer index {{index}} is out of range (0-{{v1}})
+layers.layerLockedDefaultConfiguration	exact	layers	Layer is locked in the default configuration.
 links.documentDestinationNamed	pattern	links	this document has no destination named {{name}}
 links.linkBorderStyleMust	exact	links	link border style must be solid, dashed or underline
 links.linkBorderWidthMust	exact	links	link border width must be a number
@@ -341,6 +353,7 @@ links.unknownLinkViewMode	pattern	links	unknown link view mode {{mode}}
 links.urlMustEmpty	exact	links	url must not be empty
 links.webAddressesEmailAddresses	exact	links	No web addresses or email addresses were found in the text.
 merge.theseDocumentsCannotCombined	exact	merge	These documents cannot be combined without changing their protection: they do not all carry the same encryption and permissions, and one combined document can only have one. Give them matching protection, or decrypt them first.
+metadata.documentSMetadataCannot	exact	metadata	The document's metadata cannot be read completely.
 mrc.everyScannedPageFailed	exact	mrc	every scanned page failed mask verification — no MRC output was written
 mrc.everyScannedPageFailedText	exact	mrc	every scanned page failed text verification — no MRC output was written, because a page whose words did not survive is not an output worth having. Try the archival preset, which keeps thin strokes.
 mrc.firstDifference	pattern	mrc	{{reason}} (first difference — {{divergence}})
@@ -358,8 +371,9 @@ mrc_codecs.jbigEncoderAvailableJbig	pattern	mrc_codecs	The JBIG2 encoder is not 
 mrc_codecs.jbigEncoderProducedOutput	pattern	mrc_codecs	The JBIG2 encoder produced no output for page {{v0}}.
 mrc_codecs.jbigEncoderProducedSymbol	exact	mrc_codecs	The JBIG2 encoder produced no symbol dictionary — the shared /JBIG2Globals stream every page refers to is missing.
 mrc_codecs.jbigSymbolThresholdMust	pattern	mrc_codecs	the JBIG2 symbol threshold must be {{MIN_SYMBOL_THRESHOLD}}-{{MAX_SYMBOL_THRESHOLD}}, got {{symbol_threshold}}
+mrc_codecs.jpegBackgroundCouldEncoded	exact	mrc_codecs	the JPEG 2000 background could not be encoded exactly
+mrc_codecs.jpegBackgroundNeedsPositive	pattern	mrc_codecs	a JPEG 2000 background needs a positive quantization step and 0-{{JPX_MAX_LEVELS}} decomposition levels, got {{step}} and {{levels}}
 mrc_codecs.jpegQualityMustGot	pattern	mrc_codecs	JPEG quality must be 1-100, got {{quality}}
-mrc_codecs.jpegRateMustGot	pattern	mrc_codecs	a JPEG2000 rate must be >= 1, got {{rate}}
 mrc_codecs.maskMustBitImage	pattern	mrc_codecs	a mask must be a 1-bit image (Pillow mode '1'), got mode {{v0}}
 mrc_codecs.maskVerificationCouldDecode	pattern	mrc_codecs	mask verification could not decode the stencil: {{detail}}
 mrc_codecs.maskVerificationFailedEmbedded	pattern	mrc_codecs	mask verification failed: the embedded {{v0}} stencil decodes to {{got}} ink coverage, the mask it came from has {{v2}}.
@@ -381,15 +395,18 @@ office_export.libreofficeReportedSuccessFile	pattern	soffice	LibreOffice reporte
 office_export.libreofficeReportedSuccessWrote	pattern	soffice	LibreOffice reported success but wrote no output (stderr: {{v0}})
 office_export.outputPathSameFile	exact	office_export,soffice	output path is the same file as the input
 office_export.unsupportedExportFormat	pattern	office_export	unsupported export format {{fmt}} (have {{v1}})
+optional_content.optionalContentConfigurationCannot	exact	optional_content	Optional-content configuration cannot be preserved completely.
 outline.bookmarkActionPayloadMust	pattern	outline	bookmark '{{title}}': action payload must be a dictionary
 outline.bookmarkDestPayloadMust	pattern	outline	bookmark '{{title}}': dest payload must be a name or string
 outline.bookmarkTargetsPage	pattern	outline	bookmark '{{title}}' targets page {{page}} of {{page_count}}
 outline.malformedOutlineActionPayload	exact	outline	malformed outline action payload
 outline.outlineActionPayloadNested	exact	outline	outline action payload nested too deeply
 outline.outlineDeeperThanLevels	pattern	outline	outline deeper than {{MAX_DEPTH}} levels
+outlines.pageDrawsTextFont	pattern	outlines	Page {{page}} draws text with no font selected.
 outlines.pageDrawsTextThrough	pattern	outlines	Page {{page}} draws text through the font resource {{name}}, which the page does not define.
 outlines.pageDrawsZeroWidth	pattern	outlines	Page {{page}} draws a zero-width line, which has no fixed width to outline.
 outlines.pageNestsFormXobjects	pattern	flattener,outlines	Page {{page}} nests form XObjects deeper than {{cap}} levels.
+output_intents.outputIntentConfigurationCannot	exact	output_intents	The output intent configuration cannot be preserved completely.
 page_boxes.boxMustOneGot	pattern	page_boxes	box must be one of {{v0}}, got {{box}}
 page_images.cropRectDegenerateNothing	exact	page_images	crop rect is degenerate (nothing would remain visible)
 page_images.cropRectMustLie	exact	page_images	crop rect must lie within the image (unit coordinates 0..1)
@@ -432,6 +449,7 @@ page_images.unsupportedJpegComponentsSend	pattern	page_images	unsupported JPEG (
 page_images.vectorGraphicPlacementCannot	exact	page_images	a vector graphic placement cannot be replaced with a raster image; delete it and add a new graphic
 page_images.vectorGraphicPlacementImage	exact	page_images	a vector graphic placement has no image bytes to extract
 page_labels.duplicateRangeStart	pattern	page_labels	duplicate range start {{start}}
+page_labels.invalidPageLabelRanges	exact	page_labels	Invalid page label ranges
 page_labels.rangeStartOutRange	pattern	page_labels	range start {{start}} is out of range (0-{{v1}})
 page_labels.styleMustOneNone	pattern	page_labels	style must be one of {{v0}} or 'none', got {{style}}
 page_vectors.formChainNestedVector	exact	page_vectors	the form chain for this nested vector object was not found
@@ -462,6 +480,8 @@ pdf_save.documentSEncryptionCannot3	exact	pdf_save	This document's encryption ca
 pdf_save.documentSEncryptionCannot4	exact	pdf_save	This document's encryption cannot be kept through this operation: it encrypts its metadata under a cipher that cannot be written back with that setting, and a rewritten copy would expose metadata this document keeps encrypted. Decrypt the document first if you want an unprotected copy.
 pdf_save.documentSEncryptionCannot5	exact	pdf_save	This document's encryption cannot be kept through this operation: it protects its streams, strings and embedded files with different ciphers, and a rewritten copy can carry only one cipher for all three. Decrypt the document first if you want an unprotected copy.
 pdf_save.documentSEncryptionCannot6	exact	pdf_save	This document's encryption cannot be kept through this operation: its encryption version, cipher and key length are a combination that cannot be written back exactly, and a rewritten copy would change the strength of its protection. Decrypt the document first if you want an unprotected copy.
+pdf_version.pdfVersionCannotDetermined	exact	pdf_version	The PDF version cannot be determined.
+pdf_version.versionDeclarationsCannotPreserved	exact	pdf_version	The version declarations cannot be preserved completely.
 pdfa.ghostscriptPdfConversionDid	pattern	pdfa	Ghostscript PDF/A conversion did not produce {{requested}}: the output declares {{declared}}.
 pdfa.ghostscriptPdfConversionFailed	pattern	pdfa	Ghostscript PDF/A conversion failed: {{v0}}
 pdfa.outputDeclaresPdfConformance	pattern	pdfa	The output declares no PDF/A conformance at all, so {{requested}} was not produced.
@@ -541,7 +561,7 @@ printer.mustNumberGot	pattern	printer	{{name}} must be a number, got {{value}}
 printer.mustTrueFalseGot	pattern	printer	{{name}} must be true or false, got {{value}}
 printer.pageBeyondDocumentPage	pattern	printer	Page {{end}} is beyond the document ({{page_count}} pages in total)
 printer.pageNumbersBased	pattern	printer	Page numbers are 1-based: '{{token}}'
-printer.pageSelectionEmptyPages	exact	printer	The page selection is empty (no pages match)
+printer.pageSelectionEmptyPages	exact	headers,printer	The page selection is empty (no pages match)
 printer.perSheetMustGot	pattern	printer	{{label}} per sheet must be 1-8, got {{v}}
 printer.previewDpiMustGot	pattern	printer	Preview DPI must be 18-300, got {{dpi}}
 printer.previewNeedsPaperSize	exact	printer	Preview needs the paper size (sheet_width/sheet_height)
@@ -583,9 +603,16 @@ recover.pdfEncryptedDecryptBefore	exact	recover	PDF is encrypted -- decrypt befo
 redact.alignMustLeftCentred	exact	redact	align must be 0 (left), 1 (centred) or 2 (right)
 redact.fontSizeMustNegative	exact	redact	font size must not be negative
 redact.overlayTextNeedsEmbedded	exact	redact	this overlay text needs an embedded font and no font directory was given
+redact.pageContainsMalformedDrawing	exact	redact	The page contains a malformed drawing path. Redaction was not applied.
+redact_document.documentStructureTooComplex	exact	redact_document	The document structure is too complex to redact safely.
 redact_marks.redactionMarkSDocument	pattern	redact_marks	{{count}} redaction mark(s) in this document cannot be read (page(s) {{location}}). A mark whose annotation or /Rect will not resolve is neither shown nor applied, so redacting now would leave marked content in place. Repair the document first.
 repair.pdfEncryptedDecryptBefore	exact	repair	PDF is encrypted -- decrypt before repairing
 repair.pdfTooDamagedTier	pattern	repair	PDF is too damaged for Tier 1 repair: {{e2}}. Try 'rebuild' (Tier 2) or 'recover' (Tier 3).
+reversion.pdfVersionCannotChanged	exact	reversion	The PDF version cannot be changed while preserving this document's signatures.
+reversion.pdfVersionCannotChanged2	exact	reversion	The PDF version cannot be changed without verifying this document's conformance declarations.
+reversion.pdfVersionCannotLowered	exact	reversion	The PDF version cannot be lowered because compatibility with the requested version cannot be verified.
+reversion.pdfVersionChangeDid	exact	reversion	The PDF version change did not preserve the document's encryption.
+reversion.writtenPdfDoesDeclare	exact	reversion	The written PDF does not declare the requested version.
 rtl_text.textContainsDirectionalFormatting	exact	rtl_text	text contains directional formatting characters that cannot be laid out
 sanitize.auditCouldReadDocument	pattern	sanitize	The audit could not read {{v0}}, so this document cannot be sanitized: {{v1}}
 sanitize.auditCouldReadPage	pattern	sanitize	The audit could not read {{v0}} on page {{v1}}, so this document cannot be sanitized: {{v2}}
@@ -601,9 +628,10 @@ search_redact.unknownRedactionProperty	pattern	search_redact	unknown redaction p
 search_regions.expandMustMatchWord	exact	search_regions	expand must be "match", "word" or "line"
 search_regions.giveSearchTermWord	exact	search_regions	give a search term, a word list or a built-in pattern — searching for nothing would mark every page
 search_regions.maxHitsMustPositive	exact	search_regions	max_hits must be a positive number
-search_regions.pagesMustListPage	exact	enhance_scan,form_detect,search_regions,slide_export,table_export,text_export	pages must be a list of page numbers or "all"
+search_regions.pagesMustListPage	exact	enhance_scan,form_detect,headers,search_regions,slide_export,table_export,text_export	pages must be a list of page numbers or "all"
 separations.ghostscriptFoldedSpotColours	pattern	separations	Ghostscript folded {{n}} spot colours into process; raise the spot limit or reduce the document's spots.
 separations.ghostscriptSeparationRenderFailed	pattern	separations	Ghostscript separation render failed: {{v0}}
+separations.moreThanOneInk	pattern	separations	More than one ink in this document is shown as "{{text}}", so the name cannot say which one is meant.
 separations.pageDocument	pattern	flattener,object_inspector,outlines,separations	Page {{number}} is not in this document.
 separations.pageUsesColourSpace	pattern	separations	Page {{page}} uses a colour space this engine cannot read, so the inks on it cannot all be established: {{detail}}
 separations.pageUsesSpotColours	pattern	separations	This page uses {{n}} spot colours; separation preview supports {{limit}}.
@@ -681,13 +709,23 @@ spelling.spellingDictionary	pattern	spelling	No spelling dictionary for {{langua
 spelling.unknownSpellCheckSource	pattern	spelling	unknown spell-check source {{v0}} — use text, comments or fields
 spelling.usableDictionaryNameUse	pattern	spelling	{{name}} is not a usable dictionary name — use letters, digits and underscores.
 spelling.wordSuggest	exact	spelling	No word to suggest for.
+split.cannotReplaceNonRegular	pattern	split	Cannot replace a non-regular split destination: {{path}}
+split.cannotSplitDocumentWithout	exact	split	Cannot split a document without pages
+split.chooseEitherExactSplit	exact	split	Choose either an exact split output or an output folder
 split.documentTopLevelBookmarks	exact	split	this document has no top-level bookmarks to split at
+split.exactSplitOutputOnly	exact	split	An exact split output is only valid for page ranges
 split.maximumFileSizeMust	pattern	split	maximum file size must be a number, got {{max_mb}}
 split.maximumFileSizeMust2	pattern	split	maximum file size must be greater than 0, got {{max_mb}}
 split.pagesPerFileMust	pattern	split	pages per file must be a whole number, got {{every_n}}
 split.pagesPerFileMust2	pattern	split	pages per file must be at least 1, got {{every_n}}
+split.splitDestinationChangedBefore	pattern	split	Split destination changed before publication: {{path}}
+split.splitDestinationsMustIdentify	pattern	split	Split destinations must identify different files: {{path}}
 split.splitModeMustOne	pattern	split	split mode must be one of {{v0}}, got {{mode}}
 split.splitNeedsOutputFolder	exact	split	split needs an output folder
+split.splitOutputMustReplace	pattern	split	Split output must not replace its source: {{path}}
+split.splitPublicationFailedRetained	pattern	split	Split publication failed; retained recovery files: {{details}}
+split.splitRangeSelectsPages	exact	split	The split range selects no pages
+split.splitSourceChangedDuring	exact	split	Split source changed during preparation
 stamp_appearance.chosenSignatureFaceCannot	exact	stamp_appearance	The chosen signature face cannot set that name — choose another face, or draw or import the signature instead.
 stamp_appearance.chosenSignatureStrokesDraw	exact	stamp_appearance	The chosen signature has no strokes to draw.
 stamp_appearance.chosenSignatureUsableShape	exact	stamp_appearance	The chosen signature has no usable shape — capture or import it again.
@@ -832,6 +870,7 @@ text_paragraphs.splitPositionMustNumber	exact	text_paragraphs	split position mus
 text_paragraphs.verticalTextCannotConverted	exact	text_paragraphs,text_runs	vertical text cannot be converted to the fallback font
 text_paragraphs.verticalTextRaisedCharacters	exact	text_paragraphs	vertical text with raised characters does not reflow
 text_runs.colorMustRG	exact	text_runs	color must be [r, g, b] with components in 0..1
+text_runs.editCannotSelectText	exact	text_paragraphs,text_runs	an edit cannot select this text's font by name
 text_runs.editDidApplyRun	exact	text_runs	edit did not apply (run not found)
 text_runs.fontActiveText	exact	text_runs	no font is active for this text
 text_runs.fontActiveTextRun	exact	text_runs	no font is active for this text run
@@ -858,7 +897,7 @@ trapping.mustOne	pattern	trapping	{{field}} must be one of {{choices}}.
 trapping.mustTrueFalse	pattern	trapping	{{field}} must be true or false.
 trapping.mustWholeNumber	pattern	trapping	{{field}} must be a whole number.
 trapping.overridesMustTrappingParameters	pattern	trapping	The overrides for {{name}} must be trapping parameters.
-trapping.pagesDocument	pattern	trapping	Pages {{page_range}} are not in this document.
+trapping.pagesDocument	pattern	headers,trapping	Pages {{page_range}} are not in this document.
 trapping.postscriptFilePageStructure	exact	trapping	This PostScript file has no page structure to attach trapping setup to.
 trapping.postscriptLanguageLevelMust	exact	trapping	PostScript language level must be 2 or 3.
 trapping.ripTrappingLanguagelevelFacility	exact	trapping	In-RIP trapping is a LanguageLevel 3 facility and cannot be written into LanguageLevel 2 PostScript.
