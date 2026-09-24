@@ -1,5 +1,9 @@
 # Spectra PDF
 
+**Ported to linux: see the [`linux-cross-platform`](https://github.com/pdftl-dev/Spectra-PDF/tree/linux-cross-platform) branch of this fork.**
+
+---
+
 [![CI](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/ci.yml)
 [![Release workflow](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release.yml?label=release%20workflow)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release.yml)
 [![Release recovery](https://img.shields.io/github/actions/workflow/status/jasonulbright/Spectra-PDF/release-redo.yml?label=release%20recovery)](https://github.com/jasonulbright/Spectra-PDF/actions/workflows/release-redo.yml)
@@ -8,7 +12,7 @@
 [![Platform](https://img.shields.io/badge/platform-Linux_/_Windows-0078D4)](#requirements)
 [![License](https://img.shields.io/github/license/jasonulbright/Spectra-PDF)](LICENSE)
 
-A modern, open-source PDF workbench for Windows. **Ported to linux: see the `linux-cross-platform` branch of this fork.**
+A modern, open-source PDF workbench for Windows. 
 
 Tauri v2 + React, with an embedded Python engine. No ads, no telemetry, no upsells. Ships as an installer or as a portable zip you extract and run. WebView2 prerequisite (ships with Windows 10/11). A handful of features — listed below, each marked — additionally need Ghostscript, which you install separately.
 
